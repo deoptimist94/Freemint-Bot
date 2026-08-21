@@ -1,7 +1,7 @@
 import { type Address, type Hex, parseAbi, encodeFunctionData, getAddress } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
 import { prisma } from "../db/client.js";
 import { getPublicClient, getWalletClient } from "./chain.js";
+import { assertGasSafe } from "./gasGuard.js";
 import { getActiveWallets, getWalletPrivateKey } from "./wallet.js";
 import { scanContract, getBestMintFunction, type MintFunctionInfo } from "./scanner.js";
 
@@ -106,7 +106,7 @@ export async function executeMintForWallet(
   try {
     const args = buildMintArgs(mintFunction, walletAddress, iteration);
 
-    // Simulate with the REAL args (not a hardcoded 1n).
+    // 1. Simulate with the REAL args (not a hardcoded 1n).
     const simResult = await simulateMintWithArgs(contractAddress, walletAddress, mintFunction, args);
     if (!simResult.success) {
       await recordMintHistory(userId, contractAddress, null, "SIMULATION_FAILED");
@@ -119,6 +119,10 @@ export async function executeMintForWallet(
         iteration,
       };
     }
+
+    // 2. Send-time gas enforcement: aborts if gas spiked above the user's ceiling
+    //    after the decision point (throws -> caught below, clean failure).
+    await assertGasSafe(userId);
 
     const abiItem = parseAbi([`function ${mintFunction.name}(${mintFunction.args.join(",")})`] as const);
     const data = encodeFunctionData({
@@ -134,6 +138,7 @@ export async function executeMintForWallet(
         blockTag: "pending",
       }));
 
+    // 3. Send with the env-aware wallet client (honors BASE_RPC_URL).
     const txHash = await walletClient.sendTransaction({
       to: contractAddress as Address,
       data,
