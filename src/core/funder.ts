@@ -1,13 +1,6 @@
-import { 
-  createWalletClient, 
-  http, 
-  type Hex, 
-  getAddress, 
-  parseEther 
-} from "viem";
-import { base } from "viem/chains";
+import { type Hex, getAddress, parseEther } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { getPublicClient } from "./chain.js";
+import { getPublicClient, getWalletClient } from "./chain.js";
 import { getWallets, getWalletPrivateKey } from "./wallet.js";
 
 export interface FundResult {
@@ -17,6 +10,8 @@ export interface FundResult {
   txHash?: string;
   error?: string;
 }
+
+const TRANSFER_GAS = 21000n;
 
 export async function fundSubWallets(
   userId: bigint,
@@ -40,17 +35,23 @@ export async function fundSubWallets(
   const sendWei = parseEther(amountPerWalletEth.toString());
   const totalNeededWei = sendWei * BigInt(subWallets.length);
 
-  if (masterBalance < totalNeededWei) {
+  // Reserve gas for every outgoing transfer (EIP-1559 max fee).
+  let gasBuffer = 0n;
+  try {
+    const fees = await publicClient.estimateFeesPerGas();
+    gasBuffer = fees.maxFeePerGas * TRANSFER_GAS * BigInt(subWallets.length);
+  } catch {
+    const gp = await publicClient.getGasPrice();
+    gasBuffer = gp * TRANSFER_GAS * BigInt(subWallets.length);
+  }
+
+  if (masterBalance < totalNeededWei + gasBuffer) {
     throw new Error(
-      `Insufficient balance in ${masterWallet.label}. Required: ${(Number(totalNeededWei) / 1e18).toFixed(5)} ETH | Available: ${(Number(masterBalance) / 1e18).toFixed(5)} ETH`
+      `Insufficient balance in ${masterWallet.label}. Required: ${(Number(totalNeededWei + gasBuffer) / 1e18).toFixed(6)} ETH (incl. gas) | Available: ${(Number(masterBalance) / 1e18).toFixed(6)} ETH`
     );
   }
 
-  const walletClient = createWalletClient({
-    account: masterAccount,
-    chain: base,
-    transport: http(process.env.BASE_RPC_URL || "https://mainnet.base.org"),
-  });
+  const walletClient = getWalletClient(hexKey);
 
   const results: FundResult[] = [];
   let totalDistributedEth = 0;
