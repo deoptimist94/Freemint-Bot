@@ -32,9 +32,7 @@ RUN npx prisma generate
 
 COPY --from=builder /app/dist ./dist
 
-RUN mkdir -p /app/data
-ENV DATABASE_URL="file:/app/data/bot.db"
-
 EXPOSE 3000
 
+# DATABASE_URL must be provided at runtime (Railway injects your Postgres URL).
 CMD ["sh", "-c", "npx prisma db push --skip-generate && node dist/main.js"]
