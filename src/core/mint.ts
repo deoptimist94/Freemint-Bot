@@ -1,10 +1,9 @@
-import { type Address, type Hex, parseAbi, encodeFunctionData, createWalletClient, http } from "viem";
+import { type Address, type Hex, parseAbi, encodeFunctionData, getAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { base } from "viem/chains";
 import { prisma } from "../db/client.js";
-import { getPublicClient } from "./chain.js";
+import { getPublicClient, getWalletClient } from "./chain.js";
 import { getActiveWallets, getWalletPrivateKey } from "./wallet.js";
-import { scanContract, getBestMintFunction, simulateMint, type MintFunctionInfo } from "./scanner.js";
+import { scanContract, getBestMintFunction, type MintFunctionInfo } from "./scanner.js";
 
 export interface MintResult {
   walletId: string;
@@ -34,6 +33,60 @@ export function setUserMintQuantity(userId: bigint, quantity: number): void {
   userMintQuantities.set(userId, Math.max(1, Math.min(quantity, 10)));
 }
 
+// Build the exact calldata args for a given mint round. This must match what the
+// simulation sees so sequential/quantity contracts don't pass simulation and then revert.
+function buildMintArgs(
+  mintFunction: MintFunctionInfo,
+  walletAddress: string,
+  iteration: number
+): unknown[] {
+  const args: unknown[] = [];
+  for (const argType of mintFunction.args) {
+    if (argType.includes("address")) {
+      args.push(walletAddress as Address);
+    } else if (argType.includes("uint") || argType.includes("int")) {
+      args.push(BigInt(iteration));
+    } else if (argType.startsWith("bytes32[")) {
+      args.push([]);
+    } else if (argType.startsWith("bytes")) {
+      args.push("0x");
+    } else if (argType === "bool") {
+      args.push(false);
+    } else {
+      args.push("0x");
+    }
+  }
+  return args;
+}
+
+// Simulate the exact transaction we're about to send (eth_call, zero gas).
+async function simulateMintWithArgs(
+  contractAddress: string,
+  fromAddress: string,
+  mintFunction: MintFunctionInfo,
+  args: unknown[]
+): Promise<{ success: boolean; error?: string }> {
+  const client = getPublicClient();
+  try {
+    const abiItem = parseAbi([`function ${mintFunction.name}(${mintFunction.args.join(",")})`] as const);
+    const data = encodeFunctionData({
+      abi: abiItem,
+      functionName: mintFunction.name,
+      args: args as any,
+    });
+    await client.call({
+      data,
+      to: getAddress(contractAddress),
+      account: getAddress(fromAddress),
+      value: 0n,
+    });
+    return { success: true };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, error: message };
+  }
+}
+
 export async function executeMintForWallet(
   walletId: string,
   walletAddress: string,
@@ -45,34 +98,16 @@ export async function executeMintForWallet(
   prefetchedNonce?: number
 ): Promise<MintResult> {
   const privateKey = (await getWalletPrivateKey(walletId)) as Hex;
-  const account = privateKeyToAccount(privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`);
-  const walletClient = createWalletClient({
-    account,
-    chain: base,
-    transport: http(),
-  });
-
+  const hexKey = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+  const walletClient = getWalletClient(hexKey as Hex);
   const publicClient = getPublicClient();
   const iterLabel = iteration > 1 ? `${label} (Mint #${iteration})` : label;
 
   try {
-    const abiItem = parseAbi([
-      `function ${mintFunction.name}(${mintFunction.args.join(",")})`,
-    ] as const);
+    const args = buildMintArgs(mintFunction, walletAddress, iteration);
 
-    // Intelligent argument construction based on parameter types
-    const args: unknown[] = [];
-    for (const argType of mintFunction.args) {
-      if (argType.includes("address")) {
-        args.push(walletAddress as Address);
-      } else if (argType.includes("uint") || argType.includes("int")) {
-        args.push(BigInt(iteration));
-      } else {
-        args.push(1n);
-      }
-    }
-
-    const simResult = await simulateMint(contractAddress, walletAddress, mintFunction);
+    // Simulate with the REAL args (not a hardcoded 1n).
+    const simResult = await simulateMintWithArgs(contractAddress, walletAddress, mintFunction, args);
     if (!simResult.success) {
       await recordMintHistory(userId, contractAddress, null, "SIMULATION_FAILED");
       return {
@@ -85,23 +120,24 @@ export async function executeMintForWallet(
       };
     }
 
+    const abiItem = parseAbi([`function ${mintFunction.name}(${mintFunction.args.join(",")})`] as const);
     const data = encodeFunctionData({
       abi: abiItem,
       functionName: mintFunction.name,
       args: args as any,
     });
 
-    const nonce = prefetchedNonce ?? await publicClient.getTransactionCount({
-      address: walletAddress as Address,
-      blockTag: "pending",
-    });
+    const nonce =
+      prefetchedNonce ??
+      (await publicClient.getTransactionCount({
+        address: walletAddress as Address,
+        blockTag: "pending",
+      }));
 
     const txHash = await walletClient.sendTransaction({
       to: contractAddress as Address,
       data,
       value: 0n,
-      chain: base,
-      account,
       nonce,
     });
 
@@ -141,42 +177,22 @@ export async function batchMint(
   const scanResult = await scanContract(contractAddress);
 
   if (!scanResult.isContract || scanResult.mintFunctions.length === 0) {
-    return {
-      contractAddress,
-      results: [],
-      totalSuccess: 0,
-      totalFailed: 0,
-    };
+    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
   }
 
   const freeMints = scanResult.mintFunctions.filter((f) => f.isFreeMint && !f.requiresPayment);
   if (freeMints.length === 0) {
-    return {
-      contractAddress,
-      results: [],
-      totalSuccess: 0,
-      totalFailed: 0,
-    };
+    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
   }
 
   const mintFunction = getBestMintFunction(freeMints);
   if (!mintFunction) {
-    return {
-      contractAddress,
-      results: [],
-      totalSuccess: 0,
-      totalFailed: 0,
-    };
+    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
   }
 
   const activeWallets = await getActiveWallets(userId);
   if (activeWallets.length === 0) {
-    return {
-      contractAddress,
-      results: [],
-      totalSuccess: 0,
-      totalFailed: 0,
-    };
+    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
   }
 
   const rounds = getUserMintQuantity(userId);
@@ -217,12 +233,7 @@ export async function batchMint(
   const totalSuccess = allResults.filter((r) => r.success).length;
   const totalFailed = allResults.filter((r) => !r.success).length;
 
-  return {
-    contractAddress,
-    results: allResults,
-    totalSuccess,
-    totalFailed,
-  };
+  return { contractAddress, results: allResults, totalSuccess, totalFailed };
 }
 
 export async function manualMint(
@@ -240,12 +251,7 @@ async function recordMintHistory(
 ): Promise<void> {
   try {
     await prisma.mintHistory.create({
-      data: {
-        userId,
-        contractAddress,
-        txHash,
-        status,
-      },
+      data: { userId, contractAddress, txHash, status },
     });
   } catch (err) {
     console.error("Failed to record mint history:", err);
