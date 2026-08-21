@@ -31,3 +31,17 @@ export async function checkGasSafety(userId: bigint): Promise<{
     maxGwei,
   };
 }
+
+/**
+ * Send-time enforcement: throws if gas is above the user's ceiling right now.
+ * Call this immediately before `sendTransaction` so a gas spike between the
+ * decision and the send cannot slip through.
+ */
+export async function assertGasSafe(userId: bigint): Promise<void> {
+  const { safe, currentGwei, maxGwei } = await checkGasSafety(userId);
+  if (!safe) {
+    throw new Error(
+      `Mint aborted at send time: gas ${currentGwei.toFixed(4)} Gwei exceeds your max of ${maxGwei} Gwei.`
+    );
+  }
+}
