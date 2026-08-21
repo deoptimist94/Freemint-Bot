@@ -1,9 +1,8 @@
-import { 
-  createWalletClient, 
-  http, 
-  type Hex, 
-  getAddress, 
-  parseGwei 
+import {
+  createWalletClient,
+  http,
+  type Hex,
+  getAddress,
 } from "viem";
 import { base } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
@@ -18,6 +17,8 @@ export interface SweepResult {
   error?: string;
 }
 
+const TRANSFER_GAS = 21000n;
+
 export async function sweepDustToMaster(
   userId: bigint,
   destinationAddress: string
@@ -28,6 +29,17 @@ export async function sweepDustToMaster(
 
   const results: SweepResult[] = [];
   let totalSweptEth = 0;
+
+  // EIP-1559 fee data (Base is a 1559 chain) — fetched once per sweep.
+  let maxFeePerGas: bigint | undefined;
+  let maxPriorityFeePerGas: bigint | undefined;
+  try {
+    const fees = await publicClient.estimateFeesPerGas();
+    maxFeePerGas = fees.maxFeePerGas;
+    maxPriorityFeePerGas = fees.maxPriorityFeePerGas;
+  } catch (err) {
+    console.warn("estimateFeesPerGas failed, falling back to legacy pricing:", err);
+  }
 
   for (const w of wallets) {
     // Skip if this wallet is the destination
@@ -47,19 +59,8 @@ export async function sweepDustToMaster(
         continue;
       }
 
-      const privateKey = await getWalletPrivateKey(w.id);
-      const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
-      const account = privateKeyToAccount(hexKey);
-
-      const walletClient = createWalletClient({
-        account,
-        chain: base,
-        transport: http(process.env.BASE_RPC_URL || "https://mainnet.base.org"),
-      });
-
-      // Gas calculation for native Base transfer (21000 standard gas)
-      const gasPrice = await publicClient.getGasPrice();
-      const gasCost = 21000n * gasPrice;
+      const gasPrice = maxFeePerGas ?? (await publicClient.getGasPrice());
+      const gasCost = TRANSFER_GAS * gasPrice;
 
       if (balance <= gasCost) {
         results.push({
@@ -71,12 +72,29 @@ export async function sweepDustToMaster(
         continue;
       }
 
+      const privateKey = await getWalletPrivateKey(w.id);
+      const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
+      const account = privateKeyToAccount(hexKey);
+
+      const walletClient = createWalletClient({
+        account,
+        chain: base,
+        transport: http(process.env.BASE_RPC_URL || "https://mainnet.base.org"),
+      });
+
       const sendAmount = balance - gasCost;
 
-      const txHash = await walletClient.sendTransaction({
+      const params: any = {
         to: cleanDestination,
         value: sendAmount,
-      });
+        gas: TRANSFER_GAS,
+      };
+      if (maxFeePerGas !== undefined && maxPriorityFeePerGas !== undefined) {
+        params.maxFeePerGas = maxFeePerGas;
+        params.maxPriorityFeePerGas = maxPriorityFeePerGas;
+      }
+
+      const txHash = await walletClient.sendTransaction(params);
 
       await publicClient.waitForTransactionReceipt({ hash: txHash });
 
