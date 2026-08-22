@@ -18,7 +18,11 @@ import {
   getUserMintQuantity,
   setUserMintQuantity,
 } from "../core/mint.js";
-import { fetchWalletPortfolio, executeSell, type PortfolioItem } from "../core/portfolio.js";
+import {
+  fetchWalletPortfolio,
+  executeSell,
+  type PortfolioItem,
+} from "../core/portfolio.js";
 import { sweepDustToMaster } from "../core/sweeper.js";
 import { sweepAllNFTsToMaster } from "../core/nftSweeper.js";
 import { fundSubWallets } from "../core/funder.js";
@@ -52,6 +56,10 @@ import {
   fundAmountKeyboard,
   trackingMenuKeyboard,
   trackedWalletsListKeyboard,
+  maxSpendSettingsKeyboard,
+  settingsMenuKeyboard,
+  autoSellSettingsKeyboard,
+  quantitySettingsKeyboard,
   gasSettingsKeyboard,
 } from "./keyboards.js";
 
@@ -63,7 +71,6 @@ const pendingMints = new Map<number, boolean>();
 const pendingImports = new Map<number, boolean>();
 const pendingFunds = new Map<number, boolean>();
 const pendingTracked = new Map<number, boolean>();
-const pendingMaxSpend = new Map<number, boolean>();
 
 function userIdNumber(ctx: Context): number {
   return ctx.from?.id ?? 0;
@@ -111,21 +118,19 @@ async function showMainMenu(ctx: Context, telegramId: bigint): Promise<void> {
 
 async function showWallets(ctx: Context, telegramId: bigint): Promise<void> {
   const wallets = await getWallets(telegramId);
-  const balances = await fetchAllWalletsBalances(wallets);
-
   let text = `👛 **Your Wallets**\n\n`;
   if (wallets.length === 0) {
     text += `No wallets yet. Create one below.`;
   } else {
+    const balances = await fetchAllWalletsBalances(wallets);
     for (const b of balances) {
       const wallet = wallets.find((w) => w.address === b.address);
       const icon = wallet?.isActive ? "✅" : "⭕";
       text += `${icon} **${wallet?.label ?? "Wallet"}**\n`;
-      text += `   \`${shortenAddress(b.address)}\` — ${b.ethBalance} ETH (~$${b.usdBalance})\n\n`;
+      text += `   \`${shortenAddress(b.address)}\` — ${b.ethBalance} ETH (~$${b.usdBalance})\n`;
     }
-    text += `Tap a wallet to toggle, or use the buttons below.`;
+    text += `\nTap a wallet to toggle active, or 📋 Copy for the full address.`;
   }
-
   await editOrReply(ctx, text, {
     reply_markup: walletsKeyboard(wallets),
     parse_mode: "Markdown",
@@ -140,17 +145,23 @@ async function showDeleteWallet(ctx: Context, telegramId: bigint): Promise<void>
   });
 }
 
-async function showFundMenu(ctx: Context, _telegramId: bigint): Promise<void> {
+async function showFundMenu(ctx: Context, telegramId: bigint): Promise<void> {
   const ethPrice = await getEthUsdPrice();
-  await editOrReply(
-    ctx,
-    `💰 **Fund Sub-Wallets**\n\nDistribute ETH from your master wallet to every sub-wallet.`,
-    { reply_markup: fundAmountKeyboard(ethPrice), parse_mode: "Markdown" }
-  );
+  const wallets = await getWallets(telegramId);
+  const master = wallets[0];
+  let text = `💰 **Refuel / Distribute Gas**\n\nSend gas to the master wallet below, then distribute to every sub-wallet:`;
+  if (master) text += `\n\nMaster (send gas here):\n\`${master.address}\``;
+  text += `\n\nChoose an amount to send to EACH sub-wallet:`;
+  await editOrReply(ctx, text, {
+    reply_markup: fundAmountKeyboard(ethPrice),
+    parse_mode: "Markdown",
+  });
 }
 
-async function showPortfolio(ctx: Context, telegramId: bigint): Promise<void> {
-  await ctx.answerCallbackQuery({ text: "⏳ Loading portfolio..." });
+export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<void> {
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery({ text: "⏳ Loading portfolio..." }).catch(() => undefined);
+  }
   const wallets = await getWallets(telegramId);
   if (wallets.length === 0) {
     await editOrReply(ctx, `💼 No wallets yet. Create one first.`, {
@@ -163,25 +174,32 @@ async function showPortfolio(ctx: Context, telegramId: bigint): Promise<void> {
   let totalValue = 0;
   const lines: string[] = [];
   const kb = new InlineKeyboard();
+  let hasButtons = false;
 
   for (const wallet of wallets) {
     try {
       const portfolio = await fetchWalletPortfolio(wallet.address);
-      totalValue += portfolio.totalFloorValueEth;
-      if (portfolio.items.length === 0) {
-        lines.push(`👛 **${wallet.label}** — no NFTs`);
+      if (portfolio.error) {
+        lines.push(`👛 **${wallet.label}** — ⚠️ ${portfolio.error}`);
         continue;
       }
-      lines.push(`👛 **${wallet.label}** (\`${shortenAddress(wallet.address)}\`)`);
+      totalValue += portfolio.totalFloorValueEth;
+      if (portfolio.items.length === 0) {
+        lines.push(`👛 **${wallet.label}** — no NFTs found`);
+        continue;
+      }
+      lines.push(`👛 **${wallet.label}** (\`${wallet.address}\`)`);
       for (const item of portfolio.items) {
         lines.push(
           `   🖼 #${item.tokenId} — ${item.collectionName || item.name} (floor ${item.floorPriceEth} ETH)`
         );
         const cb = `sell_${item.tokenId}_${wallet.id}`;
         if (cb.length <= 64) {
-          kb.text(`Sell #${item.tokenId}`, cb);
+          kb.text(`💰 Sell #${item.tokenId}`, cb);
+          hasButtons = true;
         } else {
-          kb.url(`Sell #${item.tokenId}`, item.openseaUrl);
+          kb.url(`Sell #${item.tokenId} on OpenSea`, item.openseaUrl);
+          hasButtons = true;
         }
       }
       kb.row();
@@ -191,23 +209,16 @@ async function showPortfolio(ctx: Context, telegramId: bigint): Promise<void> {
   }
 
   let text = `💼 **Portfolio**\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
-  if (totalValue > 0) {
-    text += `\n\nSell instantly into the top bid with the buttons below.`;
-  }
-  kb.row().text("🔁 Refresh", "portfolio").text("🏠 Main Menu", "main_menu");
+  if (hasButtons) text += `\n\nSell instantly into the top bid with the buttons below.`;
+  if (hasButtons) kb.row();
+  kb.text("🔁 Refresh", "portfolio").text("🏠 Main Menu", "main_menu");
 
   await editOrReply(ctx, text, { reply_markup: kb, parse_mode: "Markdown" });
 }
 
 async function showSettings(ctx: Context): Promise<void> {
-  const kb = new InlineKeyboard()
-    .text("⛽ Gas Limit", "settings_gas")
-    .text("🔢 Mint Qty", "settings_qty")
-    .text("⚡ Auto-Sell", "settings_autosell")
-    .row()
-    .text("🏠 Main Menu", "main_menu");
-  await editOrReply(ctx, `🛡 **Settings**\n\nConfigure gas, mint quantity and auto-sell.`, {
-    reply_markup: kb,
+  await editOrReply(ctx, `🛡 **Settings**\n\nConfigure auto-sell, mint quantity and the gas ceiling.`, {
+    reply_markup: settingsMenuKeyboard(),
     parse_mode: "Markdown",
   });
 }
@@ -216,47 +227,54 @@ async function showGasSettings(ctx: Context, telegramId: bigint): Promise<void> 
   const gas = await checkGasSafety(telegramId);
   await editOrReply(
     ctx,
-    `⛽ **Gas Settings**\n\nCurrent network gas: \`${gas.currentGwei.toFixed(4)}\` Gwei\nYour ceiling: \`${gas.maxGwei}\` Gwei\n\nSet a new ceiling below:`,
+    `⛽ **Gas Price Ceiling Guard**\n\nCurrent network gas: \`${gas.currentGwei.toFixed(4)}\` Gwei\nYour ceiling: \`${gas.maxGwei}\` Gwei\n\nSet a new ceiling below:`,
     { reply_markup: gasSettingsKeyboard(gas.maxGwei), parse_mode: "Markdown" }
   );
 }
 
 async function showQtySettings(ctx: Context, telegramId: bigint): Promise<void> {
   const qty = getUserMintQuantity(telegramId);
-  const kb = new InlineKeyboard()
-    .text("1", "qty_1")
-    .text("2", "qty_2")
-    .text("3", "qty_3")
-    .row()
-    .text("5", "qty_5")
-    .text("10", "qty_10")
-    .row()
-    .text("🏠 Main Menu", "main_menu");
-  await editOrReply(ctx, `🔢 **Mint Quantity**\n\nMints per wallet per contract: \`${qty}\``, {
-    reply_markup: kb,
+  await editOrReply(ctx, `🔢 **Mint Multiplier**\n\nMints per wallet per contract: \`${qty}\``, {
+    reply_markup: quantitySettingsKeyboard(qty),
     parse_mode: "Markdown",
   });
 }
 
 async function showAutoSellSettings(ctx: Context, telegramId: bigint): Promise<void> {
   const config = getAutoSellConfig(telegramId);
-  const kb = new InlineKeyboard()
-    .text(
-      config.enabled ? "⚡ Auto-Sell: ON ✅" : "⚡ Auto-Sell: OFF",
-      config.enabled ? "autosell_off" : "autosell_on"
-    )
-    .row()
-    .text("Min 0.001", "autosell_min_0.001")
-    .text("Min 0.005", "autosell_min_0.005")
-    .text("Min 0.01", "autosell_min_0.01")
-    .text("Min 0.05", "autosell_min_0.05")
-    .row()
-    .text("🛡 Settings", "settings")
-    .text("🏠 Main Menu", "main_menu");
+  const ethPrice = await getEthUsdPrice();
   await editOrReply(
     ctx,
-    `⚡ **Auto-Sell Settings**\n\nEnabled: ${config.enabled ? "✅" : "⭕"}\nMin payout: \`${config.minPayoutEth}\` ETH`,
-    { reply_markup: kb, parse_mode: "Markdown" }
+    `⚡ **Auto-Sell / Take-Profit**\n\nEnabled: ${config.enabled ? "✅" : "⭕"}\nMin payout: \`${config.minPayoutEth}\` ETH`,
+    {
+      reply_markup: autoSellSettingsKeyboard(config.enabled, config.minPayoutEth, ethPrice),
+      parse_mode: "Markdown",
+    }
+  );
+}
+
+async function showMaxSpendSettings(ctx: Context, telegramId: bigint): Promise<void> {
+  const config = await getSniperConfig(telegramId);
+  await editOrReply(
+    ctx,
+    `💵 **Max Spend per Copy-Mint**\n\nCurrent: \`${config.maxSpendEth}\` ETH\n\nChoose a cap for auto copy-mints:`,
+    { reply_markup: maxSpendSettingsKeyboard(config.maxSpendEth), parse_mode: "Markdown" }
+  );
+}
+
+async function showHelpText(ctx: Context): Promise<void> {
+  await editOrReply(
+    ctx,
+    `📖 **Freemint-Bot Guide**\n\n` +
+      `• 💼 **Wallets** — generate, import, copy full addresses, export keys\n` +
+      `• 🎯 **Tracking** — copy-mint whales, set max spend\n` +
+      `• 🖼 **Portfolio** — view NFTs & sell into the top bid\n` +
+      `• 🔍 **Scan Contract** — security audit before any mint\n` +
+      `• 🚀 **Manual Mint** — mint a scanned contract\n` +
+      `• 👁 **Watchlist** — track contracts\n` +
+      `• 🛡 **Settings** — auto-sell, mint qty, gas ceiling\n\n` +
+      `Commands: /whois <addr> · /bypass <addr> · /portfolio`,
+    { reply_markup: backToMainKeyboard(), parse_mode: "Markdown" }
   );
 }
 
@@ -266,7 +284,10 @@ async function showTrackingMenu(ctx: Context, telegramId: bigint): Promise<void>
   await editOrReply(
     ctx,
     `🎯 **Sniper / Copy-Trade Tracking**\n\nAuto-copy: ${config.autoCopy ? "✅ ON" : "⭕ OFF"}\nMax spend: \`${config.maxSpendEth}\` ETH\nTracked wallets: \`${tracked.length}\``,
-    { reply_markup: trackingMenuKeyboard(config.autoCopy, config.maxSpendEth, tracked.length), parse_mode: "Markdown" }
+    {
+      reply_markup: trackingMenuKeyboard(config.autoCopy, config.maxSpendEth, tracked.length),
+      parse_mode: "Markdown",
+    }
   );
 }
 
@@ -297,7 +318,7 @@ async function showWatchlist(ctx: Context, telegramId: bigint): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Callback actions
+// Wallet actions
 // ---------------------------------------------------------------------------
 async function handleNewWallet(ctx: Context, telegramId: bigint): Promise<void> {
   try {
@@ -305,7 +326,7 @@ async function handleNewWallet(ctx: Context, telegramId: bigint): Promise<void> 
     const wallets = await getWallets(telegramId);
     await editOrReply(
       ctx,
-      `✅ **New Wallet Created**\n\n📍 \`${wallet.address}\`\n📋 Label: ${wallet.label}`,
+      `✅ **New Wallet Created**\n\n📍 \`${wallet.address}\`\n📋 Label: ${wallet.label}\n\nLong-press the address to copy it.`,
       { reply_markup: walletsKeyboard(wallets), parse_mode: "Markdown" }
     );
   } catch (err) {
@@ -331,6 +352,21 @@ async function handleToggleWallet(ctx: Context, telegramId: bigint, data: string
     reply_markup: walletsKeyboard(wallets),
     parse_mode: "Markdown",
   });
+}
+
+async function handleCopyAddress(ctx: Context, telegramId: bigint, data: string): Promise<void> {
+  const walletId = data.replace(/^copyaddr_/, "");
+  const wallets = await getWallets(telegramId);
+  const w = wallets.find((x) => x.id === walletId);
+  if (!w) {
+    await ctx.answerCallbackQuery({ text: "Wallet not found" });
+    return;
+  }
+  await ctx.answerCallbackQuery({ text: "Address sent below 👇" });
+  await ctx.reply(
+    `📋 **${w.label}** — full address (long-press to copy):\n\n\`${w.address}\``,
+    { parse_mode: "Markdown", reply_markup: backToWalletsKeyboard() }
+  );
 }
 
 async function showExportKeys(ctx: Context, telegramId: bigint): Promise<void> {
@@ -359,8 +395,13 @@ async function handleExportWallet(ctx: Context, data: string): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Fund / sweep
+// ---------------------------------------------------------------------------
 async function runFund(ctx: Context, telegramId: bigint, amount: number): Promise<void> {
-  await ctx.answerCallbackQuery({ text: "⏳ Funding sub-wallets..." });
+  if (ctx.callbackQuery) {
+    await ctx.answerCallbackQuery({ text: "⏳ Funding sub-wallets..." }).catch(() => undefined);
+  }
   try {
     const result = await fundSubWallets(telegramId, amount);
     let text = `✅ **Funding Complete**\n\nDistributed: \`${result.totalDistributedEth}\` ETH\n\n`;
@@ -422,6 +463,9 @@ async function runSweepNfts(ctx: Context, telegramId: bigint): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Sell flow (callback: sell_<tokenId>_<walletId>)
+// ---------------------------------------------------------------------------
 function parseSellPayload(data: string): { tokenId: string; walletId: string } {
   const idx = data.lastIndexOf("_");
   if (idx === -1) return { tokenId: "", walletId: "" };
@@ -459,11 +503,11 @@ async function handleSell(ctx: Context, telegramId: bigint, data: string): Promi
     return;
   }
 
-  const cb = `confirm_sell_${tokenId}_${walletId}`;
+  const confirmCb = `confirm_sell_${tokenId}_${walletId}`;
   const cancelCb = `cancel_sell_${tokenId}_${walletId}`;
   const kb = new InlineKeyboard();
-  if (cb.length <= 64 && cancelCb.length <= 64) {
-    kb.text("✅ Confirm Sell", cb).text("❌ Cancel", cancelCb).row();
+  if (confirmCb.length <= 64 && cancelCb.length <= 64) {
+    kb.text("✅ Confirm Sell", confirmCb).text("❌ Cancel", cancelCb).row();
   }
   kb.url("🔗 View on OpenSea", target.item.openseaUrl);
 
@@ -494,7 +538,11 @@ async function handleConfirmSell(ctx: Context, telegramId: bigint, data: string)
       await editOrReply(
         ctx,
         `✅ **Sold!**\n\nCollection: ${target.item.collectionName || target.item.name}\nToken: \`#${tokenId}\`\nPayout: \`${result.payoutEth ?? 0}\` ETH\n\n[View receipt](https://basescan.org/tx/${result.txHash})`,
-        { reply_markup: backToMainKeyboard(), parse_mode: "Markdown", link_preview_options: { is_disabled: true } }
+        {
+          reply_markup: backToMainKeyboard(),
+          parse_mode: "Markdown",
+          link_preview_options: { is_disabled: true },
+        }
       );
     } else {
       await editOrReply(ctx, `❌ **Sell failed**\n\n${result.error}`, {
@@ -518,6 +566,9 @@ async function handleCancelSell(ctx: Context, data: string): Promise<void> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Settings / tracking actions
+// ---------------------------------------------------------------------------
 async function handleFundCallback(ctx: Context, telegramId: bigint, data: string): Promise<void> {
   const amount = parseFloat(data.replace(/^fund_/, ""));
   if (!Number.isFinite(amount) || amount <= 0) {
@@ -539,7 +590,7 @@ async function handleSetGas(ctx: Context, telegramId: bigint, data: string): Pro
 }
 
 async function handleSetQty(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const qty = parseInt(data.replace(/^qty_/, ""), 10);
+  const qty = parseInt(data.replace(/^setqty_/, ""), 10);
   if (!Number.isFinite(qty) || qty < 1) {
     await ctx.answerCallbackQuery({ text: "Invalid quantity" });
     return;
@@ -549,21 +600,46 @@ async function handleSetQty(ctx: Context, telegramId: bigint, data: string): Pro
   await showQtySettings(ctx, telegramId);
 }
 
-async function handleAutoSellToggle(ctx: Context, telegramId: bigint, enabled: boolean): Promise<void> {
-  setAutoSellConfig(telegramId, enabled);
+async function handleAutoSellToggle(ctx: Context, telegramId: bigint): Promise<void> {
+  const config = getAutoSellConfig(telegramId);
+  setAutoSellConfig(telegramId, !config.enabled);
   await showAutoSellSettings(ctx, telegramId);
 }
 
 async function handleAutoSellMin(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const min = parseFloat(data.replace(/^autosell_min_/, ""));
+  const min = parseFloat(data.replace(/^set_as_/, ""));
   if (!Number.isFinite(min) || min <= 0) {
     await ctx.answerCallbackQuery({ text: "Invalid min payout" });
     return;
   }
-  const current = getAutoSellConfig(telegramId);
-  setAutoSellConfig(telegramId, current.enabled, min);
+  const config = getAutoSellConfig(telegramId);
+  setAutoSellConfig(telegramId, config.enabled, min);
   await ctx.answerCallbackQuery({ text: `Min payout set to ${min} ETH` });
   await showAutoSellSettings(ctx, telegramId);
+}
+
+async function handleSetMaxSpend(ctx: Context, telegramId: bigint, data: string): Promise<void> {
+  const max = parseFloat(data.replace(/^setspend_/, ""));
+  if (!Number.isFinite(max) || max < 0) {
+    await ctx.answerCallbackQuery({ text: "Invalid max spend" });
+    return;
+  }
+  const config = await getSniperConfig(telegramId);
+  await setSniperConfig(telegramId, config.autoCopy, max);
+  await ctx.answerCallbackQuery({ text: `Max spend set to ${max} ETH` });
+  await showTrackingMenu(ctx, telegramId);
+}
+
+async function handleToggleAutoCopy(ctx: Context, telegramId: bigint): Promise<void> {
+  const config = await getSniperConfig(telegramId);
+  await setSniperConfig(telegramId, !config.autoCopy, config.maxSpendEth);
+  await showTrackingMenu(ctx, telegramId);
+}
+
+async function handleRemoveTracked(ctx: Context, telegramId: bigint, data: string): Promise<void> {
+  const address = data.replace(/^del_tracked_/, "").toLowerCase();
+  await removeTrackedWallet(telegramId, address);
+  await showTrackedWallets(ctx, telegramId);
 }
 
 async function handleAutoMint(ctx: Context, telegramId: bigint, enabled: boolean): Promise<void> {
@@ -591,18 +667,6 @@ async function handleMintAddress(ctx: Context, telegramId: bigint, data: string)
 async function handleConfirmMint(ctx: Context, telegramId: bigint, data: string): Promise<void> {
   const address = normalizeAddressInput(data.replace(/^confirm_mint_/, ""));
   await performMint(ctx, telegramId, address);
-}
-
-async function handleToggleAutoCopy(ctx: Context, telegramId: bigint): Promise<void> {
-  const config = await getSniperConfig(telegramId);
-  await setSniperConfig(telegramId, !config.autoCopy, config.maxSpendEth);
-  await showTrackingMenu(ctx, telegramId);
-}
-
-async function handleRemoveTracked(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const address = data.replace(/^rmtrack_/, "").toLowerCase();
-  await removeTrackedWallet(telegramId, address);
-  await showTrackedWallets(ctx, telegramId);
 }
 
 // ---------------------------------------------------------------------------
@@ -644,15 +708,6 @@ async function promptMint(ctx: Context): Promise<void> {
   );
 }
 
-async function promptMaxSpend(ctx: Context): Promise<void> {
-  pendingMaxSpend.set(userIdNumber(ctx), true);
-  await editOrReply(
-    ctx,
-    `💸 **Set Max Spend**\n\nSend the max ETH per copy-mint (e.g. \`0.05\`).`,
-    { reply_markup: backToMainKeyboard(), parse_mode: "Markdown" }
-  );
-}
-
 async function promptAddTracked(ctx: Context): Promise<void> {
   pendingTracked.set(userIdNumber(ctx), true);
   await editOrReply(
@@ -663,103 +718,89 @@ async function promptAddTracked(ctx: Context): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Main callback dispatcher (order-sensitive branches first)
+// Callback dispatcher (most-specific prefixes first)
 // ---------------------------------------------------------------------------
 export async function handleCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data ?? "";
-  const telegramId = BigInt(ctx.from?.id ?? 0);
   if (!data) return;
+  const telegramId = BigInt(ctx.from?.id ?? 0);
 
-  switch (true) {
-    case data === "main_menu":
+  switch (data) {
+    case "main_menu":
       return showMainMenu(ctx, telegramId);
-    case data === "wallets":
+    case "wallets":
       return showWallets(ctx, telegramId);
-    case data === "new_wallet":
+    case "new_wallet":
       return handleNewWallet(ctx, telegramId);
-    case data === "import_key":
+    case "import_key":
       return promptImport(ctx);
-    case data === "export_keys":
+    case "export_keys":
       return showExportKeys(ctx, telegramId);
-    case data === "delete_wallet":
+    case "delete_wallet":
       return showDeleteWallet(ctx, telegramId);
-    case data === "fund_menu":
+    case "fund_menu":
       return showFundMenu(ctx, telegramId);
-    case data === "fund_custom":
+    case "fund_custom":
       return promptCustomFund(ctx);
-    case data === "sweep_dust":
+    case "sweep_dust":
       return runSweepDust(ctx, telegramId);
-    case data === "sweep_nfts":
+    case "sweep_nfts":
       return runSweepNfts(ctx, telegramId);
-    case data === "portfolio":
+    case "portfolio":
       return showPortfolio(ctx, telegramId);
-    case data === "settings":
+    case "settings":
       return showSettings(ctx);
-    case data === "settings_gas":
+    case "menu_gas_guard":
       return showGasSettings(ctx, telegramId);
-    case data === "settings_qty":
+    case "menu_mint_qty":
       return showQtySettings(ctx, telegramId);
-    case data === "settings_autosell":
+    case "menu_autosell":
       return showAutoSellSettings(ctx, telegramId);
-    case data === "watchlist":
+    case "menu_help_text":
+      return showHelpText(ctx);
+    case "toggle_autosell":
+      return handleAutoSellToggle(ctx, telegramId);
+    case "watchlist":
       return showWatchlist(ctx, telegramId);
-    case data === "scan_contract":
+    case "scan_contract":
       return promptScan(ctx);
-    case data === "manual_mint":
+    case "manual_mint":
       return promptMint(ctx);
-    case data === "menu_tracking":
+    case "menu_tracking":
       return showTrackingMenu(ctx, telegramId);
-    case data === "toggle_autocopy":
+    case "toggle_autocopy":
       return handleToggleAutoCopy(ctx, telegramId);
-    case data === "menu_max_spend":
-      return promptMaxSpend(ctx);
-    case data === "add_tracked_prompt":
+    case "menu_max_spend":
+      return showMaxSpendSettings(ctx, telegramId);
+    case "add_tracked_prompt":
       return promptAddTracked(ctx);
-    case data === "list_tracked_wallets":
+    case "list_tracked_wallets":
       return showTrackedWallets(ctx, telegramId);
-    case data === "auto_on":
+    case "auto_on":
       return handleAutoMint(ctx, telegramId, true);
-    case data === "auto_off":
+    case "auto_off":
       return handleAutoMint(ctx, telegramId, false);
-
-    case data.startsWith("export_"):
-      return handleExportWallet(ctx, data);
-    case data.startsWith("del_"):
-      return handleDeleteWallet(ctx, telegramId, data);
-    case data.startsWith("toggle_"):
-      return handleToggleWallet(ctx, telegramId, data);
-    case data.startsWith("fund_"):
-      return handleFundCallback(ctx, telegramId, data);
-    case data.startsWith("setgas_"):
-      return handleSetGas(ctx, telegramId, data);
-    case data.startsWith("qty_"):
-      return handleSetQty(ctx, telegramId, data);
-    case data.startsWith("autosell_min_"):
-      return handleAutoSellMin(ctx, telegramId, data);
-    case data.startsWith("autosell_on"):
-      return handleAutoSellToggle(ctx, telegramId, true);
-    case data.startsWith("autosell_off"):
-      return handleAutoSellToggle(ctx, telegramId, false);
-    case data.startsWith("rmwatch_"):
-      return handleRemoveWatch(ctx, telegramId, data);
-    case data.startsWith("scan_"):
-      return handleScanAddress(ctx, telegramId, data);
-    case data.startsWith("confirm_mint_"):
-      return handleConfirmMint(ctx, telegramId, data);
-    case data.startsWith("mint_"):
-      return handleMintAddress(ctx, telegramId, data);
-    case data.startsWith("rmtrack_"):
-      return handleRemoveTracked(ctx, telegramId, data);
-    case data.startsWith("confirm_sell_"):
-      return handleConfirmSell(ctx, telegramId, data);
-    case data.startsWith("cancel_sell_"):
-      return handleCancelSell(ctx, data);
-    case data.startsWith("sell_"):
-      return handleSell(ctx, telegramId, data);
-
-    default:
-      await ctx.answerCallbackQuery({ text: "Unknown action" });
   }
+
+  if (data.startsWith("confirm_sell_")) return handleConfirmSell(ctx, telegramId, data);
+  if (data.startsWith("cancel_sell_")) return handleCancelSell(ctx, data);
+  if (data.startsWith("sell_")) return handleSell(ctx, telegramId, data);
+  if (data.startsWith("copyaddr_")) return handleCopyAddress(ctx, telegramId, data);
+  if (data.startsWith("del_tracked_")) return handleRemoveTracked(ctx, telegramId, data);
+  if (data.startsWith("export_")) return handleExportWallet(ctx, data);
+  if (data.startsWith("del_")) return handleDeleteWallet(ctx, telegramId, data);
+  if (data.startsWith("toggle_")) return handleToggleWallet(ctx, telegramId, data);
+  if (data.startsWith("set_as_")) return handleAutoSellMin(ctx, telegramId, data);
+  if (data.startsWith("setspend_")) return handleSetMaxSpend(ctx, telegramId, data);
+  if (data.startsWith("setqty_")) return handleSetQty(ctx, telegramId, data);
+  if (data.startsWith("setgas_")) return handleSetGas(ctx, telegramId, data);
+  if (data.startsWith("fund_")) return handleFundCallback(ctx, telegramId, data);
+  if (data.startsWith("rmwatch_")) return handleRemoveWatch(ctx, telegramId, data);
+  if (data.startsWith("confirm_mint_")) return handleConfirmMint(ctx, telegramId, data);
+  if (data.startsWith("scan_")) return handleScanAddress(ctx, telegramId, data);
+  if (data.startsWith("mint_")) return handleMintAddress(ctx, telegramId, data);
+
+  await ctx.answerCallbackQuery({ text: "Unknown action" }).catch(() => undefined);
 }
 
 // ---------------------------------------------------------------------------
@@ -785,23 +826,6 @@ export async function handleText(ctx: Context): Promise<void> {
       return;
     }
     await runFund(ctx, telegramId, amount);
-    return;
-  }
-
-  if (pendingMaxSpend.get(uid)) {
-    pendingMaxSpend.delete(uid);
-    const max = parseFloat(text);
-    if (!Number.isFinite(max) || max <= 0) {
-      await ctx.reply("❌ Invalid amount. Send a number like `0.05`.", { parse_mode: "Markdown" });
-      return;
-    }
-    const config = await getSniperConfig(telegramId);
-    await setSniperConfig(telegramId, config.autoCopy, max);
-    const tracked = await getTrackedWallets(telegramId);
-    await ctx.reply(`✅ Max spend set to ${max} ETH.`, {
-      reply_markup: trackingMenuKeyboard(config.autoCopy, max, tracked.length),
-      parse_mode: "Markdown",
-    });
     return;
   }
 
@@ -850,7 +874,7 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
-  // Fallback: treat any pasted address as a contract to scan.
+  // Fallback: any pasted address is scanned.
   const address = normalizeAddressInput(text);
   if (isValidAddress(address)) {
     await performScan(ctx, telegramId, address);
@@ -890,13 +914,9 @@ async function performScan(
 
     let text = `🔍 **Contract Analysis & Security Audit**\n\n`;
     text += `Contract: \`${result.contractAddress}\`\n`;
-    text += `Verified: ${
-      result.isVerified ? "✅ Yes" : "⚠️ Bytecode only"
-    }\n`;
+    text += `Verified: ${result.isVerified ? "✅ Yes" : "⚠️ Bytecode only"}\n`;
     text += `🛡 **Security Status:** ${
-      result.security.isSafe
-        ? "✅ SAFE / CLEAN"
-        : "🚨 HIGH RISK / HONEYPOT"
+      result.security.isSafe ? "✅ SAFE / CLEAN" : "🚨 HIGH RISK / HONEYPOT"
     }\n`;
     text += `Risk Score: \`${result.security.riskScore} / 100\`\n\n`;
 
@@ -990,9 +1010,7 @@ async function performMint(
 
     for (const r of result.results) {
       const statusIcon = r.success ? "✅" : "❌";
-      let card = `${statusIcon} **${r.label}** — ${
-        r.success ? "Minted!" : "Failed"
-      }\n`;
+      let card = `${statusIcon} **${r.label}** — ${r.success ? "Minted!" : "Failed"}\n`;
       card += `Wallet: \`${shortenAddress(r.walletAddress)}\`\n`;
 
       if (r.txHash && r.basescanUrl) {
@@ -1009,11 +1027,7 @@ async function performMint(
     }
 
     await ctx.reply(
-      `📊 **Mint Summary**\n\nContract: \`${shortenAddress(
-        address
-      )}\`\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${
-        result.totalFailed
-      }\nTotal Attempts: ${result.results.length}`,
+      `📊 **Mint Summary**\n\nContract: \`${shortenAddress(address)}\`\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${result.totalFailed}\nTotal Attempts: ${result.results.length}`,
       {
         reply_markup: backToMainKeyboard(),
         parse_mode: "Markdown",
