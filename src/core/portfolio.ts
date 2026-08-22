@@ -1,230 +1,179 @@
-import { type Hex, type Address, createWalletClient, http } from "viem";
-import { base } from "viem/chains";
-import { privateKeyToAccount } from "viem/accounts";
-import { getPublicClient } from "./chain.js";
+import { Hex, Address } from "viem";
+import { getPublicClient, getWalletClient } from "./chain.js";
+import { fetchCollectionFloor, FloorData } from "./autoLister.js";
 
 export interface PortfolioItem {
   contractAddress: string;
   tokenId: string;
-  collectionName: string;
+  name: string;
   floorPriceEth: number;
   topBidEth: number;
   openseaUrl: string;
 }
 
 export interface WalletPortfolio {
-  walletAddress: string;
   items: PortfolioItem[];
-  totalNfts: number;
   totalFloorValueEth: number;
 }
 
-// Reservoir responses are cached per wallet to protect the free API tier.
-const CACHE_TTL_MS = 5 * 60_000;
-const reservoirCache = new Map<
-  string,
-  { expiresAt: number; data: Map<string, { floor: number; bid: number; name: string }> }
->();
-
-function reservoirApiKey(): string {
-  return process.env.RESERVOIR_API_KEY || "demo-api-key";
+export interface SellResult {
+  success: boolean;
+  txHash?: string;
+  payoutEth?: number;
+  error?: string;
 }
 
-async function fetchReservoirPortfolio(
+const BASESCAN_API = "https://api.basescan.org/api";
+
+interface NftTx {
+  contractAddress: string;
+  tokenID: string;
+  tokenName?: string;
+  from: string;
+  to: string;
+}
+
+export async function fetchWalletPortfolio(
   walletAddress: string
-): Promise<Map<string, { floor: number; bid: number; name: string }>> {
-  const key = walletAddress.toLowerCase();
-  const cached = reservoirCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.data;
+): Promise<WalletPortfolio> {
+  const apiKey = process.env.BASESCAN_API_KEY ?? "";
+  const url =
+    `${BASESCAN_API}?module=account&action=tokennfttx&address=${walletAddress}` +
+    `&page=1&offset=100&sort=desc&apikey=${apiKey}`;
 
-  const out = new Map<string, { floor: number; bid: number; name: string }>();
-  try {
-    const res = await fetch(`https://api-base.reservoir.tools/users/${walletAddress}/tokens/v7`, {
-      headers: { Accept: "*/*", "x-api-key": reservoirApiKey() },
-    });
-    if (res.ok) {
-      const json = (await res.json()) as any;
-      const tokens = json?.tokens ?? [];
-      for (const t of tokens) {
-        const contract = t?.token?.contract?.toLowerCase();
-        const tokenId = t?.token?.tokenId;
-        if (!contract || tokenId === undefined) continue;
-        const col = t?.token?.collection ?? {};
-        out.set(`${contract}:${tokenId}`, {
-          floor: Number(t?.market?.floorAsk?.price?.amount?.native ?? 0),
-          bid: Number(t?.market?.topBid?.price?.amount?.native ?? 0),
-          name: col?.name || `Base NFT (${contract.slice(0, 6)}...)`,
-        });
-      }
-    } else {
-      console.warn(`Reservoir portfolio returned HTTP ${res.status} for ${walletAddress}`);
-    }
-  } catch (err) {
-    console.warn(`Reservoir portfolio error for ${walletAddress}:`, err);
-  }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`BaseScan API error ${res.status}`);
 
-  reservoirCache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, data: out });
-  return out;
-}
-
-export async function fetchWalletPortfolio(walletAddress: string): Promise<WalletPortfolio> {
-  const items: PortfolioItem[] = [];
-  const targetWallet = walletAddress.toLowerCase();
-
-  // 1. Determine held tokens from BaseScan (reliable token-history source).
-  try {
-    const apiKey = process.env.BASESCAN_API_KEY || "";
-    const url = `https://api.basescan.org/api?module=account&action=tokennfttx&address=${walletAddress}&apikey=${apiKey}`;
-
-    const res = await fetch(url);
-    if (res.ok) {
-      const data = (await res.json()) as any;
-
-      if (data?.status === "1" && Array.isArray(data.result)) {
-        const held = new Map<string, { contract: string; tokenId: string }>();
-
-        for (const tx of data.result) {
-          const contract = tx.contractAddress?.toLowerCase();
-          const tokenId = tx.tokenID;
-          const to = tx.to?.toLowerCase();
-          const from = tx.from?.toLowerCase();
-
-          if (!contract || tokenId === undefined) continue;
-          const key = `${contract}-${tokenId}`;
-
-          if (to === targetWallet) {
-            held.set(key, { contract, tokenId });
-          } else if (from === targetWallet) {
-            held.delete(key);
-          }
-        }
-
-        // 2. Enrich with live floor/top-bid from Reservoir (cached 5 min).
-        const market = await fetchReservoirPortfolio(walletAddress);
-
-        for (const token of held.values()) {
-          const marketKey = `${token.contract}:${token.tokenId}`;
-          const m = market.get(marketKey);
-          items.push({
-            contractAddress: token.contract,
-            tokenId: token.tokenId,
-            collectionName: m?.name || `Base NFT (${token.contract.slice(0, 6)}...)`,
-            floorPriceEth: m?.floor ?? 0,
-            topBidEth: m?.bid ?? 0,
-            openseaUrl: `https://opensea.io/assets/base/${token.contract}/${token.tokenId}`,
-          });
-        }
-      }
-    }
-  } catch (err) {
-    console.error(`Portfolio fetch error for ${walletAddress}:`, err);
-  }
-
-  const totalFloorValueEth = items.reduce((sum, i) => sum + i.floorPriceEth, 0);
-
-  return {
-    walletAddress,
-    items,
-    totalNfts: items.length,
-    totalFloorValueEth,
+  const data = (await res.json()) as {
+    status?: string;
+    message?: string;
+    result?: NftTx[];
   };
+  const txs = Array.isArray(data.result) ? data.result : [];
+
+  // Reconstruct currently held tokens (newest tx wins per token)
+  const held = new Map<string, Map<string, string>>();
+  const addr = walletAddress.toLowerCase();
+  for (const tx of txs) {
+    const contract = tx.contractAddress.toLowerCase();
+    const tokenId = BigInt(tx.tokenID).toString();
+    const from = (tx.from ?? "").toLowerCase();
+    const to = (tx.to ?? "").toLowerCase();
+    if (from === addr) {
+      const tokens = held.get(contract);
+      if (tokens) tokens.delete(tokenId);
+    }
+    if (to === addr) {
+      let tokens = held.get(contract);
+      if (!tokens) {
+        tokens = new Map();
+        held.set(contract, tokens);
+      }
+      tokens.set(tokenId, tx.tokenName || "");
+    }
+  }
+
+  const floorCache = new Map<string, FloorData | null>();
+  const getFloor = async (contract: string): Promise<FloorData | null> => {
+    if (floorCache.has(contract)) return floorCache.get(contract)!;
+    try {
+      const floor = await fetchCollectionFloor(contract);
+      floorCache.set(contract, floor);
+      return floor;
+    } catch {
+      floorCache.set(contract, null);
+      return null;
+    }
+  };
+
+  const items: PortfolioItem[] = [];
+  for (const [contract, tokens] of held) {
+    const floor = await getFloor(contract);
+    for (const [tokenId, tokenName] of tokens) {
+      items.push({
+        contractAddress: contract,
+        tokenId,
+        name:
+          floor?.collectionName ||
+          tokenName ||
+          `Base NFT (${contract.slice(0, 6)}...)`,
+        floorPriceEth: floor?.floorPriceEth ?? 0,
+        topBidEth: floor?.topBidEth ?? 0,
+        openseaUrl: `https://opensea.io/assets/base/${contract}/${tokenId}`,
+      });
+    }
+  }
+
+  const totalFloorValueEth = items.reduce(
+    (sum, item) => sum + item.floorPriceEth,
+    0
+  );
+  return { items, totalFloorValueEth };
 }
 
 export async function executeSell(
-  privateKey: Hex,
+  privateKey: string,
   contractAddress: string,
   tokenId: string
-): Promise<{ success: boolean; payoutEth?: number; txHash?: string; error?: string }> {
-  const account = privateKeyToAccount(privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`);
-  const token = `${contractAddress.toLowerCase()}:${tokenId}`;
+): Promise<SellResult> {
+  const apiKey = process.env.RESERVOIR_API_KEY || "demo-api-key";
+  const body = {
+    orders: [{ token: `${contractAddress}:${tokenId}`, weiPrice: "0" }],
+  };
 
+  let res: Response;
   try {
-    // 1. Fetch the best active bid (buy order) for this token.
-    const bidsRes = await fetch(
-      `https://api-base.reservoir.tools/orders/bids/v5?token=${token}&status=active&sortBy=price&limit=1`,
-      { headers: { Accept: "*/*", "x-api-key": reservoirApiKey() } }
-    );
-    if (!bidsRes.ok) {
-      return { success: false, error: `Reservoir bids API HTTP ${bidsRes.status}` };
-    }
-    const bidsJson = (await bidsRes.json()) as any;
-    const bestBid = bidsJson?.orders?.[0];
-    if (!bestBid?.id) {
-      return { success: false, error: "No active bids found on secondary markets" };
-    }
-
-    const payoutEth = Number(bestBid?.price?.amount?.native ?? 0);
-    if (payoutEth <= 0) {
-      return { success: false, error: "Best bid has zero payout — cannot liquidate" };
-    }
-
-    // 2. Execute the sale (fulfill the buyer's signed order on-chain).
-    const sellRes = await fetch("https://api-base.reservoir.tools/execute/sell/v7", {
+    res = await fetch("https://api-base.reservoir.tools/execute/sell/v6", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": reservoirApiKey(),
-      },
-      body: JSON.stringify({
-        items: [{ orderId: bestBid.id }],
-        taker: account.address,
-        chainId: 8453,
-      }),
+      headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+      body: JSON.stringify(body),
     });
-    if (!sellRes.ok) {
-      return { success: false, error: `Failed to construct sell: HTTP ${sellRes.status}` };
-    }
-    const sellJson = (await sellRes.json()) as any;
-    const steps: any[] = sellJson?.steps ?? [];
-    if (steps.length === 0) {
-      return { success: false, error: "No sell steps returned by marketplace" };
-    }
-
-    const publicClient = getPublicClient();
-    const walletClient = createWalletClient({
-      account,
-      chain: base,
-      transport: http(process.env.BASE_RPC_URL || "https://mainnet.base.org"),
-    });
-
-    // 3. Walk the steps: optional EIP-712 signature, then transaction(s).
-    for (const step of steps) {
-      if (step.kind === "signature") {
-        const item = step.items?.[0]?.data;
-        if (item?.types && item?.domain && item?.value) {
-          await (walletClient as any).signTypedData({
-            domain: item.domain,
-            types: item.types,
-            primaryType: item.primaryType || "OrderComponents",
-            message: item.value,
-          });
-        }
-        continue;
-      }
-
-      for (const it of step.items ?? []) {
-        const txData = it?.data;
-        if (!txData?.to || !txData?.data) continue;
-
-        const txHash = await walletClient.sendTransaction({
-          to: txData.to as Address,
-          data: txData.data as Hex,
-          value: BigInt(txData.value || "0"),
-        });
-
-        const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
-        if (receipt.status !== "success") {
-          return { success: false, error: "Sale transaction reverted on-chain", txHash };
-        }
-        return { success: true, payoutEth, txHash };
-      }
-    }
-
+  } catch (err) {
     return {
       success: false,
-      error: "Sale prepared but no on-chain transaction was emitted (off-chain order accepted)",
+      error: `Reservoir request failed: ${err instanceof Error ? err.message : String(err)}`,
     };
-  } catch (err: any) {
-    return { success: false, error: err?.message || String(err) };
+  }
+
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => "");
+    return {
+      success: false,
+      error: `Reservoir API error ${res.status}: ${bodyText.slice(0, 200)}`,
+    };
+  }
+
+  const json = (await res.json().catch(() => ({}))) as any;
+  const step = (json.steps ?? []).find(
+    (s: any) => Array.isArray(s.items) && s.items.length > 0
+  );
+  const txData = step?.items?.[0]?.data;
+
+  if (!txData || !txData.to) {
+    return {
+      success: false,
+      error: "No active bids found on secondary markets",
+    };
+  }
+
+  try {
+    const hexKey = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+    const walletClient = getWalletClient(hexKey);
+    const txHash = await walletClient.sendTransaction({
+      to: txData.to as Address,
+      data: (txData.data ?? "0x") as Hex,
+      value: BigInt(txData.value ?? "0"),
+    });
+
+    const publicClient = getPublicClient();
+    await publicClient.waitForTransactionReceipt({ hash: txHash });
+
+    const payoutEth = Number(BigInt(txData.value ?? "0")) / 1e18;
+    return { success: true, txHash, payoutEth };
+  } catch (err) {
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
