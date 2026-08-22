@@ -25,116 +25,138 @@ export interface SellResult {
   error?: string;
 }
 
-const ETHERSCAN_V2 = "https://api.etherscan.io/v2/api";
-const BASE_CHAIN_ID = "8453";
-
-function explorerApiKey(): string {
-  return (
-    process.env.ETHERSCAN_API_KEY ||
-    process.env.BASESCAN_API_KEY ||
-    ""
-  ).trim();
-}
-
-function explorerBaseUrl(): string {
-  const raw = (process.env.BASESCAN_API_URL || ETHERSCAN_V2).trim();
-  if (/basescan\.org/i.test(raw) || (raw.endsWith("/api") && !raw.includes("/v2/"))) {
-    return ETHERSCAN_V2;
-  }
-  return raw || ETHERSCAN_V2;
-}
-
-interface NftTx {
+interface OwnedNft {
   contractAddress: string;
-  tokenID: string;
-  tokenName?: string;
-  from: string;
-  to: string;
+  tokenId: string;
+  name: string;
+  collectionName: string;
 }
 
-async function fetchNftTransfers(walletAddress: string): Promise<{
-  txs: NftTx[];
+async function fetchNftsAlchemy(walletAddress: string): Promise<{
+  nfts: OwnedNft[];
   error?: string;
 }> {
-  const apiKey = explorerApiKey();
-  const baseUrl = explorerBaseUrl();
-  const params = new URLSearchParams({
-    chainid: BASE_CHAIN_ID,
-    module: "account",
-    action: "tokennfttx",
-    address: walletAddress,
-    page: "1",
-    offset: "100",
-    sort: "desc",
-  });
-  if (apiKey) params.set("apikey", apiKey);
+  const key = (process.env.ALCHEMY_API_KEY || "").trim();
+  if (!key) return { nfts: [], error: "missing_key" };
 
-  const url = `${baseUrl}?${params.toString()}`;
+  const base = `https://base-mainnet.g.alchemy.com/nft/v3/${key}/getNFTsForOwner`;
+  const url = `${base}?owner=${walletAddress}&withMetadata=true&pageSize=100`;
+
   try {
     const res = await fetch(url, { headers: { Accept: "application/json" } });
-    const data = (await res.json()) as {
-      status?: string;
-      message?: string;
-      result?: NftTx[] | string;
-    };
-
-    if (typeof data.result === "string") {
-      if (/deprecated\s+v1/i.test(data.result)) {
-        return {
-          txs: [],
-          error:
-            "Explorer on deprecated V1 — set BASESCAN_API_URL=https://api.etherscan.io/v2/api",
-        };
-      }
-      if (/missing\/invalid api key/i.test(data.result)) {
-        return {
-          txs: [],
-          error: "Missing/invalid Etherscan API key for NFT history",
-        };
-      }
-      // "No transactions found" is a normal empty wallet
-      if (/no transactions found/i.test(data.result)) return { txs: [] };
-      return { txs: [], error: data.result.slice(0, 160) };
+    const data = (await res.json()) as any;
+    if (!res.ok) {
+      return {
+        nfts: [],
+        error: data?.message || data?.error?.message || `Alchemy HTTP ${res.status}`,
+      };
     }
+    const owned = Array.isArray(data?.ownedNfts) ? data.ownedNfts : [];
+    const nfts: OwnedNft[] = owned.map((n: any) => {
+      const contract = (n.contract?.address || n.contractAddress || "").toLowerCase();
+      const tokenId = String(
+        n.tokenId ?? n.id?.tokenId ?? "0"
+      ).replace(/^0x/, (h: string) => {
+        try {
+          return BigInt("0x" + h).toString();
+        } catch {
+          return h;
+        }
+      });
+      // tokenId may already be decimal
+      let tid = String(n.tokenId ?? "0");
+      try {
+        if (tid.startsWith("0x")) tid = BigInt(tid).toString();
+      } catch {
+        /* keep */
+      }
+      return {
+        contractAddress: contract,
+        tokenId: tid,
+        name: n.name || n.title || n.rawMetadata?.name || `Token #${tid}`,
+        collectionName:
+          n.contract?.name || n.collection?.name || n.contractMetadata?.name || "",
+      };
+    }).filter((n: OwnedNft) => n.contractAddress);
 
-    if (Array.isArray(data.result)) return { txs: data.result };
-    return { txs: [], error: data.message || "Unexpected explorer response" };
+    return { nfts };
   } catch (err) {
-    return {
-      txs: [],
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return { nfts: [], error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+async function fetchNftsReservoir(walletAddress: string): Promise<{
+  nfts: OwnedNft[];
+  error?: string;
+}> {
+  const apiKey = process.env.RESERVOIR_API_KEY || "demo-api-key";
+  const url = `https://api-base.reservoir.tools/users/${walletAddress}/tokens/v7?limit=100`;
+  try {
+    const res = await fetch(url, {
+      headers: { Accept: "application/json", "x-api-key": apiKey },
+    });
+    const data = (await res.json()) as any;
+    if (!res.ok) {
+      return {
+        nfts: [],
+        error: data?.message || `Reservoir HTTP ${res.status}`,
+      };
+    }
+    const tokens = Array.isArray(data?.tokens) ? data.tokens : [];
+    const nfts: OwnedNft[] = tokens.map((t: any) => {
+      const token = t.token || t;
+      return {
+        contractAddress: String(token.contract || "").toLowerCase(),
+        tokenId: String(token.tokenId ?? ""),
+        name: token.name || `Token #${token.tokenId}`,
+        collectionName: token.collection?.name || "",
+      };
+    }).filter((n: OwnedNft) => n.contractAddress && n.tokenId);
+
+    return { nfts };
+  } catch (err) {
+    return { nfts: [], error: err instanceof Error ? err.message : String(err) };
   }
 }
 
 export async function fetchWalletPortfolio(
   walletAddress: string
 ): Promise<WalletPortfolio> {
-  const { txs, error } = await fetchNftTransfers(walletAddress);
-  if (error) {
-    return { items: [], totalFloorValueEth: 0, error };
+  let nfts: OwnedNft[] = [];
+  let lastError: string | undefined;
+
+  const alchemy = await fetchNftsAlchemy(walletAddress);
+  if (alchemy.nfts.length > 0) {
+    nfts = alchemy.nfts;
+  } else if (alchemy.error && alchemy.error !== "missing_key") {
+    lastError = `Alchemy: ${alchemy.error}`;
   }
 
-  const held = new Map<string, Map<string, string>>();
-  const addr = walletAddress.toLowerCase();
-  for (const tx of txs) {
-    const contract = (tx.contractAddress || "").toLowerCase();
-    if (!contract) continue;
-    const tokenId = BigInt(tx.tokenID).toString();
-    const from = (tx.from ?? "").toLowerCase();
-    const to = (tx.to ?? "").toLowerCase();
-    if (from === addr) {
-      const tokens = held.get(contract);
-      if (tokens) tokens.delete(tokenId);
+  if (nfts.length === 0) {
+    const reservoir = await fetchNftsReservoir(walletAddress);
+    if (reservoir.nfts.length > 0) {
+      nfts = reservoir.nfts;
+      lastError = undefined;
+    } else if (reservoir.error) {
+      lastError = lastError
+        ? `${lastError}; Reservoir: ${reservoir.error}`
+        : `Reservoir: ${reservoir.error}`;
     }
-    if (to === addr) {
-      let tokens = held.get(contract);
-      if (!tokens) {
-        tokens = new Map();
-        held.set(contract, tokens);
-      }
-      tokens.set(tokenId, tx.tokenName || "");
+  }
+
+  if (nfts.length === 0) {
+    if (!process.env.ALCHEMY_API_KEY && lastError) {
+      return {
+        items: [],
+        totalFloorValueEth: 0,
+        error:
+          "Set ALCHEMY_API_KEY (free at dashboard.alchemy.com) — Etherscan free tier cannot list Base NFTs.",
+      };
     }
+    if (lastError) {
+      return { items: [], totalFloorValueEth: 0, error: lastError };
+    }
+    return { items: [], totalFloorValueEth: 0 };
   }
 
   const floorCache = new Map<string, FloorData | null>();
@@ -151,25 +173,20 @@ export async function fetchWalletPortfolio(
   };
 
   const items: PortfolioItem[] = [];
-  for (const [contract, tokens] of held) {
-    const floor = await getFloor(contract);
-    for (const [tokenId, tokenName] of tokens) {
-      items.push({
-        contractAddress: contract,
-        tokenId,
-        name:
-          floor?.collectionName ||
-          tokenName ||
-          `Base NFT (${contract.slice(0, 6)}...)`,
-        collectionName: floor?.collectionName ?? tokenName ?? "",
-        floorPriceEth: floor?.floorPriceEth ?? 0,
-        topBidEth: floor?.topBidEth ?? 0,
-        openseaUrl: `https://opensea.io/assets/base/${contract}/${tokenId}`,
-      });
-    }
+  for (const n of nfts) {
+    const floor = await getFloor(n.contractAddress);
+    items.push({
+      contractAddress: n.contractAddress,
+      tokenId: n.tokenId,
+      name: floor?.collectionName || n.name,
+      collectionName: floor?.collectionName || n.collectionName || "",
+      floorPriceEth: floor?.floorPriceEth ?? 0,
+      topBidEth: floor?.topBidEth ?? 0,
+      openseaUrl: `https://opensea.io/assets/base/${n.contractAddress}/${n.tokenId}`,
+    });
   }
 
-  const totalFloorValueEth = items.reduce((sum, item) => sum + item.floorPriceEth, 0);
+  const totalFloorValueEth = items.reduce((s, i) => s + i.floorPriceEth, 0);
   return { items, totalFloorValueEth };
 }
 
@@ -225,10 +242,7 @@ export async function executeSell(
       data: (txData.data ?? "0x") as Hex,
       value: BigInt(txData.value ?? "0"),
     });
-
-    const publicClient = getPublicClient();
-    await publicClient.waitForTransactionReceipt({ hash: txHash });
-
+    await getPublicClient().waitForTransactionReceipt({ hash: txHash });
     const payoutEth = Number(BigInt(txData.value ?? "0")) / 1e18;
     return { success: true, txHash, payoutEth };
   } catch (err) {
