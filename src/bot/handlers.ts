@@ -1,5 +1,5 @@
 import { type Context, InlineKeyboard } from "grammy";
-import { type Hex } from "viem";
+import { getAddress, type Address, type Hex } from "viem";
 import {
   generateNewWallet,
   importWallet,
@@ -17,6 +17,8 @@ import {
   normalizeAddressInput,
 } from "../core/chain.js";
 import { scanContract } from "../core/scanner.js";
+import { analyzeBypassOptions, executeBypass } from "../core/bypassEngine.js";
+import { whoisContract } from "../core/whois.js";
 import { 
   batchMint, 
   getUserMintQuantity, 
@@ -1334,4 +1336,175 @@ async function performImport(ctx: Context, telegramId: bigint, privateKey: strin
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+// ---------------------------------------------------------------------------
+// /bypass <contractAddress> — read-only whitelist-gate analysis (zero gas)
+// ---------------------------------------------------------------------------
+async function bypassCommand(ctx: Context) {
+  const telegramId = BigInt(ctx.from?.id ?? 0);
+  const parts = (ctx.message?.text ?? "").trim().split(/\s+/);
+  const rawAddr = parts[1];
+
+  if (!rawAddr || !isValidAddress(rawAddr)) {
+    await ctx.reply(
+      "Usage: `/bypass <contract_address>`\n\n" +
+      "Example: `/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E`\n\n" +
+      "Read-only analysis (zero gas). Lists bypass strategies. To execute one:\n" +
+      "`/bypassexec <contract_address> <strategyId>`",
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  const contractAddress = rawAddr.startsWith("0x") ? rawAddr : `0x${rawAddr}`;
+
+  // Probe from the user's first active wallet so simulations match reality.
+  const wallets = await getWallets(telegramId);
+  const attacker = (wallets.length > 0
+    ? getAddress(wallets[0].address)
+    : "0x0000000000000000000000000000000000000001") as Address;
+
+  await ctx.reply(`🔍 Analyzing whitelist gate for \`${shortenAddress(contractAddress)}\`...`, {
+    parse_mode: "Markdown",
+  });
+
+  try {
+    const report = await analyzeBypassOptions(contractAddress, attacker);
+
+    let msg = `🧬 **Whitelist Gate Analysis**\n\n`;
+    msg += `Contract: \`${report.contractAddress}\`\n`;
+    msg += `Gate Type: \`${report.fingerprint.gateType}\`\n`;
+
+    if (report.fingerprint.merkleRootPresent && report.fingerprint.merkleRootValue) {
+      msg += `🌳 Merkle Root: \`${report.fingerprint.merkleRootValue}\`\n`;
+    }
+    if (report.fingerprint.openAdminSetters.length > 0) {
+      msg += `🚨 Open admin setters (callable by ANYONE):\n`;
+      for (const s of report.fingerprint.openAdminSetters) {
+        msg += `• \`${s.signature}\`\n`;
+      }
+    }
+    for (const note of report.fingerprint.notes.slice(0, 5)) {
+      msg += `ℹ️ ${note}\n`;
+    }
+    msg += `\n`;
+
+    msg += `**Strategies:**\n`;
+    for (const s of report.strategies) {
+      const icon = s.executable ? "✅" : "❌";
+      msg += `${icon} \`${s.id}\` — ${s.name}\n`;
+    }
+
+    const execStrat = report.strategies.find((s) => s.executable && s.id !== "mint_open");
+    msg += `\n_To execute, reply:_\n`;
+    msg += `\`/bypassexec ${report.contractAddress} ${execStrat ? execStrat.id : "mint_open"}\``;
+
+    await ctx.reply(msg, {
+      parse_mode: "Markdown",
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (error) {
+    await ctx.reply(`❌ Bypass analysis failed: ${errorMessage(error)}`, {
+      reply_markup: backToMainKeyboard(),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /bypassexec <contractAddress> <strategyId> — confirmed execution + audit log
+// ---------------------------------------------------------------------------
+async function bypassExecCommand(ctx: Context) {
+  const telegramId = BigInt(ctx.from?.id ?? 0);
+  const parts = (ctx.message?.text ?? "").trim().split(/\s+/);
+  const rawAddr = parts[1];
+  const strategyId = parts[2];
+
+  if (!rawAddr || !strategyId || !isValidAddress(rawAddr)) {
+    await ctx.reply(
+      "Usage: `/bypassexec <contract_address> <strategyId>`\n\n" +
+      "Run `/bypass <contract_address>` first to list available strategy IDs.",
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  const contractAddress = rawAddr.startsWith("0x") ? rawAddr : `0x${rawAddr}`;
+
+  await ctx.reply(
+    `⚡ Executing bypass \`${strategyId}\` on \`${shortenAddress(contractAddress)}\` across active wallets...\n\n` +
+    `_Security gate + per-wallet simulation run before every transaction._`,
+    { parse_mode: "Markdown" }
+  );
+
+  try {
+    const outcome = await executeBypass(telegramId, contractAddress, strategyId);
+
+    let msg = `📊 **Bypass Execution Report**\n\n`;
+    msg += `Contract: \`${outcome.contractAddress}\`\n`;
+    msg += `Strategy: \`${outcome.strategyId}\`\n\n`;
+
+    for (const r of outcome.results) {
+      const icon = r.success ? "✅" : "❌";
+      msg += `${icon} **${r.walletLabel}** — ${r.success ? "Success" : "Failed"}\n`;
+      msg += `Wallet: \`${shortenAddress(r.walletAddress)}\`\n`;
+      if (r.txHash) msg += `TX: [${shortenAddress(r.txHash, 8, 8)}](https://basescan.org/tx/${r.txHash})\n`;
+      if (r.error) msg += `Error: ${r.error}\n`;
+      msg += `\n`;
+    }
+
+    await ctx.reply(msg, {
+      parse_mode: "Markdown",
+      reply_markup: backToMainKeyboard(),
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (error) {
+    await ctx.reply(`❌ Bypass execution failed: ${errorMessage(error)}`, {
+      reply_markup: backToMainKeyboard(),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /whois <contractAddress> — find the project behind a contract
+// ---------------------------------------------------------------------------
+async function whoisCommand(ctx: Context) {
+  const parts = (ctx.message?.text ?? "").trim().split(/\s+/);
+  const rawAddr = parts[1];
+
+  if (!rawAddr || !isValidAddress(rawAddr)) {
+    await ctx.reply(
+      "Usage: `/whois <contract_address>`\n\nExample: `/whois 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E`",
+      { parse_mode: "Markdown" }
+    );
+    return;
+  }
+
+  const contractAddress = rawAddr.startsWith("0x") ? rawAddr : `0x${rawAddr}`;
+
+  await ctx.reply(`🔎 Looking up \`${shortenAddress(contractAddress)}\`...`, { parse_mode: "Markdown" });
+
+  try {
+    const report = await whoisContract(contractAddress);
+
+    let msg = `🕵️ **Contract Lookup**\n\n`;
+    msg += `Contract: \`${report.contractAddress}\`\n`;
+    if (report.contractName) msg += `Name: \`${report.contractName}\`\n`;
+    if (report.symbol) msg += `Symbol: \`${report.symbol}\`\n`;
+    if (report.collectionName) msg += `Collection: \`${report.collectionName}\`\n`;
+    if (report.externalUrl) msg += `🌐 Project: ${report.externalUrl}\n`;
+    if (report.metadataUrl) msg += `📦 Metadata: ${report.metadataUrl}\n`;
+    if (report.openseaUrl) msg += `🖼 OpenSea: ${report.openseaUrl}\n`;
+    for (const note of report.notes) msg += `ℹ️ ${note}\n`;
+
+    await ctx.reply(msg, {
+      parse_mode: "Markdown",
+      reply_markup: backToMainKeyboard(),
+      link_preview_options: { is_disabled: true },
+    });
+  } catch (error) {
+    await ctx.reply(`❌ Lookup failed: ${errorMessage(error)}`, {
+      reply_markup: backToMainKeyboard(),
+    });
+  }
 }
