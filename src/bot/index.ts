@@ -1,7 +1,7 @@
 import { Bot } from "grammy";
 import { handleCallback, handleText } from "./handlers.js";
 import { backToMainKeyboard } from "./keyboards.js";
-import { whoisCommand, bypassCommand, bypassCallback } from "./commands.js";
+import { whoisCommand, bypassCommand, bypassCallback } from "./command.js";
 
 export function createBot(): Bot {
   const token = process.env.BOT_TOKEN;
@@ -18,7 +18,7 @@ export function createBot(): Bot {
         "/whois <contract> — contract intelligence report\n" +
         "/bypass <contract> — run the bypass engine\n\n" +
         "Use the menu below to get started.",
-      { reply_markup: backToMainKeyboard }
+      { reply_markup: backToMainKeyboard() }
     );
   });
 
@@ -29,7 +29,7 @@ export function createBot(): Bot {
         "/bypass <contract address> — analyze gates & attempt a bypass\n" +
         "/portfolio — view and sell your Base NFTs\n\n" +
         "Tip: after /whois, tap 🚀 Attempt Bypass to run the engine instantly.",
-      { reply_markup: backToMainKeyboard }
+      { reply_markup: backToMainKeyboard() }
     );
   });
 
