@@ -1,15 +1,17 @@
 import { getAddress } from "viem";
 import { getPublicClient } from "./chain.js";
 
-// Common 4-byte free-mint selectors
+// Common 4-byte free-mint selectors (executable mints only)
 const MINT_SELECTORS = new Set([
   "0x1249c58b", // mint()
   "0xa0712d68", // mint(uint256)
   "0x6a627842", // mint(address)
+  "0x40c10f19", // mint(address,uint256) — ERC20-ish; scanner will reject non-NFT
   "0x4e6ec247", // claim()
-  "0xefef39a1", // publicMint()
+  "0xefef39a1", // publicMint() — verify on your chain if used
   "0x84bb1e42", // mintFree()
   "0xa6f2ae3a", // claim(address,uint256)
+  "0x2db11544", // publicClaim() common variant — keep if you see it
 ]);
 
 export interface DropEvent {
@@ -49,7 +51,7 @@ export class BaseDropListener {
 
     this.unwatch = client.watchBlocks({
       includeTransactions: true,
-      emitMissed: false,
+      emitMissed: true, // catch up if we briefly disconnect
       onBlock: async (block) => {
         await this.handleBlock(block);
       },
@@ -63,9 +65,12 @@ export class BaseDropListener {
   private scheduleReconnect() {
     if (!this.isRunning) return;
 
-    // Tear down the dead subscription so a later stop() can't act on it.
     if (this.unwatch) {
-      try { this.unwatch(); } catch { /* ignore */ }
+      try {
+        this.unwatch();
+      } catch {
+        /* ignore */
+      }
       this.unwatch = null;
     }
 
@@ -77,7 +82,7 @@ export class BaseDropListener {
       if (!this.isRunning) return;
       try {
         this.subscribe();
-        this.reconnectDelay = BASE_RECONNECT_MS; // success → reset backoff
+        this.reconnectDelay = BASE_RECONNECT_MS;
       } catch (err) {
         console.error("Block watcher re-subscribe failed:", err);
         this.scheduleReconnect();
@@ -87,12 +92,8 @@ export class BaseDropListener {
 
   private rememberContract(addr: string): boolean {
     if (this.seenContracts.has(addr)) return false;
-
     this.seenContracts.add(addr);
     this.seenOrder.push(addr);
-
-    // Evict oldest entries once the cache is full (FIFO) so we never wipe
-    // everything and re-alert on known contracts.
     while (this.seenOrder.length > MAX_SEEN) {
       const oldest = this.seenOrder.shift();
       if (oldest) this.seenContracts.delete(oldest);
@@ -104,19 +105,22 @@ export class BaseDropListener {
     const txs = block?.transactions ?? [];
     for (const tx of txs) {
       if (!tx?.to || !tx?.input || tx.input === "0x") continue;
+      // Free mints only
+      if (tx.value !== 0n && tx.value !== undefined && BigInt(tx.value) !== 0n) continue;
 
-      // Only evaluate zero-value transactions (free mints)
-      if (tx.value !== 0n) continue;
-
-      const selector = tx.input.slice(0, 10).toLowerCase();
+      const selector = String(tx.input).slice(0, 10).toLowerCase();
       if (!MINT_SELECTORS.has(selector)) continue;
 
-      const contractAddr = getAddress(tx.to);
+      let contractAddr: string;
+      try {
+        contractAddr = getAddress(tx.to);
+      } catch {
+        continue;
+      }
 
-      // Avoid duplicate processing within the same session
       if (!this.rememberContract(contractAddr)) continue;
 
-      console.log(`🎯 Free-mint candidate detected: ${contractAddr} (sig: ${selector})`);
+      console.log(`🎯 Free-mint candidate: ${contractAddr} (sig: ${selector})`);
 
       this.onDropDetected({
         contractAddress: contractAddr,
