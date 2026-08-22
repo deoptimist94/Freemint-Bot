@@ -4,14 +4,20 @@ import { startHealthServer } from "./server/health.js";
 import { startAutoMintLoop } from "./core/autoMint.js";
 import { prisma } from "./db/client.js";
 import { BaseDropListener } from "./core/listener.js";
-import { scanContract } from "./core/scanner.js";
+import {
+  scanContract,
+  getBestMintFunction,
+  simulateMint,
+} from "./core/scanner.js";
 import { startFloorWatcher } from "./core/floorWatcher.js";
 import { pollTrackedWalletsForUser } from "./core/sniperEngine.js";
+import { getWallets } from "./core/wallet.js";
+import { getAutoMintStatus } from "./core/watchlist.js";
+import { batchMint } from "./core/mint.js";
 
 async function main() {
   console.log("🚀 Starting Base Auto-Mint Bot...");
 
-  // Validate required environment variables
   const required = ["BOT_TOKEN", "ENCRYPTION_KEY"];
   for (const key of required) {
     if (!process.env[key]) {
@@ -20,7 +26,6 @@ async function main() {
     }
   }
 
-  // Test database connection
   try {
     await prisma.$connect();
     console.log("✅ Database connected");
@@ -29,29 +34,22 @@ async function main() {
     process.exit(1);
   }
 
-  // Create bot instance
   const bot = createBot();
-
-  // Start health check server for Railway
   startHealthServer(bot);
-
-  // Start auto-mint polling loop
   startAutoMintLoop(bot);
-
-  // 📈 Start Background Floor Price & Value Alert Watcher (every 5 mins)
   startFloorWatcher(bot, 300);
 
-  // 🎯 Background Copy-Mint Poller (runs every 12 seconds matching Base block time)
+  // Copy-trade every ~2 Base blocks
   setInterval(async () => {
     try {
       const configs = await prisma.sniperConfig.findMany({
         where: { autoCopy: true },
       });
-
       for (const cfg of configs) {
         await pollTrackedWalletsForUser(cfg.userId, async (msg) => {
           try {
-            const targetChatId = typeof cfg.userId === "bigint" ? Number(cfg.userId) : cfg.userId;
+            const targetChatId =
+              typeof cfg.userId === "bigint" ? Number(cfg.userId) : cfg.userId;
             await bot.api.sendMessage(targetChatId, msg, { parse_mode: "Markdown" });
           } catch (e) {
             console.error("Failed to send copy-mint notification:", e);
@@ -61,20 +59,57 @@ async function main() {
     } catch (err) {
       console.error("Error in background copy-mint poller:", err);
     }
-  }, 12000);
+  }, 12_000);
 
-  // 📡 Real-Time Free-Mint Auto-Discovery Block Sniffer
+  // Real-time free-mint sniffer → STRICT filter before alert
   const dropListener = new BaseDropListener(async (drop) => {
     try {
       const scan = await scanContract(drop.contractAddress);
-      if (!scan.isContract || scan.mintFunctions.length === 0) return;
 
-      const fn = scan.mintFunctions[0];
+      // Hard gates: real NFT + free mint + safe
+      if (!scan.isContract || !scan.isNft) {
+        console.log(`⏭ Drop ignored (not NFT): ${drop.contractAddress}`);
+        return;
+      }
+      if (!scan.security?.isSafe) {
+        console.log(`⏭ Drop ignored (unsafe): ${drop.contractAddress}`);
+        return;
+      }
+      if (!scan.mintFunctions.length) {
+        console.log(`⏭ Drop ignored (no free mint): ${drop.contractAddress}`);
+        return;
+      }
+
+      const fn = getBestMintFunction(scan.mintFunctions) || scan.mintFunctions[0];
+
+      // Prove mint is LIVE right now (filters closed / sold-out / non-NFT mints)
+      const probeWallets = await getWallets(
+        (
+          await (prisma as any).user.findFirst({
+            where: { wallets: { some: {} } },
+            include: { wallets: true },
+          })
+        )?.telegramId ?? 0n
+      ).catch(() => [] as Awaited<ReturnType<typeof getWallets>>);
+
+      const probeFrom =
+        probeWallets[0]?.address ||
+        "0x0000000000000000000000000000000000000001";
+
+      const sim = await simulateMint(scan.contractAddress, probeFrom, fn);
+      if (!sim.success) {
+        console.log(
+          `⏭ Drop ignored (simulation revert — mint closed or gated): ${drop.contractAddress} — ${sim.error?.slice(0, 120)}`
+        );
+        return;
+      }
+
       const alertMessage =
         `🚨 *NEW FREE MINT DETECTED!*\n\n` +
         `📦 *Contract:* \`${scan.contractAddress}\`\n` +
-        `⚙️ *Function:* \`${fn.name}\`\n` +
-        `🔍 *Verified:* ${scan.isVerified ? "✅ Yes" : "⚠️ Bytecode"}\n\n` +
+        `⚙️ *Function:* \`${fn.name}(${fn.args.join(",")})\`\n` +
+        `🔍 *Verified:* ${scan.isVerified ? "✅ Yes" : "⚠️ Bytecode"}\n` +
+        `🧪 *Live sim:* ✅ passes\n\n` +
         `_Tap below to mint with your active wallets:_`;
 
       const activeUsers = (await (prisma as any).user.findMany({
@@ -82,22 +117,53 @@ async function main() {
       })) as Array<any>;
 
       for (const user of activeUsers) {
-        const hasWallets = user.wallets && user.wallets.length > 0;
-        if (!hasWallets) continue;
+        if (!user.wallets?.length) continue;
 
-        const targetChatId = typeof user.telegramId === "bigint" 
-          ? Number(user.telegramId) 
-          : user.telegramId;
+        const targetChatId =
+          typeof user.telegramId === "bigint"
+            ? Number(user.telegramId)
+            : user.telegramId;
 
-        await bot.api.sendMessage(targetChatId, alertMessage, {
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: "🚀 Batch Mint Now", callback_data: `mint_${scan.contractAddress}` }],
-              [{ text: "🔗 View on BaseScan", url: `https://basescan.org/address/${scan.contractAddress}` }],
-            ],
-          },
-        }).catch((sendErr) => console.error(`Alert error for user ${user.telegramId}:`, sendErr));
+        await bot.api
+          .sendMessage(targetChatId, alertMessage, {
+            parse_mode: "Markdown",
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: "🚀 Batch Mint Now",
+                    callback_data: `mint_${scan.contractAddress}`,
+                  },
+                ],
+                [
+                  {
+                    text: "🔗 View on BaseScan",
+                    url: `https://basescan.org/address/${scan.contractAddress}`,
+                  },
+                ],
+              ],
+            },
+          })
+          .catch((sendErr) =>
+            console.error(`Alert error for user ${user.telegramId}:`, sendErr)
+          );
+
+        // Optional: auto-fire when user has Auto-Mint ON
+        try {
+          const autoOn = await getAutoMintStatus(BigInt(user.telegramId));
+          if (autoOn) {
+            console.log(`⚡ Auto-minting discovery for ${user.telegramId} on ${scan.contractAddress}`);
+            const result = await batchMint(BigInt(user.telegramId), scan.contractAddress);
+            let msg =
+              `⚡ *Auto-Mint (discovery)*\n\nContract: \`${scan.contractAddress}\`\n` +
+              `✅ ${result.totalSuccess} · ❌ ${result.totalFailed}`;
+            await bot.api
+              .sendMessage(targetChatId, msg, { parse_mode: "Markdown" })
+              .catch(() => undefined);
+          }
+        } catch (autoErr) {
+          console.error("Discovery auto-mint error:", autoErr);
+        }
       }
     } catch (err) {
       console.error("Auto-discovery pipeline error:", err);
@@ -106,7 +172,6 @@ async function main() {
 
   dropListener.start();
 
-  // Graceful shutdown
   const handleShutdown = async (signal: string) => {
     console.log(`🛑 Shutting down (${signal})...`);
     dropListener.stop();
@@ -118,7 +183,6 @@ async function main() {
   process.on("SIGINT", () => handleShutdown("SIGINT"));
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
 
-  // Start grammY polling
   try {
     await bot.start({
       onStart: (botInfo) => {
