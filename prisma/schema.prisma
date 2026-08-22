@@ -17,6 +17,7 @@ model User {
   watchlist      Watchlist[]
   trackedWallets TrackedWallet[]
   sniperConfig   SniperConfig?
+  bypassLogs     BypassLog[]
 }
 
 model Wallet {
@@ -59,11 +60,11 @@ model Watchlist {
 }
 
 model TrackedWallet {
-  id         String   @id @default(cuid())
-  userId     BigInt
-  address    String
-  label      String?
-  createdAt  DateTime @default(now())
+  id        String   @id @default(cuid())
+  userId    BigInt
+  address   String
+  label     String?
+  createdAt DateTime @default(now())
 
   user User @relation(fields: [userId], references: [telegramId], onDelete: Cascade)
 
@@ -79,4 +80,21 @@ model SniperConfig {
   updatedAt   DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [telegramId], onDelete: Cascade)
+}
+
+model BypassLog {
+  id              String   @id @default(cuid())
+  userId          BigInt
+  contractAddress String
+  strategyId      String
+  walletAddress   String
+  success         Boolean
+  txHash          String?
+  error           String?
+  createdAt       DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [telegramId], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([contractAddress])
 }
