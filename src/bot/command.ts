@@ -15,7 +15,7 @@ export async function whoisCommand(ctx: Context): Promise<void> {
   if (!raw) {
     await ctx.reply(
       "❌ Usage: /whois <contract address>\n\nExample:\n/whois 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E",
-      { reply_markup: backToMainKeyboard }
+      { reply_markup: backToMainKeyboard() }
     );
     return;
   }
@@ -23,7 +23,7 @@ export async function whoisCommand(ctx: Context): Promise<void> {
   const address = normalizeAddressInput(raw);
   if (!address || !isValidAddress(address)) {
     await ctx.reply("❌ Invalid contract address. Please send a valid Base (EVM) address.", {
-      reply_markup: backToMainKeyboard,
+      reply_markup: backToMainKeyboard(),
     });
     return;
   }
@@ -40,7 +40,7 @@ export async function whoisCommand(ctx: Context): Promise<void> {
   } catch (err) {
     await ctx.reply(
       `❌ WHOIS failed: ${err instanceof Error ? err.message : String(err)}`,
-      { reply_markup: backToMainKeyboard }
+      { reply_markup: backToMainKeyboard() }
     );
   }
 }
@@ -52,7 +52,7 @@ export async function bypassCommand(ctx: Context): Promise<void> {
   if (!raw) {
     await ctx.reply(
       "❌ Usage: /bypass <contract address>\n\nExample:\n/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E",
-      { reply_markup: backToMainKeyboard }
+      { reply_markup: backToMainKeyboard() }
     );
     return;
   }
@@ -60,7 +60,7 @@ export async function bypassCommand(ctx: Context): Promise<void> {
   const address = normalizeAddressInput(raw);
   if (!address || !isValidAddress(address)) {
     await ctx.reply("❌ Invalid contract address.", {
-      reply_markup: backToMainKeyboard,
+      reply_markup: backToMainKeyboard(),
     });
     return;
   }
@@ -71,12 +71,12 @@ export async function bypassCommand(ctx: Context): Promise<void> {
   try {
     const result = await executeBypass(userId, address);
     await ctx.reply(formatBypassResult(result), {
-      reply_markup: backToMainKeyboard,
+      reply_markup: backToMainKeyboard(),
     });
   } catch (err) {
     await ctx.reply(
       `❌ Bypass engine error: ${err instanceof Error ? err.message : String(err)}`,
-      { reply_markup: backToMainKeyboard }
+      { reply_markup: backToMainKeyboard() }
     );
   }
 }
@@ -106,18 +106,26 @@ export async function bypassCallback(ctx: Context): Promise<void> {
     };
   }
 
+  const chatId = ctx.callbackQuery?.message?.chat?.id;
+  if (chatId === undefined) {
+    await ctx.reply(formatBypassResult(result), {
+      reply_markup: backToMainKeyboard(),
+    });
+    return;
+  }
+
   try {
     await ctx.api.editMessageText(
-      ctx.chat?.id,
+      chatId,
       progress.message_id,
       formatBypassResult(result),
-      { reply_markup: backToMainKeyboard }
+      { reply_markup: backToMainKeyboard() }
     );
   } catch (err) {
     // Telegram 400 "message is not modified" — safe to ignore
     if (err instanceof Error && /message is not modified/i.test(err.message)) return;
     await ctx.reply(formatBypassResult(result), {
-      reply_markup: backToMainKeyboard,
+      reply_markup: backToMainKeyboard(),
     });
   }
 }
