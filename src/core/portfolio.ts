@@ -15,6 +15,7 @@ export interface PortfolioItem {
 export interface WalletPortfolio {
   items: PortfolioItem[];
   totalFloorValueEth: number;
+  error?: string;
 }
 
 export interface SellResult {
@@ -24,7 +25,24 @@ export interface SellResult {
   error?: string;
 }
 
-const BASESCAN_API = "https://api.basescan.org/api";
+const ETHERSCAN_V2 = "https://api.etherscan.io/v2/api";
+const BASE_CHAIN_ID = "8453";
+
+function explorerApiKey(): string {
+  return (
+    process.env.ETHERSCAN_API_KEY ||
+    process.env.BASESCAN_API_KEY ||
+    ""
+  ).trim();
+}
+
+function explorerBaseUrl(): string {
+  const raw = (process.env.BASESCAN_API_URL || ETHERSCAN_V2).trim();
+  if (/basescan\.org/i.test(raw) || (raw.endsWith("/api") && !raw.includes("/v2/"))) {
+    return ETHERSCAN_V2;
+  }
+  return raw || ETHERSCAN_V2;
+}
 
 interface NftTx {
   contractAddress: string;
@@ -34,29 +52,74 @@ interface NftTx {
   to: string;
 }
 
+async function fetchNftTransfers(walletAddress: string): Promise<{
+  txs: NftTx[];
+  error?: string;
+}> {
+  const apiKey = explorerApiKey();
+  const baseUrl = explorerBaseUrl();
+  const params = new URLSearchParams({
+    chainid: BASE_CHAIN_ID,
+    module: "account",
+    action: "tokennfttx",
+    address: walletAddress,
+    page: "1",
+    offset: "100",
+    sort: "desc",
+  });
+  if (apiKey) params.set("apikey", apiKey);
+
+  const url = `${baseUrl}?${params.toString()}`;
+  try {
+    const res = await fetch(url, { headers: { Accept: "application/json" } });
+    const data = (await res.json()) as {
+      status?: string;
+      message?: string;
+      result?: NftTx[] | string;
+    };
+
+    if (typeof data.result === "string") {
+      if (/deprecated\s+v1/i.test(data.result)) {
+        return {
+          txs: [],
+          error:
+            "Explorer on deprecated V1 — set BASESCAN_API_URL=https://api.etherscan.io/v2/api",
+        };
+      }
+      if (/missing\/invalid api key/i.test(data.result)) {
+        return {
+          txs: [],
+          error: "Missing/invalid Etherscan API key for NFT history",
+        };
+      }
+      // "No transactions found" is a normal empty wallet
+      if (/no transactions found/i.test(data.result)) return { txs: [] };
+      return { txs: [], error: data.result.slice(0, 160) };
+    }
+
+    if (Array.isArray(data.result)) return { txs: data.result };
+    return { txs: [], error: data.message || "Unexpected explorer response" };
+  } catch (err) {
+    return {
+      txs: [],
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export async function fetchWalletPortfolio(
   walletAddress: string
 ): Promise<WalletPortfolio> {
-  const apiKey = process.env.BASESCAN_API_KEY ?? "";
-  const url =
-    `${BASESCAN_API}?module=account&action=tokennfttx&address=${walletAddress}` +
-    `&page=1&offset=100&sort=desc&apikey=${apiKey}`;
+  const { txs, error } = await fetchNftTransfers(walletAddress);
+  if (error) {
+    return { items: [], totalFloorValueEth: 0, error };
+  }
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`BaseScan API error ${res.status}`);
-
-  const data = (await res.json()) as {
-    status?: string;
-    message?: string;
-    result?: NftTx[];
-  };
-  const txs = Array.isArray(data.result) ? data.result : [];
-
-  // Reconstruct currently held tokens (newest tx wins per token)
   const held = new Map<string, Map<string, string>>();
   const addr = walletAddress.toLowerCase();
   for (const tx of txs) {
-    const contract = tx.contractAddress.toLowerCase();
+    const contract = (tx.contractAddress || "").toLowerCase();
+    if (!contract) continue;
     const tokenId = BigInt(tx.tokenID).toString();
     const from = (tx.from ?? "").toLowerCase();
     const to = (tx.to ?? "").toLowerCase();
@@ -98,7 +161,7 @@ export async function fetchWalletPortfolio(
           floor?.collectionName ||
           tokenName ||
           `Base NFT (${contract.slice(0, 6)}...)`,
-        collectionName: floor?.collectionName ?? "",
+        collectionName: floor?.collectionName ?? tokenName ?? "",
         floorPriceEth: floor?.floorPriceEth ?? 0,
         topBidEth: floor?.topBidEth ?? 0,
         openseaUrl: `https://opensea.io/assets/base/${contract}/${tokenId}`,
@@ -106,10 +169,7 @@ export async function fetchWalletPortfolio(
     }
   }
 
-  const totalFloorValueEth = items.reduce(
-    (sum, item) => sum + item.floorPriceEth,
-    0
-  );
+  const totalFloorValueEth = items.reduce((sum, item) => sum + item.floorPriceEth, 0);
   return { items, totalFloorValueEth };
 }
 
@@ -152,14 +212,13 @@ export async function executeSell(
   const txData = step?.items?.[0]?.data;
 
   if (!txData || !txData.to) {
-    return {
-      success: false,
-      error: "No active bids found on secondary markets",
-    };
+    return { success: false, error: "No active bids found on secondary markets" };
   }
 
   try {
-    const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
+    const hexKey = (
+      privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
+    ) as Hex;
     const walletClient = getWalletClient(hexKey);
     const txHash = await walletClient.sendTransaction({
       to: txData.to as Address,
