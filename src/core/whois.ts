@@ -1,65 +1,86 @@
-import { type Address, getAddress, isAddress, formatEther } from "viem";
-import { getPublicClient } from "./chain.js";
+import {
+  scanContract,
+  getBestMintFunction,
+  ScanResult,
+  MintFunctionInfo,
+} from "./scanner.js";
+import { normalizeAddressInput, shortenAddress } from "./chain.js";
 
 export interface WhoisReport {
-  address: Address;
+  contractAddress: string;
   isContract: boolean;
-  bytecodeSize: number;
-  ethBalance: string;
-  txCount: number;
-  basescanUrl: string;
-  notes: string[];
+  isVerified: boolean;
+  isNft: boolean;
+  mintFunctions: MintFunctionInfo[];
+  bestMint: MintFunctionInfo | null;
+  riskScore: number;
+  isSafe: boolean;
+  isHoneypot: boolean;
+  isDrainer: boolean;
+  warnings: string[];
+  warning?: string;
 }
 
-export async function lookupWhois(raw: string): Promise<WhoisReport> {
-  if (!isAddress(raw)) {
-    throw new Error("Invalid address. Expected 0x + 40 hex characters.");
-  }
+export async function runWhois(rawAddress: string): Promise<WhoisReport> {
+  const address = normalizeAddressInput(rawAddress);
+  if (!address) throw new Error("Invalid address");
 
-  const address = getAddress(raw);
-  const client = getPublicClient();
-
-  const [code, balance, txCount] = await Promise.all([
-    client.getBytecode({ address }),
-    client.getBalance({ address }),
-    client.getTransactionCount({ address }),
-  ]);
-
-  const bytecodeSize =
-    code && code !== "0x" ? Math.floor((code.length - 2) / 2) : 0;
-  const isContract = bytecodeSize > 0;
-  const notes: string[] = [];
-
-  if (isContract) {
-    notes.push(`On-chain contract bytecode ~${bytecodeSize} bytes`);
-  } else {
-    notes.push("EOA (no contract code at this address)");
-  }
-  if (txCount === 0) notes.push("No outbound transactions from this address");
-  if (balance === 0n) notes.push("Zero ETH balance");
+  const result: ScanResult = await scanContract(address);
+  const bestMint =
+    result.mintFunctions.length > 0
+      ? getBestMintFunction(result.mintFunctions)
+      : null;
 
   return {
-    address,
-    isContract,
-    bytecodeSize,
-    ethBalance: Number(formatEther(balance)).toFixed(6),
-    txCount,
-    basescanUrl: `https://basescan.org/address/${address}`,
-    notes,
+    contractAddress: result.contractAddress,
+    isContract: result.isContract,
+    isVerified: result.isVerified,
+    isNft: result.mintFunctions.length > 0,
+    mintFunctions: result.mintFunctions,
+    bestMint,
+    riskScore: result.security?.riskScore ?? 0,
+    isSafe: result.security?.isSafe ?? false,
+    isHoneypot: result.security?.isHoneypot ?? false,
+    isDrainer: result.security?.isDrainer ?? false,
+    warnings: result.security?.warnings ?? [],
+    warning: result.warning,
   };
 }
 
-export function formatWhoisReport(r: WhoisReport): string {
-  let t = `🔎 **Whois**\n\n`;
-  t += `Address: \`${r.address}\`\n`;
-  t += `Type: ${r.isContract ? "📄 Contract" : "👤 EOA"}\n`;
-  if (r.isContract) t += `Bytecode: ~${r.bytecodeSize} bytes\n`;
-  t += `ETH Balance: \`${r.ethBalance}\` ETH\n`;
-  t += `Nonce / tx count: \`${r.txCount}\`\n`;
-  t += `Basescan: [open](${r.basescanUrl})\n`;
-  if (r.notes.length > 0) {
-    t += `\n**Notes:**\n`;
-    for (const n of r.notes) t += `• ${n}\n`;
+export function formatWhoisReport(report: WhoisReport): string {
+  const lines: string[] = [];
+  lines.push("📇 WHOIS Report");
+  lines.push("──────────────────────────");
+  lines.push(`🔤 Contract: ${shortenAddress(report.contractAddress)}`);
+  lines.push(`🧾 Verified: ${report.isVerified ? "✅ Yes" : "⚠️ No — source unverified"}`);
+  lines.push(`🪙 NFT: ${report.isNft ? "✅ Yes" : "❌ No mint functions found"}`);
+
+  if (report.mintFunctions.length > 0) {
+    lines.push("⛏ Mint functions:");
+    for (const fn of report.mintFunctions.slice(0, 5)) {
+      lines.push(
+        `  • ${fn.name}(${fn.args.join(", ")}) — ${
+          fn.isFreeMint ? "FREE" : fn.requiresPayment ? "paid" : "unknown"
+        }`
+      );
+    }
+    if (report.mintFunctions.length > 5) {
+      lines.push(`  … +${report.mintFunctions.length - 5} more`);
+    }
   }
-  return t;
+
+  if (report.bestMint) {
+    lines.push(`🎯 Best mint: ${report.bestMint.name}(${report.bestMint.args.join(", ")})`);
+  }
+
+  lines.push(`🛡 Security: score ${report.riskScore}/100 — ${report.isSafe ? "✅ SAFE" : "⚠️ RISKY"}`);
+  if (report.isHoneypot) lines.push("🍯 ⚠️ HONEYPOT detected!");
+  if (report.isDrainer) lines.push("🪤 ⚠️ DRAINER detected!");
+  if (report.warnings.length > 0) {
+    lines.push("⚠️ Warnings:");
+    for (const w of report.warnings.slice(0, 4)) lines.push(`  • ${w}`);
+  }
+  if (report.warning) lines.push(`ℹ️ ${report.warning}`);
+
+  return lines.join("\n");
 }
