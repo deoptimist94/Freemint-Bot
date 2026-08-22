@@ -108,18 +108,12 @@ export function fundAmountKeyboard(ethPrice: number): InlineKeyboard {
 export function walletsKeyboard(wallets: WalletInfo[]): InlineKeyboard {
   const kb = new InlineKeyboard();
 
-  for (let i = 0; i < wallets.length; i += 2) {
-    const w1 = wallets[i];
-    const w2 = wallets[i + 1];
-
-    const w1Text = `${w1.isActive ? "✅" : "❌"} ${w1.label}: ${shortenAddress(w1.address)}`;
-    kb.text(w1Text, `toggle_${w1.id}`);
-
-    if (w2) {
-      const w2Text = `${w2.isActive ? "✅" : "❌"} ${w2.label}: ${shortenAddress(w2.address)}`;
-      kb.text(w2Text, `toggle_${w2.id}`);
-    }
-    kb.row();
+  for (const w of wallets) {
+    const wText = `${w.isActive ? "✅" : "❌"} ${w.label}: ${shortenAddress(w.address)}`;
+    kb.text(wText, `toggle_${w.id}`).row();
+    kb.text(`📋 Copy ${w.label}`, `copyaddr_${w.id}`)
+      .url("🔗 Basescan", `https://basescan.org/address/${w.address}`)
+      .row();
   }
 
   kb.text("➕ Generate New", "new_wallet").row()
