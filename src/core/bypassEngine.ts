@@ -218,7 +218,7 @@ export async function executeBypass(
     };
   }
 
-  const hexKey = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+  const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
   const fromAddress = getAddressFromPrivateKey(hexKey);
 
   const args = buildArgs(plan.targetFn, fromAddress);
