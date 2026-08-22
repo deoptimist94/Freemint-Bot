@@ -9,36 +9,79 @@ export interface FloorData {
   collectionName: string;
 }
 
-function apiKey(): string {
-  return process.env.RESERVOIR_API_KEY || "demo-api-key";
+const ALCHEMY_NFT_V3 = "https://base-mainnet.g.alchemy.com/nft/v3";
+const REQUEST_TIMEOUT_MS = 10_000;
+const FLOOR_CACHE_TTL_MS = 5 * 60_000;
+const LOG_THROTTLE_MS = 15 * 60_000;
+
+const floorCache = new Map<string, { data: FloorData; expiresAt: number }>();
+const logThrottle = new Map<string, number>();
+
+function alchemyKey(): string {
+  return (process.env.ALCHEMY_API_KEY || "").trim();
 }
 
-// Fetch live floor price and collection stats using Reservoir API
-export async function fetchCollectionFloor(contractAddress: string): Promise<FloorData> {
-  try {
-    const res = await fetch(
-      `https://api-base.reservoir.tools/collections/v5?contract=${contractAddress}`,
-      { headers: { Accept: "*/*", "x-api-key": apiKey() } }
-    );
+function throttledLog(key: string, message: string) {
+  const now = Date.now();
+  if ((logThrottle.get(key) ?? 0) <= now - LOG_THROTTLE_MS) {
+    logThrottle.set(key, now);
+    console.warn(message);
+  }
+}
 
-    if (res.ok) {
-      const data = (await res.json()) as any;
-      if (data?.collections?.length > 0) {
-        const col = data.collections[0];
-        return {
-          floorPriceEth: Number(col.floorAsk?.price?.amount?.native ?? 0),
-          topBidEth: Number(col.topBid?.price?.amount?.native ?? 0),
-          collectionName: col.name || "Base Collection",
-        };
-      }
-    } else {
-      console.warn(`Reservoir collections API HTTP ${res.status}`);
+async function fetchJson(url: string, init?: RequestInit): Promise<any | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { ...init, signal: controller.signal });
+    if (!res.ok) return null;
+    const text = await res.text();
+    try {
+      return JSON.parse(text) as any;
+    } catch {
+      return null;
     }
-  } catch (err) {
-    console.error("Error fetching collection floor:", err);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Live floor + collection name from Alchemy NFT API v3 (Base, free tier).
+// Floors are returned in ETH (OpenSea aggregation, cached ~5-15 min by Alchemy).
+export async function fetchCollectionFloor(contractAddress: string): Promise<FloorData> {
+  const cached = floorCache.get(contractAddress);
+  if (cached && cached.expiresAt > Date.now()) return cached.data;
+
+  const key = alchemyKey();
+  if (!key) {
+    return { floorPriceEth: 0, topBidEth: 0, collectionName: "Base NFT" };
   }
 
-  return { floorPriceEth: 0, topBidEth: 0, collectionName: "Base NFT" };
+  const [floorJson, metaJson] = await Promise.all([
+    fetchJson(`${ALCHEMY_NFT_V3}/${key}/getFloorPrice?contractAddress=${contractAddress}`),
+    fetchJson(`${ALCHEMY_NFT_V3}/${key}/getContractMetadata?contractAddress=${contractAddress}`),
+  ]);
+
+  const data: FloorData = {
+    floorPriceEth: Number(floorJson?.openSea?.floorPrice ?? 0),
+    topBidEth: 0,
+    collectionName:
+      metaJson?.openSeaMetadata?.collectionName ||
+      metaJson?.name ||
+      "Base NFT",
+  };
+
+  if (!floorJson && !metaJson) {
+    throttledLog(
+      `floor:${contractAddress.toLowerCase()}`,
+      `Alchemy floor fetch failed for ${contractAddress} (check ALCHEMY_API_KEY / rate limit)`
+    );
+  }
+
+  floorCache.set(contractAddress, { data, expiresAt: Date.now() + FLOOR_CACHE_TTL_MS });
+  return data;
 }
 
 // Never trust a raw API string blindly — only accept plain integers.
@@ -52,7 +95,9 @@ function safeTxValue(raw: unknown): bigint {
   return 0n;
 }
 
-// Generate and execute a listing on secondary markets (OpenSea/Blur via Reservoir)
+// Reservoir chain subdomains (api-base.reservoir.tools) are currently NXDOMAIN,
+// so listing is routed via the unified host as best-effort. On failure it returns
+// a clean error instead of spamming logs.
 export async function executeAutoListing(
   privateKey: Hex,
   contractAddress: string,
@@ -69,11 +114,11 @@ export async function executeAutoListing(
 
     const weiPrice = BigInt(Math.floor(listPriceEth * 1e18)).toString();
 
-    const res = await fetch("https://api-base.reservoir.tools/execute/list/v5", {
+    const data = await fetchJson("https://api.reservoir.tools/execute/list/v5?chainId=8453", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": apiKey(),
+        "x-api-key": process.env.RESERVOIR_API_KEY || "demo-api-key",
       },
       body: JSON.stringify({
         items: [{ token: `${contractAddress}:${tokenId}`, weiPrice }],
@@ -81,15 +126,14 @@ export async function executeAutoListing(
       }),
     });
 
-    if (!res.ok) {
+    if (!data) {
       return {
         success: false,
-        error: `Failed to construct marketplace listing order (HTTP ${res.status})`,
+        error: "Marketplace API unreachable (Reservoir outage). Try again later.",
       };
     }
 
-    const data = (await res.json()) as any;
-    const steps: any[] = data?.steps ?? [];
+    const steps: any[] = data.steps ?? [];
     if (steps.length === 0) {
       return { success: false, error: "No listing steps returned by marketplace" };
     }
@@ -130,9 +174,7 @@ export async function executeAutoListing(
     }
 
     return {
-      success: signedOffchain
-        ? true
-        : false,
+      success: signedOffchain,
       error: signedOffchain
         ? undefined
         : "Listing prepared but no on-chain transaction was emitted",
