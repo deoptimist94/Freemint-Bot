@@ -108,20 +108,33 @@ export function startFloorWatcher(bot: Bot<any>, intervalSeconds: number = 300) 
                   `💰 *Top Instant Bid:* \`${currentBid > 0 ? `${currentBid} ETH` : "None"}\`\n\n` +
                   `_Tap below to liquidate immediately into the active bid:_`;
 
+                // Telegram hard limit: callback_data must be ≤ 64 bytes. Build a
+                // short `sell_<tokenId>_<walletId>` callback and verify the whole
+                // button set fits; otherwise fall back to a plain OpenSea link.
+                const sellCb = `sell_${item.tokenId}_${wallet.id}`;
+                const confirmCb = `confirm_sell_${item.tokenId}_${wallet.id}`;
+                const cancelCb = `cancel_sell_${item.tokenId}_${wallet.id}`;
+                const canUseCallbacks =
+                  sellCb.length <= 64 &&
+                  confirmCb.length <= 64 &&
+                  cancelCb.length <= 64;
+
+                const inlineKeyboard = canUseCallbacks
+                  ? [
+                      [
+                        {
+                          text: `💰 Liquidate Now #${item.tokenId} (${currentBid > 0 ? `${currentBid} ETH` : "Dump"})`,
+                          callback_data: sellCb,
+                        },
+                      ],
+                      [{ text: "🔗 View on OpenSea", url: item.openseaUrl }],
+                    ]
+                  : [[{ text: "🔗 View on OpenSea", url: item.openseaUrl }]];
+
                 await bot.api
                   .sendMessage(targetChatId, alertMsg, {
                     parse_mode: "Markdown",
-                    reply_markup: {
-                      inline_keyboard: [
-                        [
-                          {
-                            text: `💰 Liquidate Now #${item.tokenId} (${currentBid > 0 ? `${currentBid} ETH` : "Dump"})`,
-                            callback_data: `sell_${item.contractAddress}_${item.tokenId}_${wallet.id}`,
-                          },
-                        ],
-                        [{ text: "🔗 View on OpenSea", url: item.openseaUrl }],
-                      ],
-                    },
+                    reply_markup: { inline_keyboard: inlineKeyboard },
                   })
                   .catch((sendErr) => console.error(`Floor alert send error:`, sendErr));
               } else if (currentFloor > 0) {
