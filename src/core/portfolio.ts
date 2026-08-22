@@ -6,6 +6,7 @@ export interface PortfolioItem {
   contractAddress: string;
   tokenId: string;
   name: string;
+  collectionName: string;
   floorPriceEth: number;
   topBidEth: number;
   openseaUrl: string;
@@ -97,6 +98,7 @@ export async function fetchWalletPortfolio(
           floor?.collectionName ||
           tokenName ||
           `Base NFT (${contract.slice(0, 6)}...)`,
+        collectionName: floor?.collectionName ?? "",
         floorPriceEth: floor?.floorPriceEth ?? 0,
         topBidEth: floor?.topBidEth ?? 0,
         openseaUrl: `https://opensea.io/assets/base/${contract}/${tokenId}`,
@@ -157,7 +159,7 @@ export async function executeSell(
   }
 
   try {
-    const hexKey = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
+    const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
     const walletClient = getWalletClient(hexKey);
     const txHash = await walletClient.sendTransaction({
       to: txData.to as Address,
