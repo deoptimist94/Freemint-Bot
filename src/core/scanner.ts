@@ -17,12 +17,14 @@ export interface MintFunctionInfo {
   args: string[];
   isFreeMint: boolean;
   requiresPayment: boolean;
+  stateMutability: string;
 }
 
 export interface ScanResult {
   contractAddress: string;
   mintFunctions: MintFunctionInfo[];
   isVerified: boolean;
+  isNft: boolean;
   abi: Abi | null;
   bytecode: Hex | null;
   isContract: boolean;
@@ -31,28 +33,47 @@ export interface ScanResult {
 }
 
 const PAID_MINT_PATTERNS = [
-  "mintWithETH",
-  "paidMint",
-  "mintWithPayment",
-  "mintWithPrice",
+  "mintwitheth",
+  "paidmint",
+  "mintwithpayment",
+  "mintwithprice",
   "purchase",
+  "buynft",
+  "buy",
+];
+
+// Names that look like mint but are checkers / admin / ERC-20 deposit
+const MINT_NAME_BLOCKLIST = [
+  /^can/,           // canMint, canClaim
+  /allowance/,
+  /preview/,
+  /estimate/,
+  /calculate/,
+  /getmint/,
+  /mintprice/,
+  /mintlimit/,
+  /minted/,
+  /maxmint/,
+  /totalmint/,
+  /hasminted/,
+  /isminted/,
+  /devmint/,
+  /ownermint/,
+  /adminmint/,
+  /teamMint/i,
+  /^mintTo$/i,      // often admin
 ];
 
 const ETHERSCAN_V2 = "https://api.etherscan.io/v2/api";
 const BASE_CHAIN_ID = "8453";
 
 function explorerApiKey(): string {
-  return (
-    process.env.ETHERSCAN_API_KEY ||
-    process.env.BASESCAN_API_KEY ||
-    ""
-  ).trim();
+  return (process.env.ETHERSCAN_API_KEY || process.env.BASESCAN_API_KEY || "").trim();
 }
 
 function explorerBaseUrl(): string {
   const raw = (process.env.BASESCAN_API_URL || ETHERSCAN_V2).trim();
-  // Force-migrate any leftover V1 Basescan host
-  if (/basescan\.org/i.test(raw) || raw.endsWith("/api") && !raw.includes("/v2/")) {
+  if (/basescan\.org/i.test(raw) || (raw.endsWith("/api") && !raw.includes("/v2/"))) {
     return ETHERSCAN_V2;
   }
   return raw || ETHERSCAN_V2;
@@ -90,23 +111,29 @@ async function fetchAbiFromEtherscanV2(
   });
   if (apiKey) params.set("apikey", apiKey);
 
-  const url = `${baseUrl}?${params.toString()}`;
   try {
-    const data = await fetchJson(url);
+    const data = await fetchJson(`${baseUrl}?${params.toString()}`);
     const result = data?.result;
 
     if (typeof result === "string" && /deprecated\s+v1/i.test(result)) {
       return {
         abi: null,
         isVerified: false,
-        error: "Explorer still on deprecated Basescan V1 — set BASESCAN_API_URL=https://api.etherscan.io/v2/api",
+        error: "Explorer still on deprecated Basescan V1",
+      };
+    }
+    if (typeof result === "string" && /free api access is not supported/i.test(result)) {
+      return {
+        abi: null,
+        isVerified: false,
+        error: "Etherscan free tier does not cover Base — using Sourcify fallback",
       };
     }
     if (typeof result === "string" && /missing\/invalid api key/i.test(result)) {
       return {
         abi: null,
         isVerified: false,
-        error: "Missing/invalid Etherscan API key (BASESCAN_API_KEY / ETHERSCAN_API_KEY)",
+        error: "Missing/invalid Etherscan API key",
       };
     }
     if (data?.status === "1" && typeof result === "string" && result.startsWith("[")) {
@@ -168,21 +195,72 @@ export async function getBytecode(address: Address): Promise<Hex | null> {
   }
 }
 
-async function verifyIsNftContract(address: Address, abi: Abi): Promise<boolean> {
-  const client = getPublicClient();
+function abiHasFn(abi: Abi, names: string[]): boolean {
+  const set = new Set(names.map((n) => n.toLowerCase()));
+  return abi.some(
+    (item: any) => item?.type === "function" && set.has(String(item.name || "").toLowerCase())
+  );
+}
 
-  const hasNftFunctions = abi.some((item: any) => {
+/** Hard reject ERC-20 / ERC-4626 / lending mTokens / DEXes */
+function looksLikeFungibleOrDefi(abi: Abi): boolean {
+  const hasDecimals = abiHasFn(abi, ["decimals"]);
+  const hasTotalSupply = abiHasFn(abi, ["totalSupply"]);
+  const hasTransfer = abiHasFn(abi, ["transfer"]);
+  const hasApprove = abiHasFn(abi, ["approve"]);
+  const hasAllowance = abiHasFn(abi, ["allowance"]);
+  const hasBalanceOf = abiHasFn(abi, ["balanceOf"]);
+  const hasOwnerOf = abiHasFn(abi, ["ownerOf"]);
+  const hasTokenUri = abiHasFn(abi, ["tokenURI", "uri"]);
+  const hasSafeTransferFrom = abiHasFn(abi, ["safeTransferFrom"]);
+
+  // Classic ERC-20 shape without NFT surface
+  if (
+    hasDecimals &&
+    hasTotalSupply &&
+    hasTransfer &&
+    hasApprove &&
+    hasBalanceOf &&
+    !hasOwnerOf &&
+    !hasTokenUri &&
+    !hasSafeTransferFrom
+  ) {
+    return true;
+  }
+
+  // ERC-4626 / compound-style vaults (Moonwell mUSDC etc.)
+  if (abiHasFn(abi, ["asset", "convertToShares", "convertToAssets", "previewDeposit", "previewMint"])) {
+    return true;
+  }
+  if (abiHasFn(abi, ["exchangeRateCurrent", "accrueInterest", "borrowBalanceCurrent", "underlying"])) {
+    return true;
+  }
+
+  // allowance without ownerOf is almost always fungible
+  if (hasAllowance && hasDecimals && !hasOwnerOf && !hasTokenUri) {
+    return true;
+  }
+
+  return false;
+}
+
+export async function verifyIsNftContract(address: Address, abi: Abi): Promise<boolean> {
+  if (looksLikeFungibleOrDefi(abi)) return false;
+
+  const hasNftFns = abi.some((item: any) => {
     if (item.type !== "function") return false;
     const name = (item.name?.toLowerCase() || "");
     return (
       name === "ownerof" ||
       name === "tokenuri" ||
+      name === "uri" ||
       name === "safetransferfrom" ||
-      name === "balanceof"
+      name === "setapprovalforall"
     );
   });
-  if (hasNftFunctions) return true;
+  if (hasNftFns) return true;
 
+  const client = getPublicClient();
   try {
     const supportsErc721 = await client
       .readContract({
@@ -209,6 +287,14 @@ async function verifyIsNftContract(address: Address, abi: Abi): Promise<boolean>
   return false;
 }
 
+function isExecutableMintName(name: string): boolean {
+  if (!/mint|claim|collect/i.test(name)) return false;
+  for (const re of MINT_NAME_BLOCKLIST) {
+    if (re.test(name)) return false;
+  }
+  return true;
+}
+
 export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
   const functions: MintFunctionInfo[] = [];
 
@@ -222,13 +308,15 @@ export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
       payable?: boolean;
     };
 
-    const isPaid = PAID_MINT_PATTERNS.some((p) =>
-      fn.name.toLowerCase().includes(p.toLowerCase())
-    );
-    const isPayable = fn.stateMutability === "payable" || fn.payable === true;
-    const isMintName = /mint|claim|collect/i.test(fn.name);
+    const mut = (fn.stateMutability || (fn.payable ? "payable" : "nonpayable")).toLowerCase();
+    // Never treat view/pure checkers as mint targets
+    if (mut === "view" || mut === "pure") continue;
+    if (!isExecutableMintName(fn.name)) continue;
 
-    if (!isMintName) continue;
+    const lower = fn.name.toLowerCase();
+    const isPaid =
+      mut === "payable" ||
+      PAID_MINT_PATTERNS.some((p) => lower.includes(p));
 
     try {
       const selector = getFunctionSelector({
@@ -243,11 +331,12 @@ export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
         name: fn.name,
         selector,
         args: fn.inputs.map((i) => i.type),
-        isFreeMint: !isPayable && !isPaid,
-        requiresPayment: isPayable || isPaid,
+        isFreeMint: !isPaid,
+        requiresPayment: isPaid,
+        stateMutability: mut,
       });
     } catch {
-      // skip bad ABI entries
+      // skip
     }
   }
 
@@ -258,21 +347,24 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
   const cleanInput = rawAddress.trim();
   const hexAddress = cleanInput.startsWith("0x") ? cleanInput : `0x${cleanInput}`;
 
+  const emptySecurity = (warnings: string[], risk = 100): SecurityReport => ({
+    isSafe: false,
+    isHoneypot: false,
+    isDrainer: false,
+    riskScore: risk,
+    warnings,
+  });
+
   if (!isAddress(hexAddress)) {
     return {
       contractAddress: hexAddress,
       mintFunctions: [],
       isVerified: false,
+      isNft: false,
       abi: null,
       bytecode: null,
       isContract: false,
-      security: {
-        isSafe: false,
-        isHoneypot: false,
-        isDrainer: false,
-        riskScore: 100,
-        warnings: ["Invalid address format"],
-      },
+      security: emptySecurity(["Invalid address format"]),
       warning: "Invalid Ethereum contract address format.",
     };
   }
@@ -286,43 +378,51 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
       contractAddress: checksumAddress,
       mintFunctions: [],
       isVerified: false,
+      isNft: false,
       abi: null,
       bytecode: null,
       isContract: false,
-      security: {
-        isSafe: false,
-        isHoneypot: false,
-        isDrainer: false,
-        riskScore: 100,
-        warnings: ["No contract deployed"],
-      },
+      security: emptySecurity(["No contract deployed"]),
       warning: "No contract found at this address on Base.",
     };
   }
 
   if (!isVerified || !abi) {
-    const explorerBroken = Boolean(abiError);
     return {
       contractAddress: checksumAddress,
       mintFunctions: [],
       isVerified: false,
+      isNft: false,
+      abi,
+      bytecode,
+      isContract: true,
+      security: emptySecurity(
+        [abiError ? `Explorer: ${abiError}` : "Unverified contract source"],
+        abiError ? 40 : 50
+      ),
+      warning: abiError
+        ? `Skipped: Could not load ABI (${abiError}).`
+        : "Skipped: Contract source code is unverified.",
+    };
+  }
+
+  if (looksLikeFungibleOrDefi(abi)) {
+    return {
+      contractAddress: checksumAddress,
+      mintFunctions: [],
+      isVerified,
+      isNft: false,
       abi,
       bytecode,
       isContract: true,
       security: {
-        isSafe: false,
+        isSafe: true,
         isHoneypot: false,
         isDrainer: false,
-        riskScore: explorerBroken ? 40 : 50,
-        warnings: [
-          explorerBroken
-            ? `Explorer API error: ${abiError}`
-            : "Unverified contract source",
-        ],
+        riskScore: 5,
+        warnings: ["Fungible token / DeFi contract (not NFT)"],
       },
-      warning: explorerBroken
-        ? `Skipped: Could not load ABI (${abiError}). Check BASESCAN_API_URL + API key.`
-        : "Skipped: Contract source code is unverified.",
+      warning: "Skipped: ERC-20 / lending / vault token — not an NFT free mint.",
     };
   }
 
@@ -332,6 +432,7 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
       contractAddress: checksumAddress,
       mintFunctions: [],
       isVerified,
+      isNft: false,
       abi,
       bytecode,
       isContract: true,
@@ -342,7 +443,7 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
         riskScore: 10,
         warnings: ["Not an NFT contract"],
       },
-      warning: "Skipped: Contract is a token/DeFi protocol, not an NFT collection.",
+      warning: "Skipped: Contract is not an ERC-721/1155 NFT collection.",
     };
   }
 
@@ -352,6 +453,7 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
       contractAddress: checksumAddress,
       mintFunctions: [],
       isVerified,
+      isNft: true,
       abi,
       bytecode,
       isContract: true,
@@ -361,33 +463,22 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
   }
 
   const mintFunctions = analyzeAbiForMintFunctions(abi);
-  // Prefer free mints; still surface paid mints so whois/bypass can explain gates
   const freeMintFunctions = mintFunctions.filter((f) => f.isFreeMint && !f.requiresPayment);
-  const reportFns = freeMintFunctions.length > 0 ? freeMintFunctions : mintFunctions;
-
-  if (reportFns.length === 0) {
-    return {
-      contractAddress: checksumAddress,
-      mintFunctions: [],
-      isVerified,
-      abi,
-      bytecode,
-      isContract: true,
-      security,
-      warning: "Skipped: No valid mint/claim function detected.",
-    };
-  }
 
   if (freeMintFunctions.length === 0) {
     return {
       contractAddress: checksumAddress,
-      mintFunctions: reportFns,
+      mintFunctions: mintFunctions.filter((f) => f.requiresPayment),
       isVerified,
+      isNft: true,
       abi,
       bytecode,
       isContract: true,
       security,
-      warning: "Verified NFT found, but mint functions require payment (not a free mint).",
+      warning:
+        mintFunctions.length > 0
+          ? "Verified NFT found, but mint requires payment (not free)."
+          : "Skipped: No valid free-mint function detected.",
     };
   }
 
@@ -395,6 +486,7 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
     contractAddress: checksumAddress,
     mintFunctions: freeMintFunctions,
     isVerified,
+    isNft: true,
     abi,
     bytecode,
     isContract: true,
@@ -414,9 +506,11 @@ export async function simulateMint(
       `function ${mintFunction.name}(${mintFunction.args.join(",")})`,
     ] as const);
     const args = mintFunction.args.map((type) => {
-      if (type === "uint256") return 1n;
+      if (type.startsWith("uint") || type.startsWith("int")) return 1n;
       if (type === "address") return getAddress(fromAddress);
-      if (type === "bytes32[]") return [];
+      if (type === "bool") return true;
+      if (type.endsWith("[]")) return [];
+      if (type.startsWith("bytes")) return "0x";
       return "0x";
     });
     const data = encodeFunctionData({
