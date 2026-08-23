@@ -11,8 +11,12 @@
 //                          bypass the gate (e.g. bot owner, for testing).
 //
 // Setup: add the bot as an ADMINISTRATOR of the channel (no rights needed) so
-// getChatMember can query membership. If the bot can't reach the channel, the
-// gate fails OPEN (logs a warning) so a misconfig never bricks the bot.
+// getChatMember can query membership.
+//
+// Failure policy: TRANSIENT API/network errors fail OPEN (bot keeps working),
+// but CONFIG errors (chat not found, bot not admin, private channel resolved
+// by @username, ...) log a loud [channelGate] CONFIG ERROR line to Railway
+// logs. Run /gate_status (owner only) for a one-shot diagnosis.
 import type { Context, NextFunction } from "grammy";
 import { backToMainKeyboard } from "./keyboards.js";
 
@@ -44,13 +48,17 @@ function getGateConfig(): { chatId: string; inviteLink: string } | null {
   return { chatId, inviteLink };
 }
 
-function getBypassIds(): Set<number> {
+export function getBypassIds(): Set<number> {
   const ids = new Set<number>();
   for (const part of (process.env.GATE_OWNER_IDS ?? "").split(",")) {
     const n = Number(part.trim());
     if (Number.isInteger(n) && n > 0) ids.add(n);
   }
   return ids;
+}
+
+export function isGateOwner(userId: number): boolean {
+  return getBypassIds().has(userId);
 }
 
 function statusIsJoined(status: string, isMember?: boolean): boolean {
@@ -62,26 +70,61 @@ function statusIsJoined(status: string, isMember?: boolean): boolean {
   );
 }
 
-async function checkMembership(ctx: Context, userId: number): Promise<boolean> {
+function errorMessage(err: unknown): string {
+  if (err && typeof err === "object") {
+    const e = err as { description?: unknown; message?: unknown };
+    if (typeof e.description === "string" && e.description) return e.description;
+    if (typeof e.message === "string" && e.message) return e.message;
+  }
+  return typeof err === "string" ? err : String(err ?? "unknown error");
+}
+
+function classifyError(msg: string): "config" | "transient" {
+  if (
+    /chat not found|user not found|not found|CHAT_ADMIN_REQUIRED|bot.*(kicked|was kicked)|username|forbidden|can't (find|access|use)|deactivated|400|migrated/i.test(
+      msg
+    )
+  ) {
+    return "config";
+  }
+  return "transient";
+}
+
+export function resolveChatId(chatId: string): string | number {
+  return /^-?\d+$/.test(chatId) ? Number(chatId) : chatId;
+}
+
+async function checkMembership(
+  ctx: Context,
+  userId: number
+): Promise<{ joined: boolean; detail: string }> {
   const config = getGateConfig();
-  if (!config) return true;
-  const chatId = /^-?\d+$/.test(config.chatId)
-    ? Number(config.chatId)
-    : config.chatId;
+  if (!config) return { joined: true, detail: "gate disabled" };
   try {
-    const member = await ctx.api.getChatMember(chatId, userId);
-    return statusIsJoined(
+    const member = await ctx.api.getChatMember(
+      resolveChatId(config.chatId),
+      userId
+    );
+    const joined = statusIsJoined(
       member.status,
       (member as { is_member?: boolean }).is_member
     );
+    return { joined, detail: member.status };
   } catch (err) {
-    // Fail-open on API/network errors so a hiccup never bricks the bot.
-    // If this logs repeatedly, verify the bot is an admin of the channel.
-    console.error(
-      "[channelGate] membership check failed (fail-open):",
-      err
-    );
-    return true;
+    const msg = errorMessage(err);
+    const kind = classifyError(msg);
+    if (kind === "config") {
+      console.error(
+        "[channelGate] CONFIG ERROR — gate is NOT enforcing. Fix REQUIRED_CHANNEL or channel admin setup. Detail:",
+        msg
+      );
+    } else {
+      console.error(
+        "[channelGate] membership check failed (transient, fail-open):",
+        msg
+      );
+    }
+    return { joined: true, detail: `ERROR: ${msg}` };
   }
 }
 
@@ -93,7 +136,10 @@ function gatePromptText(inviteLink: string): string {
   );
 }
 
-async function sendGatePrompt(ctx: Context, entry: GateCacheEntry): Promise<void> {
+async function sendGatePrompt(
+  ctx: Context,
+  entry: GateCacheEntry
+): Promise<void> {
   const config = getGateConfig();
   if (!config) return;
   entry.promptedAt = Date.now();
@@ -115,7 +161,7 @@ async function sendGatePrompt(ctx: Context, entry: GateCacheEntry): Promise<void
 }
 
 async function handleGateCheck(ctx: Context, userId: number): Promise<void> {
-  const joined = await checkMembership(ctx, userId);
+  const { joined } = await checkMembership(ctx, userId);
   const now = Date.now();
   gateCache.set(userId, { joined, at: now, promptedAt: now });
   if (joined) {
@@ -139,6 +185,53 @@ export function isGateCallback(data: string): boolean {
   return data === GATE_CHECK_CB;
 }
 
+export async function gateStatusReport(ctx: Context): Promise<string> {
+  const enabled = isGateEnabled();
+  const config = getGateConfig();
+  const userId = ctx.from?.id ?? 0;
+  const lines: string[] = [];
+  lines.push("🔐 Gate status");
+  lines.push("");
+  if (!enabled) {
+    lines.push("Gate: DISABLED — REQUIRED_CHANNEL is not set.");
+    lines.push("Set REQUIRED_CHANNEL on the service, then Redeploy.");
+    return lines.join("\n");
+  }
+  lines.push(`REQUIRED_CHANNEL: ${config?.chatId ?? "(unset)"}`);
+  lines.push(`Invite link in use: ${config?.inviteLink ?? "(none)"}`);
+  lines.push(
+    `CHANNEL_INVITE_LINK env: ${
+      process.env.CHANNEL_INVITE_LINK?.trim() || "not set (using default)"
+    }`
+  );
+  lines.push(
+    `GATE_OWNER_IDS env: ${process.env.GATE_OWNER_IDS?.trim() || "not set"}`
+  );
+  lines.push("");
+  if (!userId) {
+    lines.push("No Telegram user id on this update.");
+    return lines.join("\n");
+  }
+  lines.push(`You: ${userId}`);
+  const res = await checkMembership(ctx, userId);
+  if (res.detail.startsWith("ERROR:")) {
+    lines.push(`Membership check: ❌ ${res.detail.slice(6)}`);
+    lines.push("");
+    lines.push("Most likely fixes:");
+    lines.push("1. Public channel: the bot must be an ADMIN of the channel (Manage Channel → Administrators).");
+    lines.push("2. Private channel: REQUIRED_CHANNEL must be the NUMERIC id (e.g. -1001234567890), NOT @username, and CHANNEL_INVITE_LINK must be a t.me/+ invite link.");
+    lines.push("3. Get the numeric id: forward any channel message to @userinfobot.");
+  } else {
+    lines.push(
+      `Membership check: ${res.joined ? "✅ joined" : "❌ not joined"} (status: ${res.detail})`
+    );
+    if (res.joined) {
+      lines.push("Note: this account is a member/admin of the channel, so the gate lets it through. Test with an account that has never joined.");
+    }
+  }
+  return lines.join("\n");
+}
+
 export function channelGateMiddleware(): (
   ctx: Context,
   next: NextFunction
@@ -149,7 +242,7 @@ export function channelGateMiddleware(): (
     const userId = ctx.from?.id;
     if (userId === undefined) return next();
 
-    if (getBypassIds().has(userId)) return next();
+    if (isGateOwner(userId)) return next();
 
     const cbData = ctx.callbackQuery?.data;
     if (cbData && isGateCallback(cbData)) {
@@ -173,7 +266,7 @@ export function channelGateMiddleware(): (
       return;
     }
 
-    const joined = await checkMembership(ctx, userId);
+    const { joined } = await checkMembership(ctx, userId);
     const entry: GateCacheEntry = {
       joined,
       at: now,
