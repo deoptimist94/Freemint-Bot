@@ -58,6 +58,7 @@ export interface WatchOptions {
   chain?: ChainId;
   pollIntervalMs?: number;
   maxDurationMs?: number;
+  notify?: (message: string) => void;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2_500;
@@ -314,9 +315,11 @@ export async function startWatchMint(
   const { badge, name: chainName } = getChainConfig(chain);
   const address = normalizeAddressInput(options.address);
 
-  const notify = (message: string) => {
-    console.log(`[watch] ${message}`);
-  };
+  const notify =
+    options.notify ??
+    ((message: string) => {
+      console.log(`[watch] ${message}`);
+    });
   const safeNotify = (message: string) => {
     try {
       notify(message);
@@ -396,7 +399,7 @@ export async function startWatchMint(
       };
     }
 
-    const wallet = getWallets().find((w) => w.isActive);
+    const wallet = getWallets(options.userId).find((w) => w.isActive);
     if (!wallet) {
       const reason = "No active wallet found.";
       safeNotify(`⛔ ${badge} ${reason}`);
