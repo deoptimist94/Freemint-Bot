@@ -8,15 +8,37 @@ import { runWhois, formatWhoisReport } from "../core/whois.js";
 import { executeBypass } from "../core/bypassEngine.js";
 import type { BypassResult } from "../core/bypassEngine.js";
 import { startWatchMint, stopWatch } from "../core/watchMint.js";
+import { withChainContext } from "../core/chainContext.js";
+import {
+  getUserChainSelection,
+  sanitizeSelection,
+  getChainsForSelection,
+  getPrimaryChain,
+  chainBadge,
+  chainLabel,
+  type ChainSelection,
+} from "../core/userChain.js";
+import type { ChainId } from "../core/chains.js";
 import { backToMainKeyboard } from "./keyboards.js";
+
+// --chain=base|robinhood|both — parsed from anywhere in the command line, so
+// both `/bypass <addr> --chain=robinhood` and flag-first order work.
+function parseChainFlag(parts: string[]): ChainSelection | undefined {
+  const flag = parts.find((p) => p.startsWith("--chain="));
+  if (!flag) return undefined;
+  return sanitizeSelection(flag.slice("--chain=".length));
+}
 
 export async function whoisCommand(ctx: Context): Promise<void> {
   const parts = (ctx.message?.text ?? "").trim().split(/\s+/);
-  const raw = parts[1];
+  const raw = parts.slice(1).find((p) => !p.startsWith("--"));
 
   if (!raw) {
     await ctx.reply(
-      "❌ Usage: /whois <contract address>\n\nExample:\n/whois 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E",
+      "❌ Usage: /whois <contract address> [--chain=base|robinhood|both]\n\n" +
+        "Examples:\n" +
+        "/whois 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E\n" +
+        "/whois 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --chain=robinhood",
       { reply_markup: backToMainKeyboard() }
     );
     return;
@@ -25,21 +47,47 @@ export async function whoisCommand(ctx: Context): Promise<void> {
   const address = normalizeAddressInput(raw);
   if (!address || !isValidAddress(address)) {
     await ctx.reply(
-      "❌ Invalid contract address. Please send a valid Base (EVM) address.",
+      "❌ Invalid contract address. Please send a valid EVM address.",
       { reply_markup: backToMainKeyboard() }
     );
     return;
   }
 
+  const userId = BigInt(ctx.from?.id ?? 0);
+  const selection = parseChainFlag(parts) ?? (await getUserChainSelection(userId));
+  const chains = getChainsForSelection(selection);
+
   await ctx.reply("🔍 Running WHOIS on contract...");
   try {
-    const report = await runWhois(address);
-    await ctx.reply(formatWhoisReport(report), {
-      reply_markup: new InlineKeyboard()
-        .text("🚀 Attempt Bypass", `bypass_${report.contractAddress}`)
-        .row()
-        .text("🏠 Main Menu", "main_menu"),
-    });
+    const reports: { chain: ChainId; report: Awaited<ReturnType<typeof runWhois>> }[] = [];
+    for (const chain of chains) {
+      const report = await withChainContext(chain, () => runWhois(address));
+      reports.push({ chain, report });
+    }
+
+    let body: string;
+    if (reports.length === 1) {
+      body = formatWhoisReport(reports[0].report);
+    } else {
+      body = reports
+        .map(
+          ({ chain, report }) =>
+            `🔗 ${chainBadge(chain)} ${chainLabel(chain)}\n\n${formatWhoisReport(report)}`
+        )
+        .join("\n\n─────\n\n");
+    }
+
+    const kb = new InlineKeyboard();
+    for (const { chain, report } of reports) {
+      kb.text(
+        reports.length > 1
+          ? `🚀 Attempt Bypass ${chainBadge(chain)} ${chainLabel(chain)}`
+          : "🚀 Attempt Bypass",
+        `bypass_${report.contractAddress}_${chain}`
+      );
+    }
+    kb.row().text("🏠 Main Menu", "main_menu");
+    await ctx.reply(body, { reply_markup: kb });
   } catch (err) {
     await ctx.reply(
       `❌ WHOIS failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -50,7 +98,7 @@ export async function whoisCommand(ctx: Context): Promise<void> {
 
 export async function bypassCommand(ctx: Context): Promise<void> {
   const parts = (ctx.message?.text ?? "").trim().split(/\s+/);
-  const raw = parts[1];
+  const raw = parts.slice(1).find((p) => !p.startsWith("--"));
 
   if (!raw) {
     await ctx.reply(
@@ -60,12 +108,12 @@ export async function bypassCommand(ctx: Context): Promise<void> {
         "--probe — map contract state & mint surface\n" +
         "--schedule — arm auto-mint at the public window\n" +
         "--watch — poll-and-fire: fire instantly when the mint opens (FCFS)\n" +
-        "--stop — stop active watcher(s) for this contract\n\n" +
+        "--stop — stop active watcher(s) for this contract\n" +
+        "--chain=base|robinhood|both — run on specific network(s); default: your /chain selection\n\n" +
         "Examples:\n" +
         "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --dry\n" +
-        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --probe\n" +
-        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --probe --schedule\n" +
-        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --watch",
+        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --chain=robinhood --dry\n" +
+        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --chain=both --watch",
       { reply_markup: backToMainKeyboard() }
     );
     return;
@@ -79,7 +127,7 @@ export async function bypassCommand(ctx: Context): Promise<void> {
     return;
   }
 
-  const flags = parts.slice(2);
+  const flags = parts.slice(1).filter((p) => p.startsWith("--"));
   const dryRun = flags.includes("--dry") || flags.includes("--simulate");
   const probeOnly = flags.includes("--probe");
   const schedule = flags.includes("--schedule");
@@ -87,7 +135,11 @@ export async function bypassCommand(ctx: Context): Promise<void> {
   const stop = flags.includes("--stop");
   const userId = BigInt(ctx.from?.id ?? 0);
 
+  const selection = parseChainFlag(parts) ?? (await getUserChainSelection(userId));
+  const chains = getChainsForSelection(selection);
+
   if (stop) {
+    // --stop kills the watcher(s) for this contract on every chain.
     const stopped = stopWatch(userId, address);
     await ctx.reply(
       stopped > 0
@@ -112,30 +164,36 @@ export async function bypassCommand(ctx: Context): Promise<void> {
         .row()
         .text("🏠 Main Menu", "main_menu");
 
+    const watchTargets = chains
+      .map((c) => `${chainBadge(c)} ${chainLabel(c)}`)
+      .join(", ");
     await ctx.reply(
-      "👀 Watch mode armed — polling the contract every 2.5s.\n\n" +
+      `👀 Watch mode armed — polling ${chains.length > 1 ? watchTargets : "the contract"} every 2.5s.\n\n` +
         "The engine will fire the instant the mint opens (FCFS).\n" +
         "Progress updates will be posted here. Use the ⏹ button or /bypass <addr> --stop to cancel.",
       { reply_markup: stopKeyboard() }
     );
 
-    startWatchMint({
-      userId,
-      rawAddress: address,
-      notify: (msg) =>
+    for (const chain of chains) {
+      startWatchMint({
+        userId,
+        address,
+        chain,
+        notify: (msg) =>
+          ctx.api
+            .sendMessage(chatId, msg, { reply_markup: stopKeyboard() })
+            .then(() => undefined)
+            .catch(() => undefined),
+      }).catch((err) =>
         ctx.api
-          .sendMessage(chatId, msg, { reply_markup: stopKeyboard() })
-          .then(() => undefined)
-          .catch(() => undefined),
-    }).catch((err) =>
-      ctx.api
-        .sendMessage(
-          chatId,
-          `❌ Watch error: ${err instanceof Error ? err.message : String(err)}`,
-          { reply_markup: backToMainKeyboard() }
-        )
-        .catch(() => undefined)
-    );
+          .sendMessage(
+            chatId,
+            `❌ Watch error (${chainLabel(chain)}): ${err instanceof Error ? err.message : String(err)}`,
+            { reply_markup: backToMainKeyboard() }
+          )
+          .catch(() => undefined)
+      );
+    }
     return;
   }
 
@@ -147,22 +205,27 @@ export async function bypassCommand(ctx: Context): Promise<void> {
   await ctx.reply(statusLine);
 
   try {
-    const result = await executeBypass(userId, address, { dryRun, probeOnly });
-
-    let text = formatBypassResult(result);
-    if (schedule) {
-      const armed = armAutoMint(ctx, userId, address, result);
-      if (armed) {
-        text +=
-          `\n\n🔔 Auto-mint armed — the engine will fire at the public window and report the outcome here.\n` +
-          `🧾 Job ID: ${armed.id}`;
-      } else {
-        text +=
-          `\n\n⏰ No usable public window was detected — nothing armed. ` +
-          `Run --probe first to inspect state.`;
+    const sections: string[] = [];
+    for (const chain of chains) {
+      const result = await withChainContext(chain, () =>
+        executeBypass(userId, address, { dryRun, probeOnly })
+      );
+      let text = formatBypassResult(result, chain);
+      if (schedule) {
+        const armed = armAutoMint(ctx, userId, address, chain, result);
+        if (armed) {
+          text +=
+            `\n\n🔔 Auto-mint armed (${chainBadge(chain)} ${chainLabel(chain)}) — the engine will fire at the public window and report the outcome here.\n` +
+            `🧾 Job ID: ${armed.id}`;
+        } else {
+          text +=
+            `\n\n⏰ No usable public window was detected (${chainBadge(chain)} ${chainLabel(chain)}) — nothing armed. ` +
+            `Run --probe first to inspect state.`;
+        }
       }
+      sections.push(text);
     }
-
+    const text = sections.join("\n\n─────\n\n");
     // Plain text only — never parse_mode Markdown (probe/error strings break entities).
     await ctx.reply(text, { reply_markup: backToMainKeyboard() });
   } catch (err) {
@@ -175,19 +238,38 @@ export async function bypassCommand(ctx: Context): Promise<void> {
 
 export async function bypassCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data ?? "";
-  const address = normalizeAddressInput(data.replace(/^bypass_/, ""));
+  const rest = data.replace(/^bypass_/, "");
+  let address: string;
+  let chain: ChainId | undefined;
+  if (rest.endsWith("_robinhood")) {
+    chain = "robinhood";
+    address = rest.slice(0, -11);
+  } else if (rest.endsWith("_base")) {
+    chain = "base";
+    address = rest.slice(0, -5);
+  } else {
+    chain = undefined;
+    address = rest;
+  }
+  address = normalizeAddressInput(address);
   if (!address || !isValidAddress(address)) {
     await ctx.answerCallbackQuery({ text: "❌ Invalid address in callback" });
     return;
   }
 
   const userId = BigInt(ctx.from?.id ?? 0);
+  if (!chain) {
+    // Legacy callback without a chain suffix — use the user's default.
+    const selection = await getUserChainSelection(userId);
+    chain = getPrimaryChain(selection);
+  }
+
   await ctx.answerCallbackQuery({ text: "⏳ Running bypass engine..." });
   const progress = await ctx.reply("⏳ Bypass engine running...");
 
   let result: BypassResult;
   try {
-    result = await executeBypass(userId, address);
+    result = await withChainContext(chain, () => executeBypass(userId, address));
   } catch (err) {
     result = {
       success: false,
@@ -198,7 +280,7 @@ export async function bypassCallback(ctx: Context): Promise<void> {
     };
   }
 
-  const text = formatBypassResult(result);
+  const text = formatBypassResult(result, chain);
   const chatId = ctx.callbackQuery?.message?.chat?.id;
   if (chatId === undefined) {
     await ctx.reply(text, { reply_markup: backToMainKeyboard() });
@@ -252,6 +334,7 @@ interface ScheduledJob {
   id: string;
   userId: bigint;
   address: string;
+  chain: ChainId;
   chatId: number;
   fireAt: number;
   timer: NodeJS.Timeout;
@@ -266,6 +349,7 @@ function armAutoMint(
   ctx: Context,
   userId: bigint,
   address: string,
+  chain: ChainId,
   result: BypassResult
 ): { id: string } | null {
   const at = result.publicMintAt;
@@ -284,11 +368,13 @@ function armAutoMint(
   const timer = setTimeout(async () => {
     scheduledJobs.delete(id);
     try {
-      const fireResult = await executeBypass(userId, address);
+      const fireResult = await withChainContext(chain, () =>
+        executeBypass(userId, address)
+      );
       await ctx.api
         .sendMessage(
           chatId,
-          `🔔 Scheduled mint fired\n\n${formatBypassResult(fireResult)}`
+          `🔔 Scheduled mint fired (${chainBadge(chain)} ${chainLabel(chain)})\n\n${formatBypassResult(fireResult, chain)}`
         )
         .catch(() => undefined);
     } catch (err) {
@@ -301,15 +387,18 @@ function armAutoMint(
     }
   }, delay);
 
-  scheduledJobs.set(id, { id, userId, address, chatId, fireAt: at.atMs, timer });
+  scheduledJobs.set(id, { id, userId, address, chain, chatId, fireAt: at.atMs, timer });
   return { id };
 }
 
-function formatBypassResult(result: BypassResult): string {
+function formatBypassResult(result: BypassResult, chain?: ChainId): string {
   const lines: string[] = [];
   lines.push("🧪 Bypass Engine Result");
   lines.push("──────────────────────");
   lines.push(`📇 Contract: ${shortenAddress(result.contractAddress)}`);
+  if (chain) {
+    lines.push(`🌐 Network: ${chainBadge(chain)} ${chainLabel(chain)}`);
+  }
   lines.push(`🚪 Gate type: ${result.gateType}`);
   lines.push(`🧩 Strategy: ${result.strategyId}`);
   if (result.state && result.state !== result.gateType) {
@@ -412,11 +501,20 @@ soldout / ended — max supply reached; it's over
 2. The bot polls every 2.5 seconds and reports gate changes.
 3. The moment the contract stops reverting, it sends the mint instantly and posts the TX link.
 4. Stop with the ⏹ button or /bypass ADDRESS --stop.
-Limits: 3 watchers per contract, 5 per user. Whitelist/signature/soldout gates auto-stop the watcher.`,
+Limits: 3 watchers per contract, 5 per user. Whitelist/signature/soldout gates auto-stop the watcher.
+
+<b>🌐 Multi-Chain — Base + Robinhood Chain</b>
+Use /chain to set your default network, or force one per command:
+/whois ADDRESS --chain=robinhood
+/bypass ADDRESS --chain=base
+/bypass ADDRESS --chain=both — runs both networks in one go
+/bypass ADDRESS --watch --chain=robinhood — watch on a specific chain
+/bypass ADDRESS --schedule --chain=both — arms on every selected chain
+Portfolio shows ⛽ Base and 🏹 Robinhood Chain items together. Sell is ⛽ Base-only for now — 🏹 items must be sold off-platform.`,
   `<b>🐝 Freemint-Bot — User Guide (3/3)</b>
 
 <b>🖼 Portfolio</b>
-NFTs are grouped by collection. Each group shows floor price and top bid, with a Sell button per collection. Use 🔄 Refresh to re-fetch, or 📦 Sweep All NFTs to Wallet 1 to consolidate. Floor shows 0 ETH when there are no live listings or the source is temporarily down — it retries automatically.
+NFTs are grouped by collection. Each group shows floor price and top bid, with a Sell button per collection (Sell is ⛽ Base-only; 🏹 Robinhood items are shown but must be sold off-platform). Use 🔄 Refresh to re-fetch, or 📦 Sweep All NFTs to Wallet 1 to consolidate. Floor shows 0 ETH when there are no live listings or the source is temporarily down — it retries automatically.
 
 <b>💼 Wallets</b>
 Generate — free instant Base wallet.
