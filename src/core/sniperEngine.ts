@@ -1,7 +1,9 @@
-import { type Address } from "viem";
 import { getPublicClient } from "./chain.js";
 import { prisma } from "../db/client.js";
 import { batchMint } from "./mint.js";
+import { withChainContext } from "./chainContext.js";
+import { type ChainId, getChainConfig } from "./chains.js";
+import { getChainsForSelection, getUserChainSelection } from "./userChain.js";
 
 export async function addTrackedWallet(telegramId: bigint, address: string, label?: string) {
   return await prisma.trackedWallet.upsert({
@@ -45,38 +47,126 @@ export async function setSniperConfig(telegramId: bigint, autoCopy: boolean, max
   });
 }
 
-// ==== Shared scanning state (replaces per-user cursors) ====
-// All users share one time-windowed cursor + one block cache, so the public RPC
-// is hit once per block instead of once per user per block.
+// ==== Shared scanning state (per-chain cursors) ====
+// All users share one time-windowed cursor + one block cache PER CHAIN, so each
+// public RPC is hit once per block instead of once per user per block.
+// Whale EVM addresses are identical on Base and Robinhood (same address space),
+// so TrackedWallet rows need NO chain column — only polling + copy-mint do.
 const CYCLE_MS = 12_000;          // matches the poller interval in main.ts
-const MAX_BLOCKS_PER_CYCLE = 50n; // Base mines ~6 blocks per 12s; 50 is a huge safety margin
+const MAX_BLOCKS_PER_CYCLE = 50n; // both chains mine well under 50 blocks per 12s
 
-let cycleStartedAt = 0;
-let cycleFromBlock: bigint | null = null;
-let cycleToBlock: bigint | null = null;
-let cycleProcessed = new Set<string>(); // `${telegramId}:${txHash}`
+const cycleStartedAt: Record<ChainId, number> = { base: 0, robinhood: 0 };
+const cycleFromBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
+const cycleToBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
+const cycleProcessed: Record<ChainId, Set<string>> = { base: new Set(), robinhood: new Set() };
 
-const blockCache = new Map<string, any>();
+const blockCache = new Map<string, any>(); // key: `${chain}:${blockNumber}`
 let blockCacheSince = 0;
 
-async function getBlockCached(blockNumber: bigint): Promise<any | null> {
+async function getBlockCached(chain: ChainId, blockNumber: bigint): Promise<any | null> {
   const now = Date.now();
   if (now - blockCacheSince > CYCLE_MS) {
     blockCache.clear();
     blockCacheSince = now;
   }
-  const key = blockNumber.toString();
+  const key = `${chain}:${blockNumber.toString()}`;
   if (blockCache.has(key)) return blockCache.get(key);
   try {
-    const block = await getPublicClient().getBlock({
+    const block = await getPublicClient(chain).getBlock({
       blockNumber,
       includeTransactions: true,
     });
     blockCache.set(key, block);
     return block;
   } catch (err) {
-    console.error(`getBlock(${key}) failed:`, err);
+    console.error(`getBlock(${chain}, ${blockNumber}) failed:`, err);
     return null;
+  }
+}
+
+async function pollChain(
+  chain: ChainId,
+  telegramId: bigint,
+  tracked: Array<{ address: string; label: string | null }>,
+  config: { maxSpendEth: number },
+  notifyCallback: (msg: string) => void
+) {
+  const { badge, name } = getChainConfig(chain);
+  const publicClient = getPublicClient(chain);
+
+  try {
+    const head = await publicClient.getBlockNumber();
+    const now = Date.now();
+
+    // New 12s window → advance this chain's cursor and reset its dedupe set.
+    if (now - cycleStartedAt[chain] > CYCLE_MS) {
+      cycleStartedAt[chain] = now;
+      cycleFromBlock[chain] =
+        cycleFromBlock[chain] === null
+          ? head - 1n
+          : cycleToBlock[chain] === null
+          ? head - 1n
+          : cycleToBlock[chain] + 1n;
+      cycleToBlock[chain] = head;
+      cycleProcessed[chain] = new Set();
+    }
+
+    const fromBlock = cycleFromBlock[chain];
+    const toBlock = cycleToBlock[chain];
+    if (fromBlock === null || toBlock === null) return;
+
+    // Bound the scan to the most recent blocks if we ever fall behind.
+    let from = fromBlock;
+    if (toBlock - from + 1n > MAX_BLOCKS_PER_CYCLE) {
+      from = toBlock - MAX_BLOCKS_PER_CYCLE + 1n;
+    }
+
+    for (let bNum = from; bNum <= toBlock; bNum++) {
+      const block = await getBlockCached(chain, bNum);
+      if (!block?.transactions) continue;
+
+      for (const tx of block.transactions) {
+        if (typeof tx !== "object" || !tx.from) continue;
+
+        const sender = tx.from.toLowerCase();
+        const matchedWallet = tracked.find((tw) => tw.address.toLowerCase() === sender);
+        if (!matchedWallet) continue;
+
+        if (!tx.to || !tx.input || tx.input === "0x" || tx.input.length <= 10) continue;
+
+        // One copy-mint per whale-tx per user per chain (dedupe across shared cycles).
+        const dedupeKey = `${chain}:${telegramId.toString()}:${tx.hash}`;
+        if (cycleProcessed[chain].has(dedupeKey)) continue;
+        cycleProcessed[chain].add(dedupeKey);
+
+        const valueEth = Number(tx.value || 0n) / 1e18;
+
+        if (valueEth <= config.maxSpendEth) {
+          notifyCallback(
+            `🎯 **WHALE COPY-MINT ALERT (${matchedWallet.label || "Tracked"}) — ${badge} ${name}!**\n` +
+              `Target Contract: \`${tx.to}\`\n` +
+              `Value: \`${valueEth} ETH\`\n` +
+              `TxHash: \`${tx.hash}\`\n\n` +
+              `🚀 Attempting copy-mint across your sub-wallets… ` +
+              `(contract is re-vetted by the security gate before any transaction is sent)`
+          );
+
+          // batchMint re-runs scanContract internally, which now FAILS CLOSED:
+          // if the GoPlus check or NFT check fails, zero transactions are sent.
+          // The chain context makes every no-arg client/chain lookup inside
+          // batchMint resolve to the chain the whale tx actually happened on.
+          await withChainContext(chain, () => batchMint(telegramId, tx.to));
+        } else {
+          notifyCallback(
+            `⏭️ **Skipped Copy-Mint (${matchedWallet.label || "Tracked"}) — ${badge} ${name}**\n` +
+              `Cost: ~${valueEth} ETH exceeds your Max Spend setting (${config.maxSpendEth} ETH).\n` +
+              `TxHash: \`${tx.hash}\``
+          );
+        }
+      }
+    }
+  } catch (err) {
+    console.error(`Error in sniper polling for user ${telegramId} on ${chain}:`, err);
   }
 }
 
@@ -90,72 +180,12 @@ export async function pollTrackedWalletsForUser(
   const tracked = await getTrackedWallets(telegramId);
   if (tracked.length === 0) return;
 
-  const publicClient = getPublicClient();
+  // Poll every chain the user's /chain selection covers (base, robinhood, or both).
+  // Failures on one chain are caught inside pollChain and never block the others.
+  const selection = await getUserChainSelection(telegramId);
+  const chains = getChainsForSelection(selection);
 
-  try {
-    const head = await publicClient.getBlockNumber();
-    const now = Date.now();
-
-    // New 12s window → advance the shared cursor and reset per-cycle dedupe.
-    if (now - cycleStartedAt > CYCLE_MS) {
-      cycleStartedAt = now;
-      cycleFromBlock =
-        cycleFromBlock === null ? head - 1n : cycleToBlock === null ? head - 1n : cycleToBlock + 1n;
-      cycleToBlock = head;
-      cycleProcessed = new Set();
-    }
-
-    if (cycleFromBlock === null || cycleToBlock === null) return;
-
-    // Bound the scan to the most recent blocks if we ever fall behind.
-    let from = cycleFromBlock;
-    if (cycleToBlock - from + 1n > MAX_BLOCKS_PER_CYCLE) {
-      from = cycleToBlock - MAX_BLOCKS_PER_CYCLE + 1n;
-    }
-
-    for (let bNum = from; bNum <= cycleToBlock; bNum++) {
-      const block = await getBlockCached(bNum);
-      if (!block?.transactions) continue;
-
-      for (const tx of block.transactions) {
-        if (typeof tx !== "object" || !tx.from) continue;
-
-        const sender = tx.from.toLowerCase();
-        const matchedWallet = tracked.find((tw) => tw.address.toLowerCase() === sender);
-        if (!matchedWallet) continue;
-
-        if (!tx.to || !tx.input || tx.input === "0x" || tx.input.length <= 10) continue;
-
-        // One copy-mint per whale-tx per user (dedupe across shared cycles).
-        const dedupeKey = `${telegramId.toString()}:${tx.hash}`;
-        if (cycleProcessed.has(dedupeKey)) continue;
-        cycleProcessed.add(dedupeKey);
-
-        const valueEth = Number(tx.value || 0n) / 1e18;
-
-        if (valueEth <= config.maxSpendEth) {
-          notifyCallback(
-            `🎯 **WHALE COPY-MINT ALERT (${matchedWallet.label || "Tracked"})!**\n` +
-              `Target Contract: \`${tx.to}\`\n` +
-              `Value: \`${valueEth} ETH\`\n` +
-              `TxHash: \`${tx.hash}\`\n\n` +
-              `🚀 Attempting copy-mint across your sub-wallets… ` +
-              `(contract is re-vetted by the security gate before any transaction is sent)`
-          );
-
-          // batchMint re-runs scanContract internally, which now FAILS CLOSED:
-          // if the GoPlus check or NFT check fails, zero transactions are sent.
-          await batchMint(telegramId, tx.to);
-        } else {
-          notifyCallback(
-            `⏭️ **Skipped Copy-Mint (${matchedWallet.label || "Tracked"})**\n` +
-              `Cost: ~${valueEth} ETH exceeds your Max Spend setting (${config.maxSpendEth} ETH).\n` +
-              `TxHash: \`${tx.hash}\``
-          );
-        }
-      }
-    }
-  } catch (err) {
-    console.error(`Error in sniper polling for user ${telegramId}:`, err);
+  for (const chain of chains) {
+    await pollChain(chain, telegramId, tracked, config, notifyCallback);
   }
 }
