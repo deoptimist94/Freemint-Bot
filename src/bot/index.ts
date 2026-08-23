@@ -8,6 +8,7 @@ import {
   watchStopCallback,
   guideCommand,
 } from "./command.js";
+import { chainCommand, chainCallback } from "./chainCommand.js";
 import { getBotStats, formatStatsLine } from "../core/stats.js";
 import { ensureUser } from "../core/wallet.js";
 
@@ -33,9 +34,10 @@ export function createBot(): Bot {
 
     await ctx.reply(
       "👋 Welcome to Freemint-Bot!\n\n" +
-        "I scan Base-chain NFT contracts for free mints, audit security, " +
+        "I scan Base & Robinhood Chain NFT contracts for free mints, audit security, " +
         "bypass mint gates and track your portfolio.\n\n" +
         "Commands:\n" +
+        "/chain — choose Base / Robinhood / Both chains\n" +
         "/whois <contract> — contract intelligence report\n" +
         "/bypass <contract> — run the bypass engine\n" +
         "/portfolio — view NFTs across your wallets\n" +
@@ -49,6 +51,7 @@ export function createBot(): Bot {
   bot.command("help", async (ctx) => {
     await ctx.reply(
       "🤖 Freemint-Bot help\n\n" +
+        "/chain — pick which chain(s) you operate on (Base / Robinhood / Both)\n" +
         "/whois <contract address> — security, verified status, mint functions\n" +
         "/bypass <contract address> — analyze gates & attempt a bypass\n" +
         "/bypass <contract> --watch — poll-and-fire FCFS mint watcher\n" +
@@ -60,6 +63,7 @@ export function createBot(): Bot {
   });
 
   bot.command("guide", (ctx) => guideCommand(ctx));
+  bot.command("chain", (ctx) => chainCommand(ctx));
   bot.command("whois", (ctx) => whoisCommand(ctx));
   bot.command("bypass", (ctx) => bypassCommand(ctx));
   bot.command("portfolio", async (ctx) => {
@@ -68,6 +72,10 @@ export function createBot(): Bot {
   });
 
   bot.on("callback_query:data", async (ctx, next) => {
+    if (ctx.callbackQuery.data.startsWith("chain_set_")) {
+      await chainCallback(ctx);
+      return;
+    }
     if (ctx.callbackQuery.data.startsWith("watch_stop_")) {
       await watchStopCallback(ctx);
       return;
