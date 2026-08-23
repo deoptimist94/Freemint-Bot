@@ -1,4 +1,4 @@
-import type { Context } from "grammy";
+import type { Context, InlineKeyboardMarkup } from "grammy";
 import {
   getUserChainSelection,
   setUserChainSelection,
@@ -7,12 +7,7 @@ import {
   type ChainSelection,
 } from "../core/userChain.js";
 
-export function chainKeyboard(selection: ChainSelection): {
-  inline_keyboard: {
-    text: string;
-    callback_data: string;
-  }[][];
-} {
+export function chainKeyboard(selection: ChainSelection): InlineKeyboardMarkup {
   const mark = (s: ChainSelection): string => (s === selection ? "✅ " : "");
   return {
     inline_keyboard: [
@@ -60,6 +55,6 @@ export async function chainCallback(ctx: Context): Promise<void> {
   await setUserChainSelection(telegramId, selection);
   await ctx.answerCallbackQuery(`Chain set to ${selectionLabel(selection)}`);
   await ctx
-    .editMessageReplyMarkup(chainKeyboard(selection))
+    .editMessageReplyMarkup({ reply_markup: chainKeyboard(selection) })
     .catch(() => undefined);
 }
