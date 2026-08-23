@@ -229,7 +229,10 @@ export async function fetchWalletPortfolio(
     if (!floor) continue;
     item.floorPriceEth = floor.floorPriceEth;
     item.topBidEth = floor.topBidEth;
-    if (floor.collectionName) {
+    // autoLister falls back to "<Chain> NFT" (e.g. "Base NFT") when no floor
+    // source knows the collection — never let that generic placeholder clobber
+    // the real collection name that Alchemy wallet metadata already provided.
+    if (floor.collectionName && floor.collectionName !== `${config.name} NFT`) {
       item.collectionName = floor.collectionName;
       if (!item.name || item.name.startsWith("Token #")) {
         item.name = floor.collectionName;
