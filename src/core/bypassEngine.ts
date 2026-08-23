@@ -21,6 +21,9 @@ import {
   type MintFunctionInfo,
   type ScanResult,
 } from "./scanner.js";
+import { getChainConfig, getDefaultChainId, type ChainId } from "./chains.js";
+import { getUserChainSelection, getPrimaryChain } from "./userChain.js";
+import { withChainContext } from "./chainContext.js";
 import { prisma } from "../db/client.js";
 
 export type GateType =
@@ -46,6 +49,7 @@ export interface BypassResult {
   state?: string;
   probe?: ProbeRow[];
   publicMintAt?: { atMs: number; label: string } | null;
+  chain?: ChainId;
 }
 
 export interface BypassPlan {
@@ -521,7 +525,8 @@ async function logBypass(
   walletAddress: string,
   success: boolean,
   txHash?: string,
-  error?: string
+  error?: string,
+  chain: ChainId = getDefaultChainId()
 ): Promise<void> {
   try {
     await prisma.bypassLog.create({
@@ -533,6 +538,7 @@ async function logBypass(
         success,
         txHash: txHash ?? null,
         error: error ?? null,
+        chain,
       },
     });
   } catch {
@@ -552,7 +558,8 @@ async function tryDirectMint(
   client: ReturnType<typeof getPublicClient>,
   attempts: WalletInfo[],
   options: BypassOptions,
-  base: BypassResult
+  base: BypassResult,
+  chain: ChainId
 ): Promise<BypassResult | null> {
   const targetFn = plan.targetFn;
   if (!targetFn) return null;
@@ -596,7 +603,8 @@ async function tryDirectMint(
         fromAddress,
         true,
         undefined,
-        "dry-run (simulation only)"
+        "dry-run (simulation only)",
+        chain
       );
       return {
         ...base,
@@ -626,7 +634,7 @@ async function tryDirectMint(
         receiptTimeout,
       ]);
 
-      await logBypass(userId, address, strategyId, fromAddress, true, txHash);
+      await logBypass(userId, address, strategyId, fromAddress, true, txHash, undefined, chain);
       return {
         ...base,
         success: true,
@@ -718,7 +726,8 @@ async function tryMatrix(
   options: BypassOptions,
   base: BypassResult,
   fns: MintFunctionInfo[],
-  strategyId: string
+  strategyId: string,
+  chain: ChainId
 ): Promise<BypassResult | null> {
   if (!result.abi || fns.length === 0) return null;
 
@@ -752,7 +761,8 @@ async function tryMatrix(
         fromAddress,
         true,
         undefined,
-        "dry-run (simulation only)"
+        "dry-run (simulation only)",
+        chain
       );
       return {
         ...base,
@@ -781,7 +791,7 @@ async function tryMatrix(
         receiptTimeout,
       ]);
 
-      await logBypass(userId, address, strategyId, fromAddress, true, txHash);
+      await logBypass(userId, address, strategyId, fromAddress, true, txHash, undefined, chain);
       return {
         ...base,
         success: true,
@@ -852,6 +862,15 @@ function buildFinalError(
 // Orchestrator
 // ---------------------------------------------------------------------------
 
+function chainRpcHint(chain: ChainId): string {
+  return chain === "robinhood"
+    ? `Set ROBINHOOD_RPC_URL to a private Robinhood Chain RPC endpoint, or ensure ROBINHOOD_ALCHEMY_API_KEY is set so the bot can use Alchemy RPC automatically.`
+    : `Set BASE_RPC_URL to a private Alchemy/QuickNode Base endpoint, or ensure ALCHEMY_API_KEY is set so the bot can use Alchemy RPC automatically.`;
+}
+
+// Chain is resolved per-user (getUserChainSelection → getPrimaryChain) and the
+// whole run executes inside withChainContext so getPublicClient() /
+// getWalletClient() / checkGasSafety() all inherit the correct chain.
 export async function executeBypass(
   userId: bigint,
   rawAddress: string,
@@ -860,7 +879,17 @@ export async function executeBypass(
   const address = normalizeAddressInput(rawAddress);
   if (!address) throw new Error("Invalid address");
 
-  const result: ScanResult = await scanContract(address);
+  const chain: ChainId = getPrimaryChain(await getUserChainSelection(userId));
+  return withChainContext(chain, () => runBypass(userId, address, chain, options));
+}
+
+async function runBypass(
+  userId: bigint,
+  address: string,
+  chain: ChainId,
+  options: BypassOptions
+): Promise<BypassResult> {
+  const result: ScanResult = await scanContract(address, chain);
   const client = getPublicClient();
 
   const probe = await probeStateVariables(
@@ -880,6 +909,7 @@ export async function executeBypass(
     state,
     probe,
     publicMintAt,
+    chain,
   };
 
   if (options.probeOnly) {
@@ -893,7 +923,8 @@ export async function executeBypass(
       "",
       true,
       undefined,
-      "probe-only (no tx)"
+      "probe-only (no tx)",
+      chain
     );
     return base;
   }
@@ -901,14 +932,14 @@ export async function executeBypass(
   const gas = await checkGasSafety(userId);
   if (!gas.safe) {
     const error = `Gas too high to proceed: ${gas.currentGwei} gwei (ceiling ${gas.maxGwei} gwei)`;
-    await logBypass(userId, address, "none", "", false, undefined, error);
+    await logBypass(userId, address, "none", "", false, undefined, error, chain);
     return { ...base, error };
   }
 
   const wallets = await getWallets(userId);
   if (wallets.length === 0) {
     const error = "No wallet found. Add a wallet in the Portfolio menu first.";
-    await logBypass(userId, address, "none", "", false, undefined, error);
+    await logBypass(userId, address, "none", "", false, undefined, error, chain);
     return { ...base, error };
   }
 
@@ -957,8 +988,8 @@ export async function executeBypass(
   if (simError && simError.startsWith("RPC_TRANSPORT:")) {
     const error =
       `RPC unavailable during simulation (${simError.replace(/^RPC_TRANSPORT:\s*/, "")}). ` +
-      `Set BASE_RPC_URL to a private Alchemy/QuickNode Base endpoint, or ensure ALCHEMY_API_KEY is set so the bot can use Alchemy RPC automatically.`;
-    await logBypass(userId, address, "none", "", false, undefined, error);
+      chainRpcHint(chain);
+    await logBypass(userId, address, "none", "", false, undefined, error, chain);
     return { ...base, gateType: "unknown", error };
   }
 
@@ -978,7 +1009,8 @@ export async function executeBypass(
       client,
       attempts,
       options,
-      base
+      base,
+      chain
     );
     if (direct) return direct;
   }
@@ -999,7 +1031,8 @@ export async function executeBypass(
         options,
         base,
         pubFns,
-        "public_path"
+        "public_path",
+        chain
       );
       if (pub) return pub;
     }
@@ -1017,7 +1050,8 @@ export async function executeBypass(
         options,
         base,
         allFns,
-        "probe_matrix"
+        "probe_matrix",
+        chain
       );
       if (matrix) return matrix;
     }
@@ -1027,8 +1061,10 @@ export async function executeBypass(
   if (base.error && base.error.includes("RPC_TRANSPORT")) {
     const error =
       `RPC unavailable during bypass attempts. ` +
-      `Set BASE_RPC_URL or ALCHEMY_API_KEY so simulations can reach Base.`;
-    await logBypass(userId, address, base.strategyId, "", false, undefined, error);
+      (chain === "robinhood"
+        ? `Set ROBINHOOD_RPC_URL or ROBINHOOD_ALCHEMY_API_KEY so simulations can reach ${getChainConfig(chain).name}.`
+        : `Set BASE_RPC_URL or ALCHEMY_API_KEY so simulations can reach ${getChainConfig(chain).name}.`);
+    await logBypass(userId, address, base.strategyId, "", false, undefined, error, chain);
     return { ...base, gateType: "unknown", error };
   }
 
@@ -1038,6 +1074,6 @@ export async function executeBypass(
     publicMintAt,
     plan.reason
   );
-  await logBypass(userId, address, base.strategyId, "", false, undefined, error);
+  await logBypass(userId, address, base.strategyId, "", false, undefined, error, chain);
   return { ...base, error };
 }
