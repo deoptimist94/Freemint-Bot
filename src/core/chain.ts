@@ -1,4 +1,11 @@
-import { createWalletClient, http, createPublicClient, type Address, type Hex, type Chain } from "viem";
+import {
+  createWalletClient,
+  http,
+  createPublicClient,
+  type Address,
+  type Hex,
+  type Chain,
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 
@@ -6,11 +13,21 @@ export type { Hex, Address };
 
 export const BASE_CHAIN_ID = 8453;
 
+// Prefer explicit BASE_RPC_URL, then Alchemy (same key as NFT API), then public Base.
+// Public mainnet.base.org rate-limits eth_call hard — that was the "RPC Request failed".
+export function getBaseRpcUrl(): string {
+  const explicit = (process.env.BASE_RPC_URL || "").trim();
+  if (explicit) return explicit;
+  const alchemy = (process.env.ALCHEMY_API_KEY || "").trim();
+  if (alchemy) return `https://base-mainnet.g.alchemy.com/v2/${alchemy}`;
+  return "https://mainnet.base.org";
+}
+
 export const baseChain: Chain = {
   ...base,
   rpcUrls: {
     default: {
-      http: [process.env.BASE_RPC_URL || "https://mainnet.base.org"],
+      http: [getBaseRpcUrl()],
     },
   },
 };
@@ -18,7 +35,11 @@ export const baseChain: Chain = {
 export function getPublicClient() {
   return createPublicClient({
     chain: baseChain,
-    transport: http(process.env.BASE_RPC_URL || "https://mainnet.base.org"),
+    transport: http(getBaseRpcUrl(), {
+      timeout: 20_000,
+      retryCount: 2,
+      retryDelay: 400,
+    }),
   });
 }
 
@@ -27,7 +48,11 @@ export function getWalletClient(privateKey: Hex) {
   return createWalletClient({
     account,
     chain: baseChain,
-    transport: http(process.env.BASE_RPC_URL || "https://mainnet.base.org"),
+    transport: http(getBaseRpcUrl(), {
+      timeout: 20_000,
+      retryCount: 2,
+      retryDelay: 400,
+    }),
   });
 }
 
