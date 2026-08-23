@@ -13,6 +13,9 @@ import {
   normalizeAddressInput,
 } from "../core/chain.js";
 import { scanContract } from "../core/scanner.js";
+import { getChainConfig, type ChainId } from "../core/chains.js";
+import { getUserChainSelection, getPrimaryChain } from "../core/userChain.js";
+import { withChainContext } from "../core/chainContext.js";
 import {
   batchMint,
   getUserMintQuantity,
@@ -81,6 +84,18 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// ---------------------------------------------------------------------------
+// Batch 4: per-user chain resolution
+// ---------------------------------------------------------------------------
+async function resolveUserChain(telegramId: bigint): Promise<ChainId> {
+  return getPrimaryChain(await getUserChainSelection(telegramId));
+}
+
+function networkBadge(chain: ChainId): string {
+  const c = getChainConfig(chain);
+  return `${c.badge} ${c.name}`;
+}
+
 type EditOptions = {
   parse_mode?: "Markdown" | "HTML";
   reply_markup?: unknown;
@@ -111,19 +126,25 @@ async function editOrReply(ctx: Context, text: string, options?: EditOptions): P
 // ---------------------------------------------------------------------------
 async function showMainMenu(ctx: Context, telegramId: bigint): Promise<void> {
   const autoMint = await getAutoMintStatus(telegramId);
-  await editOrReply(ctx, `🏠 **Main Menu**\n\nAuto-mint: ${autoMint ? "✅ ON" : "⭕ OFF"}`, {
-    reply_markup: mainMenuKeyboard(autoMint),
-    parse_mode: "Markdown",
-  });
+  const chain = await resolveUserChain(telegramId);
+  await editOrReply(
+    ctx,
+    `🏠 **Main Menu**\n\n🌐 Network: ${networkBadge(chain)}\nAuto-mint: ${autoMint ? "✅ ON" : "⭕ OFF"}`,
+    {
+      reply_markup: mainMenuKeyboard(autoMint),
+      parse_mode: "Markdown",
+    }
+  );
 }
 
 async function showWallets(ctx: Context, telegramId: bigint): Promise<void> {
   const wallets = await getWallets(telegramId);
-  let text = `👛 **Your Wallets**\n\n`;
+  const chain = await resolveUserChain(telegramId);
+  let text = `👛 **Your Wallets** — ${networkBadge(chain)}\n\n`;
   if (wallets.length === 0) {
     text += `No wallets yet. Create one below.`;
   } else {
-    const balances = await fetchAllWalletsBalances(wallets);
+    const balances = await withChainContext(chain, () => fetchAllWalletsBalances(wallets));
     for (const b of balances) {
       const wallet = wallets.find((w) => w.address === b.address);
       const icon = wallet?.isActive ? "✅" : "⭕";
@@ -149,8 +170,9 @@ async function showDeleteWallet(ctx: Context, telegramId: bigint): Promise<void>
 async function showFundMenu(ctx: Context, telegramId: bigint): Promise<void> {
   const ethPrice = await getEthUsdPrice();
   const wallets = await getWallets(telegramId);
+  const chain = await resolveUserChain(telegramId);
   const master = wallets[0];
-  let text = `💰 **Refuel / Distribute Gas**\n\nSend gas to the master wallet below, then distribute to every sub-wallet:`;
+  let text = `💰 **Refuel / Distribute Gas** — ${networkBadge(chain)}\n\nSend gas to the master wallet below, then distribute to every sub-wallet:`;
   if (master) text += `\n\nMaster (send gas here):\n\`${master.address}\``;
   text += `\n\nChoose an amount to send to EACH sub-wallet:`;
   await editOrReply(ctx, text, {
@@ -159,13 +181,10 @@ async function showFundMenu(ctx: Context, telegramId: bigint): Promise<void> {
   });
 }
 
-// Grouped portfolio view: one line per collection instead of one line per NFT.
 const TOKENS_PER_COLLECTION = 40;
 const MAX_COLLECTION_BUTTONS = 8;
 const MAX_TEXT_LENGTH = 3500;
 
-// Telegram Markdown: escape user-controlled strings (collection names, labels)
-// so dynamic values can't break entity parsing and kill the whole message.
 function mdEscape(text: string): string {
   return text
     .replace(/[\r\n]+/g, " ")
@@ -173,7 +192,7 @@ function mdEscape(text: string): string {
 }
 
 interface CollectionGroup {
-  key: string; // `${contractAddress.toLowerCase()}::${name}`
+  key: string;
   contractAddress: string;
   name: string;
   items: PortfolioItem[];
@@ -214,8 +233,6 @@ function groupItems(items: PortfolioItem[]): CollectionGroup[] {
       }
     });
   }
-  // Highest floor first, then largest holdings — the collections that matter
-  // most are always at the top of the wallet section.
   groups.sort((a, b) => {
     if (b.floorPriceEth !== a.floorPriceEth) return b.floorPriceEth - a.floorPriceEth;
     return b.items.length - a.items.length;
@@ -236,12 +253,12 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
     return;
   }
 
-  // Fetch every wallet in parallel; each fetch is internally time-bounded
-  // (single Alchemy page + concurrent floor lookups with a hard budget).
+  const chain = await resolveUserChain(telegramId);
+
   const results = await Promise.allSettled(
     wallets.map(async (wallet) => ({
       wallet,
-      portfolio: await fetchWalletPortfolio(wallet.address),
+      portfolio: await withChainContext(chain, () => fetchWalletPortfolio(wallet.address)),
     }))
   );
 
@@ -268,9 +285,6 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
       continue;
     }
 
-    // Register EVERY item this wallet holds (fetch caps at 100) so any token a
-    // user later taps via a collection button resolves instantly and never
-    // fails with "Token not found in your wallets" on a transient API hiccup.
     for (const item of portfolio.items) {
       setSellTarget(telegramId, wallet.id, item.tokenId, {
         walletId: wallet.id,
@@ -283,7 +297,6 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
       });
     }
 
-    // Grouped view: one line per collection, token ids inline.
     const groups = groupItems(portfolio.items);
     lines.push(`👛 **${mdEscape(wallet.label)}** (\`${wallet.address}\`)`);
     for (const g of groups) {
@@ -296,8 +309,6 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
       lines.push(`   ${ids}${extra > 0 ? ` …(+${extra})` : ""}`);
     }
 
-    // One sell button per collection (sells that collection's lowest token).
-    // Capped at 8; oversized callbacks fall back to an OpenSea link.
     let buttons = 0;
     for (const g of groups) {
       if (buttons >= MAX_COLLECTION_BUTTONS) break;
@@ -316,14 +327,11 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
     kb.row();
   }
 
-  // Build the message and, if needed, drop trailing item lines until it fits
-  // comfortably under Telegram's 4096-char hard limit. Dropping whole lines
-  // keeps the Markdown balanced so entity parsing can never fail.
-  let text = `💼 **Portfolio**\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
+  let text = `💼 **Portfolio** — ${networkBadge(chain)}\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
   if (hasButtons) text += `\n\nSell into the top bid with the buttons below (each sells the lowest token of that collection).`;
   while (text.length > MAX_TEXT_LENGTH && lines.length > 0) {
     lines.pop();
-    text = `💼 **Portfolio**\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
+    text = `💼 **Portfolio** — ${networkBadge(chain)}\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
     if (hasButtons) text += `\n\nSell into the top bid with the buttons below (each sells the lowest token of that collection).`;
   }
 
@@ -380,9 +388,11 @@ async function showMaxSpendSettings(ctx: Context, telegramId: bigint): Promise<v
 }
 
 async function showHelpText(ctx: Context): Promise<void> {
+  const chain = await resolveUserChain(BigInt(ctx.from?.id ?? 0));
   await editOrReply(
     ctx,
     `📖 **Freemint-Bot Guide**\n\n` +
+      `🌐 Network: ${networkBadge(chain)}\n\n` +
       `• 💼 **Wallets** — generate, import, copy full addresses, export keys\n` +
       `• 🎯 **Tracking** — copy-mint whales, set max spend\n` +
       `• 🖼 **Portfolio** — view NFTs & sell into the top bid\n` +
@@ -418,11 +428,12 @@ async function showTrackedWallets(ctx: Context, telegramId: bigint): Promise<voi
 
 async function showWatchlist(ctx: Context, telegramId: bigint): Promise<void> {
   const contracts = await getWatchlistWithContracts(telegramId);
+  const chain = await resolveUserChain(telegramId);
   let text: string;
   if (contracts.length === 0) {
-    text = `📋 **Your Watchlist is empty.**\n\nSend me any contract address to scan it, then add it to your watchlist.`;
+    text = `📋 **Your Watchlist is empty.** (🌐 ${networkBadge(chain)})\n\nSend me any contract address to scan it, then add it to your watchlist.`;
   } else {
-    text = `Tracking ${contracts.length} contract(s):\n\n`;
+    text = `🌐 ${networkBadge(chain)}\n\nTracking ${contracts.length} contract(s):\n\n`;
     for (const c of contracts) {
       text += `• \`${c}\`\n`;
     }
@@ -434,9 +445,6 @@ async function showWatchlist(ctx: Context, telegramId: bigint): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Wallet actions
-// ---------------------------------------------------------------------------
 async function handleNewWallet(ctx: Context, telegramId: bigint): Promise<void> {
   try {
     const wallet = await generateNewWallet(telegramId);
@@ -512,16 +520,14 @@ async function handleExportWallet(ctx: Context, data: string): Promise<void> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Fund / sweep
-// ---------------------------------------------------------------------------
 async function runFund(ctx: Context, telegramId: bigint, amount: number): Promise<void> {
   if (ctx.callbackQuery) {
     await ctx.answerCallbackQuery({ text: "⏳ Funding sub-wallets..." }).catch(() => undefined);
   }
   try {
-    const result = await fundSubWallets(telegramId, amount);
-    let text = `✅ **Funding Complete**\n\nDistributed: \`${result.totalDistributedEth}\` ETH\n\n`;
+    const chain = await resolveUserChain(telegramId);
+    const result = await withChainContext(chain, () => fundSubWallets(telegramId, amount));
+    let text = `✅ **Funding Complete** — ${networkBadge(chain)}\n\nDistributed: \`${result.totalDistributedEth}\` ETH\n\n`;
     for (const r of result.results) {
       text += r.error
         ? `❌ ${r.walletLabel} — ${r.error}\n`
@@ -543,8 +549,9 @@ async function runSweepDust(ctx: Context, telegramId: bigint): Promise<void> {
   }
   await ctx.answerCallbackQuery({ text: "⏳ Sweeping dust..." });
   try {
-    const result = await sweepDustToMaster(telegramId, wallets[0].address);
-    let text = `🧹 **Dust Sweep Complete**\n\nTotal swept: \`${result.totalSweptEth}\` ETH\n\n`;
+    const chain = await resolveUserChain(telegramId);
+    const result = await withChainContext(chain, () => sweepDustToMaster(telegramId, wallets[0].address));
+    let text = `🧹 **Dust Sweep Complete** — ${networkBadge(chain)}\n\nTotal swept: \`${result.totalSweptEth}\` ETH\n\n`;
     for (const r of result.results) {
       text += r.error ? `❌ ${r.walletLabel} — ${r.error}\n` : `✅ ${r.walletLabel} — ${r.sweptEth} ETH\n`;
     }
@@ -564,8 +571,9 @@ async function runSweepNfts(ctx: Context, telegramId: bigint): Promise<void> {
   }
   await ctx.answerCallbackQuery({ text: "⏳ Sweeping NFTs..." });
   try {
-    const result = await sweepAllNFTsToMaster(telegramId, wallets[0].address);
-    let text = `🗃 **NFT Sweep Complete**\n\nMoved: \`${result.totalMoved}\` NFTs\n\n`;
+    const chain = await resolveUserChain(telegramId);
+    const result = await withChainContext(chain, () => sweepAllNFTsToMaster(telegramId, wallets[0].address));
+    let text = `🗃 **NFT Sweep Complete** — ${networkBadge(chain)}\n\nMoved: \`${result.totalMoved}\` NFTs\n\n`;
     for (const r of result.results) {
       text += r.error
         ? `❌ ${r.collectionName || r.fromWallet} #${r.tokenId} — ${r.error}\n`
@@ -579,13 +587,6 @@ async function runSweepNfts(ctx: Context, telegramId: bigint): Promise<void> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Sell flow (callback: sell_<tokenId>_<walletId>)
-// ---------------------------------------------------------------------------
-// Prefix-aware parse: the old version ran lastIndexOf("_") over the WHOLE
-// callback, so `sell_404_w1` produced tokenId "sell_404" → cache miss →
-// "Token not found in your wallets". Stripping the prefix first fixes it for
-// sell_, confirm_sell_ and cancel_sell_ alike.
 function parseSellPayload(prefix: string, data: string): { tokenId: string; walletId: string } {
   const rest = data.startsWith(prefix) ? data.slice(prefix.length) : data;
   const idx = rest.lastIndexOf("_");
@@ -607,10 +608,6 @@ async function resolveSellTarget(
   const wallet = wallets.find((w) => w.id === walletId);
   if (!wallet) return null;
 
-  // 1) Fast path: the portfolio view and floor alerts already registered the
-  //    exact item for this wallet+token, so a Sell tap resolves instantly —
-  //    no live re-fetch that can fail with a transient Alchemy error and
-  //    produce "Token not found".
   const cached = getSellTarget(telegramId, walletId, tokenId);
   if (cached) {
     return {
@@ -627,8 +624,6 @@ async function resolveSellTarget(
     };
   }
 
-  // 2) Live fallback — restricted to the wallet named in the callback so a
-  //    stale or forged payload can never dump a token from a different wallet.
   try {
     const portfolio = await fetchWalletPortfolio(wallet.address);
     const item = portfolio.items.find((i) => i.tokenId === tokenId);
@@ -645,7 +640,7 @@ async function resolveSellTarget(
       return { wallet, item };
     }
   } catch {
-    // live lookup failed — report not found rather than a cryptic error
+    // live lookup failed
   }
   return null;
 }
@@ -729,9 +724,6 @@ async function handleCancelSell(ctx: Context, data: string): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Settings / tracking actions
-// ---------------------------------------------------------------------------
 async function handleFundCallback(ctx: Context, telegramId: bigint, data: string): Promise<void> {
   const amount = parseFloat(data.replace(/^fund_/, ""));
   if (!Number.isFinite(amount) || amount <= 0) {
@@ -832,9 +824,6 @@ async function handleConfirmMint(ctx: Context, telegramId: bigint, data: string)
   await performMint(ctx, telegramId, address);
 }
 
-// ---------------------------------------------------------------------------
-// Pending-input prompts
-// ---------------------------------------------------------------------------
 async function promptImport(ctx: Context): Promise<void> {
   pendingImports.set(userIdNumber(ctx), true);
   await editOrReply(
@@ -880,9 +869,6 @@ async function promptAddTracked(ctx: Context): Promise<void> {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Callback dispatcher (most-specific prefixes first)
-// ---------------------------------------------------------------------------
 export async function handleCallback(ctx: Context): Promise<void> {
   const data = ctx.callbackQuery?.data ?? "";
   if (!data) return;
@@ -966,9 +952,6 @@ export async function handleCallback(ctx: Context): Promise<void> {
   await ctx.answerCallbackQuery({ text: "Unknown action" }).catch(() => undefined);
 }
 
-// ---------------------------------------------------------------------------
-// Text handler (pending inputs + fallback scan)
-// ---------------------------------------------------------------------------
 export async function handleText(ctx: Context): Promise<void> {
   const uid = userIdNumber(ctx);
   const telegramId = BigInt(uid);
@@ -1037,7 +1020,6 @@ export async function handleText(ctx: Context): Promise<void> {
     return;
   }
 
-  // Fallback: any pasted address is scanned.
   const address = normalizeAddressInput(text);
   if (isValidAddress(address)) {
     await performScan(ctx, telegramId, address);
@@ -1049,20 +1031,18 @@ export async function handleText(ctx: Context): Promise<void> {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Scan / mint / import
-// ---------------------------------------------------------------------------
 async function performScan(
   ctx: Context,
   telegramId: bigint,
   address: string
 ): Promise<void> {
-  await ctx.reply(`🔍 Scanning contract \`${shortenAddress(address)}\`...`, {
+  const chain = await resolveUserChain(telegramId);
+  await ctx.reply(`🔍 Scanning contract \`${shortenAddress(address)}\` on ${networkBadge(chain)}...`, {
     parse_mode: "Markdown",
   });
 
   try {
-    const result = await scanContract(address);
+    const result = await withChainContext(chain, () => scanContract(address, chain));
 
     if (!result.isContract) {
       await ctx.reply(
@@ -1075,7 +1055,7 @@ async function performScan(
       return;
     }
 
-    let text = `🔍 **Contract Analysis & Security Audit**\n\n`;
+    let text = `🔍 **Contract Analysis & Security Audit** — ${networkBadge(chain)}\n\n`;
     text += `Contract: \`${result.contractAddress}\`\n`;
     text += `Verified: ${result.isVerified ? "✅ Yes" : "⚠️ Bytecode only"}\n`;
     text += `🛡 **Security Status:** ${
@@ -1123,7 +1103,8 @@ async function performMint(
   telegramId: bigint,
   address: string
 ): Promise<void> {
-  const gasCheck = await checkGasSafety(telegramId);
+  const chain = await resolveUserChain(telegramId);
+  const gasCheck = await withChainContext(chain, () => checkGasSafety(telegramId));
   if (!gasCheck.safe) {
     await ctx.reply(
       `⚠️ **MINT ABORTED (HIGH GAS)**\n\n` +
@@ -1152,7 +1133,7 @@ async function performMint(
   const multiplier = getUserMintQuantity(telegramId);
 
   await ctx.reply(
-    `🚀 **Starting Mint**\n\n` +
+    `🚀 **Starting Mint** — ${networkBadge(chain)}\n\n` +
       `Contract: \`${shortenAddress(address)}\`\n` +
       `Active Wallets: ${activeCount} (x${multiplier} each)\n` +
       `Gas Price: \`${gasCheck.currentGwei.toFixed(4)} Gwei\` (Safe ✅)\n\n` +
@@ -1161,7 +1142,7 @@ async function performMint(
   );
 
   try {
-    const result = await batchMint(telegramId, address);
+    const result = await withChainContext(chain, () => batchMint(telegramId, address));
 
     if (result.results.length === 0) {
       await ctx.reply(
@@ -1190,7 +1171,7 @@ async function performMint(
     }
 
     await ctx.reply(
-      `📊 **Mint Summary**\n\nContract: \`${shortenAddress(address)}\`\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${result.totalFailed}\nTotal Attempts: ${result.results.length}`,
+      `📊 **Mint Summary** — ${networkBadge(chain)}\n\nContract: \`${shortenAddress(address)}\`\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${result.totalFailed}\nTotal Attempts: ${result.results.length}`,
       {
         reply_markup: backToMainKeyboard(),
         parse_mode: "Markdown",
