@@ -18,7 +18,6 @@ import { withChainContext } from "./core/chainContext.js";
 import { type ChainId, getChainConfig } from "./core/chains.js";
 import {
   getChainsForSelection,
-  getPrimaryChain,
   getUserChainSelection,
 } from "./core/userChain.js";
 
@@ -57,7 +56,9 @@ async function main() {
           try {
             const targetChatId =
               typeof cfg.userId === "bigint" ? Number(cfg.userId) : cfg.userId;
-            await bot.api.sendMessage(targetChatId, msg, { parse_mode: "Markdown" });
+            await bot.api.sendMessage(targetChatId, msg, {
+              parse_mode: "Markdown",
+            });
           } catch (e) {
             console.error("Failed to send copy-mint notification:", e);
           }
@@ -68,7 +69,7 @@ async function main() {
     }
   }, 12_000);
 
-  // Real-time free-mint sniffer → STRICT filter before alert (one pipeline per chain)
+  // Auto-discovery pipeline per chain)
   const handleDrop = (chain: ChainId) => async (drop: DropEvent) => {
     const { badge, name, explorerBaseUrl } = getChainConfig(chain);
     try {
@@ -134,34 +135,26 @@ async function main() {
             ? Number(user.telegramId)
             : user.telegramId;
 
-        // Mint button only when the drop chain is the user's primary chain
-        // (for "both" users a Robinhood drop must not mint on Base).
-        const canMintNow = getPrimaryChain(selection) === chain;
+        // Mint button carries the drop chain, so both-chain users mint on the right network.
         const alertMessage =
           `🚨 *NEW FREE MINT DETECTED!* — ${badge} ${name}\n\n` +
           `📦 *Contract:* \`${scan.contractAddress}\`\n` +
           `⚙️ *Function:* \`${fn.name}(${fn.args.join(",")})\`\n` +
           `🔍 *Verified:* ${scan.isVerified ? "✅ Yes" : "⚠️ Bytecode"}\n` +
           `🧪 *Live sim:* ✅ passes\n\n` +
-          (canMintNow
-            ? `_Tap below to mint with your active wallets:_`
-            : `_Set your chain to ${name} (${badge}) with /chain, then use /mint ${scan.contractAddress}._`);
+          `_Tap below to mint with your active wallets:_`;
 
         await bot.api
           .sendMessage(targetChatId, alertMessage, {
             parse_mode: "Markdown",
             reply_markup: {
               inline_keyboard: [
-                ...(canMintNow
-                  ? [
-                      [
-                        {
-                          text: "🚀 Batch Mint Now",
-                          callback_data: `mint_${scan.contractAddress}`,
-                        },
-                      ],
-                    ]
-                  : []),
+                [
+                  {
+                    text: "🚀 Batch Mint Now",
+                    callback_data: `mint_${scan.contractAddress}_${chain}`,
+                  },
+                ],
                 [
                   {
                     text: chain === "base" ? "🔗 View on BaseScan" : "🔗 View on Blockscout",
