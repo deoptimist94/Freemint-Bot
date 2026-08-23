@@ -7,35 +7,45 @@ import {
   type Chain,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { base } from "viem/chains";
+import {
+  baseViemChain,
+  robinhoodViemChain,
+  getChainConfig,
+  getDefaultChainId,
+  resolveBaseRpcUrl,
+  resolveRobinhoodRpcUrl,
+  type ChainId,
+  type ChainSelection,
+} from "./chains.js";
 
 export type { Hex, Address };
+export type { ChainId, ChainSelection };
+export { getDefaultChainId, resolveBaseRpcUrl, resolveRobinhoodRpcUrl };
 
 export const BASE_CHAIN_ID = 8453;
 
-// Prefer explicit BASE_RPC_URL, then Alchemy (same key as NFT API), then public Base.
-// Public mainnet.base.org rate-limits eth_call hard — that was the "RPC Request failed".
-export function getBaseRpcUrl(): string {
-  const explicit = (process.env.BASE_RPC_URL || "").trim();
-  if (explicit) return explicit;
-  const alchemy = (process.env.ALCHEMY_API_KEY || "").trim();
-  if (alchemy) return `https://base-mainnet.g.alchemy.com/v2/${alchemy}`;
-  return "https://mainnet.base.org";
+// Backward-compatible aliases: existing Base-only callers keep working
+// unchanged. The viem Chain objects live in chains.ts (single source of truth).
+export const baseChain: Chain = baseViemChain;
+export const robinhoodChain: Chain = robinhoodViemChain;
+
+// Per-chain RPC with a clear error when a chain has no RPC configured
+// (Robinhood requires ROBINHOOD_RPC_URL or an Alchemy key with Robinhood
+// enabled — it has no public free RPC).
+export function getRpcUrl(chain: ChainId = "base"): string {
+  return getChainConfig(chain).resolveRpcUrl();
 }
 
-export const baseChain: Chain = {
-  ...base,
-  rpcUrls: {
-    default: {
-      http: [getBaseRpcUrl()],
-    },
-  },
-};
+// Kept as an alias for existing callers; use getRpcUrl("robinhood") for RH.
+export function getBaseRpcUrl(): string {
+  return resolveBaseRpcUrl();
+}
 
-export function getPublicClient() {
+export function getPublicClient(chain?: ChainId) {
+  const target = chain ?? getDefaultChainId();
   return createPublicClient({
-    chain: baseChain,
-    transport: http(getBaseRpcUrl(), {
+    chain: getChainConfig(target).viemChain,
+    transport: http(getRpcUrl(target), {
       timeout: 20_000,
       retryCount: 2,
       retryDelay: 400,
@@ -43,12 +53,13 @@ export function getPublicClient() {
   });
 }
 
-export function getWalletClient(privateKey: Hex) {
+export function getWalletClient(privateKey: Hex, chain?: ChainId) {
+  const target = chain ?? getDefaultChainId();
   const account = privateKeyToAccount(privateKey);
   return createWalletClient({
     account,
-    chain: baseChain,
-    transport: http(getBaseRpcUrl(), {
+    chain: getChainConfig(target).viemChain,
+    transport: http(getRpcUrl(target), {
       timeout: 20_000,
       retryCount: 2,
       retryDelay: 400,
