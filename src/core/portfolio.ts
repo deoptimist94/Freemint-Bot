@@ -245,7 +245,7 @@ export async function executeSell(
   privateKey: string,
   contractAddress: string,
   tokenId: string,
-  chain: ChainId = "base"
+  chain: ChainId = getDefaultChainId()
 ): Promise<SellResult> {
   // Reservoir does not support Robinhood Chain yet — no best-bid execution.
   if (chain !== "base") {
