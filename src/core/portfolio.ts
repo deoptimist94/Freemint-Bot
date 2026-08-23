@@ -34,12 +34,10 @@ interface OwnedNft {
 
 const ALCHEMY_NFT_V3 = "https://base-mainnet.g.alchemy.com/nft/v3";
 const REQUEST_TIMEOUT_MS = 12_000;
-// One Alchemy page (pageSize 100) is plenty for a bot portfolio view.
 const MAX_NFTS_PER_WALLET = 100;
-// Floor lookups run concurrently with a hard time budget so a slow/rate-limited
-// Alchemy response can never stall the whole portfolio for minutes.
-const FLOOR_CONCURRENCY = 5;
-const FLOOR_TIME_BUDGET_MS = 20_000;
+// Floors are fetched once per unique contract (not once per token).
+const FLOOR_CONCURRENCY = 6;
+const FLOOR_TIME_BUDGET_MS = 25_000;
 
 function normalizeTokenId(raw: unknown): string {
   const s = String(raw ?? "0");
@@ -75,7 +73,9 @@ async function fetchJson(url: string): Promise<any | null> {
   }
 }
 
-async function fetchNftsAlchemy(walletAddress: string): Promise<{ nfts: OwnedNft[]; error?: string }> {
+async function fetchNftsAlchemy(
+  walletAddress: string
+): Promise<{ nfts: OwnedNft[]; error?: string }> {
   const key = (process.env.ALCHEMY_API_KEY || "").trim();
   if (!key) return { nfts: [], error: "missing_key" };
 
@@ -96,7 +96,9 @@ async function fetchNftsAlchemy(walletAddress: string): Promise<{ nfts: OwnedNft
         `${ALCHEMY_NFT_V3}/${key}/getNFTsForOwner?${params.toString()}`
       );
       if (!data) {
-        error = error || "Alchemy request failed (check ALCHEMY_API_KEY / rate limit)";
+        error =
+          error ||
+          "Alchemy request failed (check ALCHEMY_API_KEY / rate limit)";
         break;
       }
 
@@ -108,8 +110,13 @@ async function fetchNftsAlchemy(walletAddress: string): Promise<{ nfts: OwnedNft
         nfts.push({
           contractAddress: contract,
           tokenId: tid,
-          name: n.name || n.metadata?.name || n.contractMetadata?.name || `Token #${tid}`,
-          collectionName: n.contractMetadata?.name || n.collection?.name || "",
+          name:
+            n.name ||
+            n.metadata?.name ||
+            n.contractMetadata?.name ||
+            `Token #${tid}`,
+          collectionName:
+            n.contractMetadata?.name || n.collection?.name || "",
         });
       }
 
@@ -123,7 +130,9 @@ async function fetchNftsAlchemy(walletAddress: string): Promise<{ nfts: OwnedNft
   return { nfts, error };
 }
 
-export async function fetchWalletPortfolio(walletAddress: string): Promise<WalletPortfolio> {
+export async function fetchWalletPortfolio(
+  walletAddress: string
+): Promise<WalletPortfolio> {
   const { nfts, error } = await fetchNftsAlchemy(walletAddress);
 
   if (nfts.length === 0) {
@@ -140,8 +149,6 @@ export async function fetchWalletPortfolio(walletAddress: string): Promise<Walle
     return { items: [], totalFloorValueEth: 0 };
   }
 
-  // Pre-seed every item so even if floor lookups time out, each token still
-  // appears in the portfolio (floor 0 = no market data yet).
   const items: PortfolioItem[] = nfts.map((n) => ({
     contractAddress: n.contractAddress,
     tokenId: n.tokenId,
@@ -152,29 +159,51 @@ export async function fetchWalletPortfolio(walletAddress: string): Promise<Walle
     openseaUrl: `https://opensea.io/assets/base/${n.contractAddress}/${n.tokenId}`,
   }));
 
-  // Worker pool: at most FLOOR_CONCURRENCY parallel floor requests, and the
-  // whole wallet gives up after FLOOR_TIME_BUDGET_MS so a stuck API can never
-  // hang the portfolio view for minutes.
+  // ONE floor lookup per unique contract — Onchain Blocks (50 tokens) = 1 call.
+  const uniqueContracts = [...new Set(nfts.map((n) => n.contractAddress))];
+  const floorByContract = new Map<
+    string,
+    { floorPriceEth: number; topBidEth: number; collectionName: string }
+  >();
+
   const deadline = Date.now() + FLOOR_TIME_BUDGET_MS;
   let next = 0;
   const worker = async (): Promise<void> => {
-    while (next < nfts.length) {
+    while (next < uniqueContracts.length) {
       if (Date.now() > deadline) return;
       const idx = next++;
+      const contract = uniqueContracts[idx];
       try {
-        const floor = await fetchCollectionFloor(nfts[idx].contractAddress);
-        items[idx].name = floor.collectionName || items[idx].name;
-        items[idx].collectionName = floor.collectionName || items[idx].collectionName;
-        items[idx].floorPriceEth = floor.floorPriceEth;
-        items[idx].topBidEth = floor.topBidEth;
+        const floor = await fetchCollectionFloor(contract);
+        floorByContract.set(contract, {
+          floorPriceEth: floor.floorPriceEth,
+          topBidEth: floor.topBidEth,
+          collectionName: floor.collectionName,
+        });
       } catch {
-        // keep the zeroed seed item
+        // leave zeroed
       }
     }
   };
   await Promise.all(
-    Array.from({ length: Math.min(FLOOR_CONCURRENCY, nfts.length) }, () => worker())
+    Array.from(
+      { length: Math.min(FLOOR_CONCURRENCY, uniqueContracts.length) },
+      () => worker()
+    )
   );
+
+  for (const item of items) {
+    const floor = floorByContract.get(item.contractAddress);
+    if (!floor) continue;
+    item.floorPriceEth = floor.floorPriceEth;
+    item.topBidEth = floor.topBidEth;
+    if (floor.collectionName) {
+      item.collectionName = floor.collectionName;
+      if (!item.name || item.name.startsWith("Token #")) {
+        item.name = floor.collectionName;
+      }
+    }
+  }
 
   const totalFloorValueEth = items.reduce((sum, i) => sum + i.floorPriceEth, 0);
   return { items, totalFloorValueEth };
@@ -190,17 +219,20 @@ export async function executeSell(
 
   let res: Response;
   try {
-    res = await fetch("https://api.reservoir.tools/execute/sell/v6?chainId=8453", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-api-key": process.env.RESERVOIR_API_KEY || "demo-api-key",
-      },
-      body: JSON.stringify({
-        orders: [{ token: `${contractAddress}:${tokenId}`, weiPrice: "0" }],
-      }),
-      signal: controller.signal,
-    });
+    res = await fetch(
+      "https://api.reservoir.tools/execute/sell/v6?chainId=8453",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": process.env.RESERVOIR_API_KEY || "demo-api-key",
+        },
+        body: JSON.stringify({
+          orders: [{ token: `${contractAddress}:${tokenId}`, weiPrice: "0" }],
+        }),
+        signal: controller.signal,
+      }
+    );
   } catch (err) {
     return {
       success: false,
@@ -225,11 +257,16 @@ export async function executeSell(
   const txData = step?.items?.[0]?.data;
 
   if (!txData || !txData.to) {
-    return { success: false, error: "No active bids found on secondary markets" };
+    return {
+      success: false,
+      error: "No active bids found on secondary markets",
+    };
   }
 
   try {
-    const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
+    const hexKey = (
+      privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
+    ) as Hex;
     const walletClient = getWalletClient(hexKey);
     const txHash = await walletClient.sendTransaction({
       to: txData.to as Address,
@@ -240,6 +277,9 @@ export async function executeSell(
     const payoutEth = Number(BigInt(txData.value ?? "0")) / 1e18;
     return { success: true, txHash, payoutEth };
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : String(err) };
+    return {
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
