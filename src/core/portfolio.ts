@@ -34,7 +34,12 @@ interface OwnedNft {
 
 const ALCHEMY_NFT_V3 = "https://base-mainnet.g.alchemy.com/nft/v3";
 const REQUEST_TIMEOUT_MS = 12_000;
-const MAX_NFTS_PER_WALLET = 300;
+// One Alchemy page (pageSize 100) is plenty for a bot portfolio view.
+const MAX_NFTS_PER_WALLET = 100;
+// Floor lookups run concurrently with a hard time budget so a slow/rate-limited
+// Alchemy response can never stall the whole portfolio for minutes.
+const FLOOR_CONCURRENCY = 5;
+const FLOOR_TIME_BUDGET_MS = 20_000;
 
 function normalizeTokenId(raw: unknown): string {
   const s = String(raw ?? "0");
@@ -135,19 +140,41 @@ export async function fetchWalletPortfolio(walletAddress: string): Promise<Walle
     return { items: [], totalFloorValueEth: 0 };
   }
 
-  const items: PortfolioItem[] = [];
-  for (const n of nfts) {
-    const floor = await fetchCollectionFloor(n.contractAddress);
-    items.push({
-      contractAddress: n.contractAddress,
-      tokenId: n.tokenId,
-      name: floor.collectionName || n.name,
-      collectionName: floor.collectionName || n.collectionName || "",
-      floorPriceEth: floor.floorPriceEth,
-      topBidEth: floor.topBidEth,
-      openseaUrl: `https://opensea.io/assets/base/${n.contractAddress}/${n.tokenId}`,
-    });
-  }
+  // Pre-seed every item so even if floor lookups time out, each token still
+  // appears in the portfolio (floor 0 = no market data yet).
+  const items: PortfolioItem[] = nfts.map((n) => ({
+    contractAddress: n.contractAddress,
+    tokenId: n.tokenId,
+    name: n.name,
+    collectionName: n.collectionName || "",
+    floorPriceEth: 0,
+    topBidEth: 0,
+    openseaUrl: `https://opensea.io/assets/base/${n.contractAddress}/${n.tokenId}`,
+  }));
+
+  // Worker pool: at most FLOOR_CONCURRENCY parallel floor requests, and the
+  // whole wallet gives up after FLOOR_TIME_BUDGET_MS so a stuck API can never
+  // hang the portfolio view for minutes.
+  const deadline = Date.now() + FLOOR_TIME_BUDGET_MS;
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < nfts.length) {
+      if (Date.now() > deadline) return;
+      const idx = next++;
+      try {
+        const floor = await fetchCollectionFloor(nfts[idx].contractAddress);
+        items[idx].name = floor.collectionName || items[idx].name;
+        items[idx].collectionName = floor.collectionName || items[idx].collectionName;
+        items[idx].floorPriceEth = floor.floorPriceEth;
+        items[idx].topBidEth = floor.topBidEth;
+      } catch {
+        // keep the zeroed seed item
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(FLOOR_CONCURRENCY, nfts.length) }, () => worker())
+  );
 
   const totalFloorValueEth = items.reduce((sum, i) => sum + i.floorPriceEth, 0);
   return { items, totalFloorValueEth };
