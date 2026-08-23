@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import { shortenAddress } from "../core/chain.js";
+import { shortenAddress, type ChainId } from "../core/chain.js";
 import type { WalletInfo } from "../core/wallet.js";
 
 export function mainMenuKeyboard(autoMintEnabled: boolean): InlineKeyboard {
@@ -161,17 +161,18 @@ export function exportWalletsKeyboard(wallets: WalletInfo[]): InlineKeyboard {
   return kb;
 }
 
-export function watchlistKeyboard(contracts: string[]): InlineKeyboard {
+export function watchlistKeyboard(contracts: string[], chain?: ChainId): InlineKeyboard {
   const kb = new InlineKeyboard();
+  const suffix = chain ? `_${chain}` : "";
 
   for (let i = 0; i < contracts.length; i += 2) {
     const c1 = contracts[i];
     const c2 = contracts[i + 1];
 
-    kb.text(`🔍 ${shortenAddress(c1, 4, 4)}`, `scan_${c1}`);
+    kb.text(`🔍 ${shortenAddress(c1, 4, 4)}`, `scan_${c1}${suffix}`);
 
     if (c2) {
-      kb.text(`🔍 ${shortenAddress(c2, 4, 4)}`, `scan_${c2}`);
+      kb.text(`🔍 ${shortenAddress(c2, 4, 4)}`, `scan_${c2}${suffix}`);
     }
     kb.row();
   }
@@ -180,10 +181,10 @@ export function watchlistKeyboard(contracts: string[]): InlineKeyboard {
     const c1 = contracts[i];
     const c2 = contracts[i + 1];
 
-    kb.text(`🚀 Mint ${shortenAddress(c1, 4, 4)}`, `mint_${c1}`);
+    kb.text(`🚀 Mint ${shortenAddress(c1, 4, 4)}`, `mint_${c1}${suffix}`);
 
     if (c2) {
-      kb.text(`🚀 Mint ${shortenAddress(c2, 4, 4)}`, `mint_${c2}`);
+      kb.text(`🚀 Mint ${shortenAddress(c2, 4, 4)}`, `mint_${c2}${suffix}`);
     }
     kb.row();
   }
@@ -205,9 +206,11 @@ export function watchlistKeyboard(contracts: string[]): InlineKeyboard {
   return kb;
 }
 
-export function confirmMintKeyboard(contractAddress: string): InlineKeyboard {
+export function confirmMintKeyboard(contractAddress: string, chain?: ChainId): InlineKeyboard {
+  const clean = contractAddress.replace(/^0x/, "");
+  const cb = `confirm_mint_${clean}${chain ? `_${chain}` : ""}`;
   return new InlineKeyboard()
-    .text("✅ Confirm Mint", `confirm_mint_${contractAddress}`).row()
+    .text("✅ Confirm Mint", cb).row()
     .text("❌ Cancel", "main_menu");
 }
 
