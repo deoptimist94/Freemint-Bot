@@ -4,6 +4,8 @@ import { getPublicClient, getWalletClient } from "./chain.js";
 import { assertGasSafe } from "./gasGuard.js";
 import { getActiveWallets, getWalletPrivateKey } from "./wallet.js";
 import { scanContract, getBestMintFunction, type MintFunctionInfo } from "./scanner.js";
+import { getContextChain } from "./chainContext.js";
+import { getChainConfig, getDefaultChainId, type ChainId } from "./chains.js";
 
 export interface MintResult {
   walletId: string;
@@ -103,13 +105,17 @@ export async function executeMintForWallet(
   const publicClient = getPublicClient();
   const iterLabel = iteration > 1 ? `${label} (Mint #${iteration})` : label;
 
+  // Resolve the active chain from context (set by withChainContext in handlers/
+  // main/sniper) so history rows and explorer links point at the right network.
+  const chain: ChainId = getContextChain() ?? getDefaultChainId();
+
   try {
     const args = buildMintArgs(mintFunction, walletAddress, iteration);
 
     // 1. Simulate with the REAL args (not a hardcoded 1n).
     const simResult = await simulateMintWithArgs(contractAddress, walletAddress, mintFunction, args);
     if (!simResult.success) {
-      await recordMintHistory(userId, contractAddress, null, "SIMULATION_FAILED");
+      await recordMintHistory(userId, contractAddress, null, "SIMULATION_FAILED", chain);
       return {
         walletId,
         walletAddress,
@@ -138,7 +144,7 @@ export async function executeMintForWallet(
         blockTag: "pending",
       }));
 
-    // 3. Send with the env-aware wallet client (honors BASE_RPC_URL).
+    // 3. Send with the chain-aware wallet client (resolves via context).
     const txHash = await walletClient.sendTransaction({
       to: contractAddress as Address,
       data,
@@ -149,7 +155,7 @@ export async function executeMintForWallet(
     const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
 
     const status = receipt.status === "success" ? "SUCCESS" : "FAILED";
-    await recordMintHistory(userId, contractAddress, txHash, status);
+    await recordMintHistory(userId, contractAddress, txHash, status, chain);
 
     return {
       walletId,
@@ -157,13 +163,13 @@ export async function executeMintForWallet(
       label: iterLabel,
       success: receipt.status === "success",
       txHash,
-      basescanUrl: `https://basescan.org/tx/${txHash}`,
+      basescanUrl: `${getChainConfig(chain).explorerBaseUrl}/tx/${txHash}`,
       error: receipt.status !== "success" ? "Transaction reverted on-chain" : undefined,
       iteration,
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await recordMintHistory(userId, contractAddress, null, "ERROR");
+    await recordMintHistory(userId, contractAddress, null, "ERROR", chain);
     return {
       walletId,
       walletAddress,
@@ -252,11 +258,12 @@ async function recordMintHistory(
   userId: bigint,
   contractAddress: string,
   txHash: string | null,
-  status: string
+  status: string,
+  chain: ChainId
 ): Promise<void> {
   try {
     await prisma.mintHistory.create({
-      data: { userId, contractAddress, txHash, status },
+      data: { userId, contractAddress, txHash, status, chain },
     });
   } catch (err) {
     console.error("Failed to record mint history:", err);
