@@ -68,99 +68,46 @@ const MAX_CONCURRENT_PER_CONTRACT = 3;
 const MAX_CONCURRENT_PER_USER = 5;
 const REASON_CHANGE_MIN_INTERVAL_MS = 30_000;
 
-// Revert reasons that will never clear on their own — no point polling through
-// them, so the watcher stops immediately and reports the gate.
 const PERMANENT_REASONS =
   /whitelist|allowlist|not\s+(on|in)\s+(the\s+)?(list|whitelist)|signature|invalid\s+signature|insufficient|sold\s*out|max\s*(mint|supply)|already\s+minted|mint\s*(ended|closed)|forbidden|unauthorized/i;
 
 const activeWatches = new Map<string, WatchHandle[]>();
 
-// Chain-prefixed so a Base watch and a Robinhood watch on the same contract
-// are tracked independently.
-function watchKey(
-  userId: bigint,
-  address: string,
-  chain: ChainId = "base"
-): string {
-  return `${chain}:${userId.toString()}:${address.toLowerCase()}`;
+function watchKey(userId: bigint, address: string, chain: ChainId): string {
+  return `${userId.toString()}:${chain}:${address.toLowerCase()}`;
 }
 
-export function isWatchActive(
-  userId: bigint,
-  address: string,
-  chain: ChainId = "base"
-): boolean {
-  const key = watchKey(userId, address, chain);
-  return (activeWatches.get(key) ?? []).some((h) => !h.stopped);
-}
-
-export function activeWatchCount(userId: bigint): number {
-  let count = 0;
+function activeWatchCount(userId: bigint): number {
+  let n = 0;
   for (const [key, handles] of activeWatches) {
-    if (key.includes(`:${userId.toString()}:`)) {
-      count += handles.filter((h) => !h.stopped).length;
-    }
+    if (key.startsWith(`${userId.toString()}:`)) n += handles.length;
   }
-  return count;
-}
-
-// Stops watchers for (userId, address). With a chain given, only that chain's
-// watchers stop; without one, all chains are stopped. Returns how many were
-// actually stopped.
-export function stopWatch(
-  userId: bigint,
-  address: string,
-  chain?: ChainId
-): number {
-  const addr = address.toLowerCase();
-  let stopped = 0;
-  for (const [key, handles] of activeWatches) {
-    const matches = chain
-      ? key === watchKey(userId, address, chain)
-      : key.endsWith(`:${userId.toString()}:${addr}`);
-    if (!matches) continue;
-    for (const handle of handles) {
-      if (!handle.stopped) {
-        handle.stop();
-        stopped += 1;
-      }
-    }
-  }
-  return stopped;
+  return n;
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function shortReason(message: string): string {
-  let reason = message
-    .replace(/execution reverted:/g, "")
-    .replace(/Error:/g, "")
-    .replace(/VM Exception while processing transaction:/g, "")
-    .replace(/revert$/i, "")
-    .trim()
-    .split("\n")[0]
-    .trim();
-  if (reason.length > 220) reason = `${reason.slice(0, 220)}...`;
-  return reason || "unknown error";
+function shortReason(reason: string): string {
+  const cleaned = reason.replace(/\s+/g, " ").trim();
+  return cleaned.length > 180 ? `${cleaned.slice(0, 177)}...` : cleaned;
 }
 
 function classifyGate(reason: string): string | undefined {
   const r = reason.toLowerCase();
-  if (/whitelist|allowlist/.test(r)) return "whitelist";
-  if (/signature/.test(r)) return "signature";
-  if (/insufficient|payment|funds|balance|price/.test(r)) return "payment";
-  if (/sold\s*out|max\s*(mint|supply)/.test(r)) return "soldout";
+  if (/whitelist|allowlist|not\s+(on|in)\s+(the\s+)?(list|whitelist)/.test(r))
+    return "whitelist";
+  if (/signature|invalid\s+signature/.test(r)) return "signature";
+  if (/sold\s*out|max\s*(mint|supply)|already\s+minted/.test(r))
+    return "soldout";
   if (/paused/.test(r)) return "paused";
   if (/not\s+started|too\s+early/.test(r)) return "not_started";
+  if (/insufficient/.test(r)) return "insufficient";
+  if (/mint\s*(ended|closed)|forbidden|unauthorized/.test(r)) return "closed";
   return undefined;
 }
 
-// Encodes free-mint calldata for the detected function. Nonce-ish args (uint)
-// get 1, address args get the wallet, bytes32[] gets [], everything else gets
-// a zero default — good enough to make the simulate call answer "will this
-// mint now?".
 function buildMintCalldata(
   fn: MintFunctionInfo,
   fromAddress: Address
@@ -173,9 +120,15 @@ function buildMintCalldata(
       if (/^bytes(\d+)?(\[\])?$/.test(arg)) {
         return arg.endsWith("[]") ? [] : "0x";
       }
+      if (arg.endsWith("[]")) return [];
+      if (arg === "bool") return true;
       return "0x";
     });
-    return encodeFunctionData({ abi, functionName: fn.name, args });
+    return encodeFunctionData({
+      abi,
+      functionName: fn.name,
+      args: args as any,
+    });
   } catch {
     return undefined;
   }
@@ -308,6 +261,27 @@ async function fireMint(
   }
 }
 
+export function stopWatchMint(
+  userId: bigint,
+  address: string,
+  chain?: ChainId
+): number {
+  const addr = address.toLowerCase();
+  let stopped = 0;
+  for (const [key, handles] of [...activeWatches.entries()]) {
+    const matchChain = chain
+      ? key === watchKey(userId, addr, chain)
+      : key.startsWith(`${userId.toString()}:`) && key.endsWith(`:${addr}`);
+    if (!matchChain) continue;
+    for (const h of handles) {
+      h.stop();
+      stopped += 1;
+    }
+    activeWatches.delete(key);
+  }
+  return stopped;
+}
+
 export async function startWatchMint(
   options: WatchOptions
 ): Promise<WatchResult> {
@@ -381,9 +355,6 @@ export async function startWatchMint(
   let lastGateNotifyAt = 0;
 
   try {
-    // Scan on the SAME chain the watcher will fire on — the scanner's
-    // explorer/ABI switch (Etherscan V2 for Base, Blockscout for Robinhood)
-    // lives in scanner.ts.
     const result = await scanContract(address, chain);
     const fn = getBestMintFunction(result.mintFunctions);
     if (!fn) {
@@ -399,7 +370,8 @@ export async function startWatchMint(
       };
     }
 
-    const wallet = getWallets(options.userId).find((w) => w.isActive);
+    const wallets = await getWallets(options.userId);
+    const wallet = wallets.find((w) => w.isActive) ?? wallets[0];
     if (!wallet) {
       const reason = "No active wallet found.";
       safeNotify(`⛔ ${badge} ${reason}`);
@@ -412,7 +384,10 @@ export async function startWatchMint(
       };
     }
 
-    const hexKey = getWalletPrivateKey(wallet.id);
+    const privateKey = await getWalletPrivateKey(wallet.id);
+    const hexKey = (
+      privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
+    ) as Hex;
     const fromAddress = getAddressFromPrivateKey(hexKey);
     const data = buildMintCalldata(fn, fromAddress);
     if (!data) {
