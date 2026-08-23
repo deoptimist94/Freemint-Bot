@@ -350,3 +350,118 @@ function formatBypassResult(result: BypassResult): string {
   );
   return lines.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// /guide — public user guide (HTML, split into 3 messages, <4096 chars each)
+// ---------------------------------------------------------------------------
+
+const GUIDE_PARTS: readonly string[] = [
+  `<b>🐝 Freemint-Bot — User Guide (1/3)</b>
+
+<b>⚡ Quick Start — 60 seconds</b>
+1. Press Start.
+2. Tap ➕ New Wallet — the bot creates a Base wallet instantly (or 📥 Import Key to add your own).
+3. Send a little ETH for gas (~0.0005 ETH is plenty; each tx costs about $0.001).
+4. Tap 🖼 My Portfolio to see your NFTs.
+5. You're ready to hunt free mints.
+
+<b>🧭 Main Menu Map</b>
+💼 My Wallets — manage wallets: toggle active, copy address, refuel, sweep, export, delete
+➕ New Wallet — generate a fresh Base wallet
+🎯 Tracking — watch other wallets and auto-copy their mints
+🖼 My Portfolio — all NFTs across your wallets, floors, Sell buttons
+🔍 Scan Contract — analyze any contract address
+🚀 Manual Mint — mint a contract you already scanned
+👁 Watchlist — your saved contracts for quick access
+🛡 Settings / Gas — max gas price the bot may pay
+⚡ Auto-Mint — master switch for automatic minting`,
+  `<b>🐝 Freemint-Bot — User Guide (2/3)</b>
+
+<b>🔍 Scanning and WHOIS</b>
+Use the Scan button or /whois followed by a contract address.
+You get:
+✅ Verified — source verified on the explorer, or ⚠️ bytecode only
+🛡 Security status — SAFE/CLEAN or 🚨 HIGH RISK / HONEYPOT, score /100
+⛏ Free mint functions found
+🚀 Attempt Bypass button — jumps straight into the bypass engine
+
+⚠️ Never mint a contract the scanner marks UNSAFE.
+
+<b>🧪 Bypass Engine — the minting power tool</b>
+It simulates the mint BEFORE sending any transaction, so it tells you the gate type for free, zero gas.
+
+Commands:
+/bypass ADDRESS — full run: analyze gate, mint if open
+/bypass ADDRESS --dry — simulate only, no transaction
+/bypass ADDRESS --probe — map contract state (phase, price, supply)
+/bypass ADDRESS --probe --schedule — auto-mint at the public window
+/bypass ADDRESS --watch — poll-and-fire: mint the instant the gate opens
+/bypass ADDRESS --stop — stop an active watcher
+
+Gate types:
+mint_open — live and free: the engine mints immediately
+timed — opens at a set time (FCFS): use --watch or --schedule
+paused — owner paused it; nothing works until unpaused
+whitelist / allowlist — only listed wallets; cannot be forged on-chain
+signature — needs a signed voucher; only the project can sign
+payment — costs money; engine only does value-0 free mints
+soldout / ended — max supply reached; it's over
+
+<b>👀 Watch mode — for FCFS timed mints</b>
+1. Run /bypass ADDRESS --watch before the mint opens.
+2. The bot polls every 2.5 seconds and reports gate changes.
+3. The moment the contract stops reverting, it sends the mint instantly and posts the TX link.
+4. Stop with the ⏹ button or /bypass ADDRESS --stop.
+Limits: 3 watchers per contract, 5 per user. Whitelist/signature/soldout gates auto-stop the watcher.`,
+  `<b>🐝 Freemint-Bot — User Guide (3/3)</b>
+
+<b>🖼 Portfolio</b>
+NFTs are grouped by collection. Each group shows floor price and top bid, with a Sell button per collection. Use 🔄 Refresh to re-fetch, or 📦 Sweep All NFTs to Wallet 1 to consolidate. Floor shows 0 ETH when there are no live listings or the source is temporarily down — it retries automatically.
+
+<b>💼 Wallets</b>
+Generate — free instant Base wallet.
+Import — paste a private key to manage an existing wallet.
+Toggle ✅/❌ — only active wallets mint.
+Refuel / Distribute Gas — top up wallets with preset or custom amounts.
+Sweep All ETH Dust — collect leftover gas to your main wallet.
+Export / Delete — backup keys or remove a wallet.
+Keys are encrypted at rest; they never appear on screen unless you tap Export.
+
+<b>🎯 Tracking and Sniper</b>
+Add Tracked Wallet — watch any public wallet.
+Auto-Copy — when a tracked wallet mints, the bot tries the same contract.
+Max Spend — 0 ETH means free mints only.
+
+<b>🛡 Settings / Gas</b>
+Gas guard stops expensive mints: 0.02 Ultra Cheap · 0.05 Recommended · 0.10 Fast · 0.25 Aggressive. If network gas is above your cap, the mint aborts and tells you.
+
+<b>❓ FAQ</b>
+Q: "No free mint functions detected" — why?
+A: The contract may require payment, be unverified, or not be an NFT. Don't mint it anyway.
+Q: Mint failed with "Not whitelisted"?
+A: The contract only allows listed wallets. No tool can forge that.
+Q: Gas "too high"?
+A: Network gas spiked above your cap. Raise it in Settings or wait.
+Q: Same wallet for everything?
+A: Yes, but per-wallet limits mean more wallets = more chances.
+Q: Is my key safe?
+A: Encrypted at rest. The bot only signs what you approve.
+
+<b>⚠️ Safety rules</b>
+1. Never share private keys or seed phrases — including with "support".
+2. Only mint contracts the scanner marks SAFE/CLEAN.
+3. Free mint ≠ safe mint. The audit is your friend.
+4. The bot can't guarantee 1-second sellouts — that's the reality of FCFS.
+
+Enjoy hunting free mints! 🐝`,
+];
+
+export async function guideCommand(ctx: Context): Promise<void> {
+  for (let i = 0; i < GUIDE_PARTS.length; i++) {
+    const isLast = i === GUIDE_PARTS.length - 1;
+    await ctx.reply(GUIDE_PARTS[i], {
+      parse_mode: "HTML",
+      ...(isLast ? { reply_markup: backToMainKeyboard() } : {}),
+    });
+  }
+}
