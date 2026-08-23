@@ -18,6 +18,14 @@ model User {
   trackedWallets TrackedWallet[]
   sniperConfig   SniperConfig?
   bypassLogs     BypassLog[]
+  preference     UserPreference?
+}
+
+model UserPreference {
+  userId BigInt  @id
+  chain  String  @default("base")
+
+  user User @relation(fields: [userId], references: [telegramId], onDelete: Cascade)
 }
 
 model Wallet {
@@ -38,6 +46,7 @@ model MintHistory {
   id              String   @id @default(cuid())
   userId          BigInt
   contractAddress String
+  chain           String   @default("base")
   txHash          String?
   status          String
   timestamp       DateTime @default(now())
@@ -51,11 +60,12 @@ model Watchlist {
   id              String   @id @default(cuid())
   userId          BigInt
   contractAddress String
+  chain           String   @default("base")
   addedAt         DateTime @default(now())
 
   user User @relation(fields: [userId], references: [telegramId], onDelete: Cascade)
 
-  @@unique([userId, contractAddress])
+  @@unique([userId, contractAddress, chain])
   @@index([userId])
 }
 
@@ -86,6 +96,7 @@ model BypassLog {
   id              String   @id @default(cuid())
   userId          BigInt
   contractAddress String
+  chain           String   @default("base")
   strategyId      String
   walletAddress   String
   success         Boolean
