@@ -51,7 +51,7 @@ export async function bypassCommand(ctx: Context): Promise<void> {
 
   if (!raw) {
     await ctx.reply(
-      "❌ Usage: /bypass <contract address>\n\nExample:\n/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E",
+      "❌ Usage: /bypass <contract address> [--dry]\n\n--dry: simulate only, no transaction is sent.\n\nExample:\n/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E\n/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --dry",
       { reply_markup: backToMainKeyboard() }
     );
     return;
@@ -65,11 +65,18 @@ export async function bypassCommand(ctx: Context): Promise<void> {
     return;
   }
 
+  // Optional safety flag: /bypass <addr> --dry (or --simulate) never sends a tx.
+  const dryRun = parts[2] === "--dry" || parts[2] === "--simulate";
+
   const userId = BigInt(ctx.from?.id ?? 0);
-  await ctx.reply("⏳ Running bypass engine... This can take up to a minute.");
+  await ctx.reply(
+    dryRun
+      ? "🧪 DRY RUN — simulating only, no transaction will be sent..."
+      : "⏳ Running bypass engine... This can take up to a minute."
+  );
 
   try {
-    const result = await executeBypass(userId, address);
+    const result = await executeBypass(userId, address, { dryRun });
     await ctx.reply(formatBypassResult(result), {
       reply_markup: backToMainKeyboard(),
     });
@@ -140,6 +147,10 @@ function formatBypassResult(result: BypassResult): string {
   if (result.walletAddress) lines.push(`👛 Wallet: ${shortenAddress(result.walletAddress)}`);
   if (result.txHash) lines.push(`✅ Tx: ${shortenAddress(result.txHash)}`);
   if (result.error) lines.push(`❌ ${result.error}`);
+  if (result.dryRun) {
+    lines.push("\n🧪 DRY RUN — simulation only. No transaction was sent.");
+    lines.push("Run without --dry to actually mint.");
+  }
   lines.push(result.success ? "\n✅ Bypass executed successfully!" : "\n⚠️ Bypass could not be executed.");
   return lines.join("\n");
 }
