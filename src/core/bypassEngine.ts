@@ -1,4 +1,4 @@
-import { Hex, Address, encodeFunctionData, parseAbi } from "viem";
+import { Hex, Address, encodeFunctionData, parseAbi, decodeErrorResult } from "viem";
 import {
   getPublicClient,
   getAddressFromPrivateKey,
@@ -30,6 +30,7 @@ export interface BypassResult {
   strategyId: string;
   walletAddress?: string;
   txHash?: string;
+  dryRun?: boolean;
   error?: string;
 }
 
@@ -39,6 +40,21 @@ export interface BypassPlan {
   targetFn: MintFunctionInfo | null;
   reason?: string;
 }
+
+export interface BypassOptions {
+  // Simulate only — never send a real transaction.
+  dryRun?: boolean;
+}
+
+// Common reverts that carry human-readable data. Custom errors on the target
+// contract are decoded separately when its ABI is available.
+const REVERT_ABI = parseAbi([
+  "error Error(string)",
+  "error Panic(uint256)",
+] as const);
+
+const MAX_WALLET_ATTEMPTS = 5;
+const RECEIPT_TIMEOUT_MS = 60_000;
 
 export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
   if (!mintFunctions || mintFunctions.length === 0) return "none";
@@ -112,17 +128,64 @@ function buildArgs(fn: MintFunctionInfo, fromAddress: Address): unknown[] {
   });
 }
 
+function extractRevertData(err: unknown): Hex | undefined {
+  const e = err as any;
+  const candidates = [
+    e?.data,
+    e?.cause?.data,
+    e?.details?.data,
+    e?.error?.data,
+    e?.rpcError?.data,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && /^0x[0-9a-fA-F]+$/.test(c) && c.length >= 10) {
+      return c as Hex;
+    }
+  }
+  // viem sometimes embeds the revert bytes in the message instead.
+  const msg = typeof e?.message === "string" ? e.message : String(err ?? "");
+  const match = msg.match(/0x[0-9a-fA-F]{8,}/);
+  if (match) return match[0] as Hex;
+  return undefined;
+}
+
+// Decode a revert into a human-readable reason: Error(string), Panic(uint256),
+// or the contract's own custom error selector (best-effort without the ABI).
+export function decodeRevertReason(err: unknown, contractAbi?: unknown): string {
+  const data = extractRevertData(err);
+  if (data) {
+    try {
+      const decoded = decodeErrorResult({ abi: REVERT_ABI, data });
+      if (decoded.errorName === "Error") return String(decoded.args?.[0] ?? "reverted");
+      if (decoded.errorName === "Panic") return `Panic(${String(decoded.args?.[0])})`;
+    } catch {
+      // not a standard revert — fall through to custom-error attempt
+    }
+    try {
+      if (contractAbi) {
+        const decoded = decodeErrorResult({ abi: contractAbi as any, data });
+        return `${decoded.errorName}(${(decoded.args ?? []).map(String).join(", ")})`;
+      }
+    } catch {
+      // unknown selector
+    }
+  }
+  const base = err instanceof Error ? err.message : String(err);
+  return base.length > 200 ? base.slice(0, 200) : base;
+}
+
 async function simulateCall(
   client: ReturnType<typeof getPublicClient>,
   to: Address,
   data: Hex,
-  from: Address
-): Promise<boolean> {
+  from: Address,
+  contractAbi?: unknown
+): Promise<{ ok: boolean; error?: string }> {
   try {
     await client.call({ to, data, account: from, value: 0n } as any);
-    return true;
-  } catch {
-    return false;
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: decodeRevertReason(err, contractAbi) };
   }
 }
 
@@ -152,7 +215,8 @@ async function logBypass(
 
 export async function executeBypass(
   userId: bigint,
-  rawAddress: string
+  rawAddress: string,
+  options: BypassOptions = {}
 ): Promise<BypassResult> {
   const address = normalizeAddressInput(rawAddress);
   if (!address) throw new Error("Invalid address");
@@ -188,12 +252,7 @@ export async function executeBypass(
   }
 
   const wallets = await getWallets(userId);
-  const wallet = (
-    wallets.find((w) => (w as { isActive?: boolean }).isActive) ??
-    wallets[0]
-  ) as { id: string } | undefined;
-
-  if (!wallet) {
+  if (wallets.length === 0) {
     const error = "No wallet found. Add a wallet in the Portfolio menu first.";
     await logBypass(userId, address, strategyId, "", false, undefined, error);
     return {
@@ -205,55 +264,91 @@ export async function executeBypass(
     };
   }
 
-  const privateKey = await getWalletPrivateKey(wallet.id);
-  if (!privateKey) {
-    const error = "Wallet private key unavailable";
-    await logBypass(userId, address, strategyId, "", false, undefined, error);
-    return {
-      success: false,
-      contractAddress: address,
-      gateType: plan.gateType,
-      strategyId,
-      error,
-    };
-  }
-
-  const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
-  const fromAddress = getAddressFromPrivateKey(hexKey);
-
-  const args = buildArgs(plan.targetFn, fromAddress);
-  const data = encodeCall(plan.targetFn, args);
+  // Active wallets first, then inactive; stop after a few attempts so a fully
+  // gated contract can't burn minutes on simulated calls.
+  const attempts = [
+    ...wallets.filter((w) => w.isActive),
+    ...wallets.filter((w) => !w.isActive),
+  ].slice(0, MAX_WALLET_ATTEMPTS);
 
   const client = getPublicClient();
-  const simOk = await simulateCall(client, address as Address, data, fromAddress);
-  if (!simOk) {
-    const error = `Simulation reverted for ${plan.targetFn.name}()`;
-    await logBypass(userId, address, strategyId, fromAddress, false, undefined, error);
-    return {
-      success: false,
-      contractAddress: address,
-      gateType: plan.gateType,
-      strategyId,
-      walletAddress: fromAddress,
-      error,
-    };
+
+  let lastSimError: string | undefined;
+  let lastSendError: string | undefined;
+
+  for (const wallet of attempts) {
+    const privateKey = await getWalletPrivateKey(wallet.id).catch(() => null);
+    if (!privateKey) continue;
+
+    const hexKey = (privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`) as Hex;
+    const fromAddress = getAddressFromPrivateKey(hexKey);
+
+    // Rebuild calldata per wallet so `address` args match the actual signer.
+    const args = buildArgs(plan.targetFn, fromAddress);
+    const data = encodeCall(plan.targetFn, args);
+
+    const sim = await simulateCall(
+      client,
+      address as Address,
+      data,
+      fromAddress,
+      result.abi ?? undefined
+    );
+    if (!sim.ok) {
+      lastSimError = sim.error;
+      continue;
+    }
+
+    if (options.dryRun) {
+      await logBypass(userId, address, strategyId, fromAddress, true, undefined, "dry-run (simulation only)");
+      return {
+        success: true,
+        contractAddress: address,
+        gateType: plan.gateType,
+        strategyId,
+        walletAddress: fromAddress,
+        dryRun: true,
+      };
+    }
+
+    try {
+      const walletClient = getWalletClient(hexKey);
+      const txHash = await walletClient.sendTransaction({
+        to: address as Address,
+        data,
+        value: 0n,
+      });
+      // Bound the receipt wait so a stalled node can't hang the command forever.
+      const receiptTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("Transaction receipt timeout")), RECEIPT_TIMEOUT_MS)
+      );
+      receiptTimeout.catch(() => undefined); // avoid unhandled rejection later
+      await Promise.race([client.waitForTransactionReceipt({ hash: txHash }), receiptTimeout]);
+
+      await logBypass(userId, address, strategyId, fromAddress, true, txHash);
+      return {
+        success: true,
+        contractAddress: address,
+        gateType: plan.gateType,
+        strategyId,
+        walletAddress: fromAddress,
+        txHash,
+      };
+    } catch (err) {
+      lastSendError = err instanceof Error ? err.message : String(err);
+      // try the next wallet
+    }
   }
 
-  const walletClient = getWalletClient(hexKey);
-  const txHash = await walletClient.sendTransaction({
-    to: address as Address,
-    data,
-    value: 0n,
-  });
-  await client.waitForTransactionReceipt({ hash: txHash });
-
-  await logBypass(userId, address, strategyId, fromAddress, true, txHash);
+  const error = lastSimError
+    ? `Simulation reverted for ${plan.targetFn.name}(): ${lastSimError}`
+    : lastSendError ?? "No usable wallet for bypass attempt";
+  await logBypass(userId, address, strategyId, "", false, undefined, error);
   return {
-    success: true,
+    success: false,
     contractAddress: address,
     gateType: plan.gateType,
     strategyId,
-    walletAddress: fromAddress,
-    txHash,
+    error,
   };
 }
