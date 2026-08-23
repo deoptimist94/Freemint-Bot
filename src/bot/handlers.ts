@@ -101,6 +101,30 @@ function networkBadge(chain: ChainId): string {
   return `${c.badge} ${c.name}`;
 }
 
+// ---------------------------------------------------------------------------
+// Batch 5: chain-suffixed callback parsing (scan_/mint_/confirm_mint_)
+// ---------------------------------------------------------------------------
+const CHAIN_CALLBACK_SUFFIXES = ["base", "robinhood"] as const;
+
+function parseChainCallback(
+  data: string,
+  prefix: string,
+  restore0x = false
+): { address: string; chain?: ChainId } {
+  const rest = data.startsWith(prefix) ? data.slice(prefix.length) : data;
+  let address = rest;
+  let chain: ChainId | undefined;
+  for (const suffix of CHAIN_CALLBACK_SUFFIXES) {
+    if (rest.endsWith(`_${suffix}`)) {
+      address = rest.slice(0, rest.length - suffix.length - 1);
+      chain = suffix as ChainId;
+      break;
+    }
+  }
+  if (restore0x && !address.startsWith("0x")) address = `0x${address}`;
+  return { address, chain };
+}
+
 type EditOptions = {
   parse_mode?: "Markdown" | "HTML";
   reply_markup?: unknown;
@@ -194,6 +218,15 @@ function mdEscape(text: string): string {
   return text
     .replace(/[\r\n]+/g, " ")
     .replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
+function htmlEscape(text: string): string {
+  return String(text)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 interface CollectionGroup {
@@ -476,7 +509,7 @@ async function showWatchlist(ctx: Context, telegramId: bigint): Promise<void> {
     text += `\nUse the buttons below to scan, mint, or remove contracts.`;
   }
   await editOrReply(ctx, text, {
-    reply_markup: watchlistKeyboard(contracts),
+    reply_markup: watchlistKeyboard(contracts, chain),
     parse_mode: "Markdown",
   });
 }
@@ -846,18 +879,18 @@ async function handleRemoveWatch(ctx: Context, telegramId: bigint, data: string)
 }
 
 async function handleScanAddress(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const address = normalizeAddressInput(data.replace(/^scan_/, ""));
-  await performScan(ctx, telegramId, address);
+  const { address, chain } = parseChainCallback(data, "scan_");
+  await performScan(ctx, telegramId, normalizeAddressInput(address), chain);
 }
 
 async function handleMintAddress(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const address = normalizeAddressInput(data.replace(/^mint_/, ""));
-  await performMint(ctx, telegramId, address);
+  const { address, chain } = parseChainCallback(data, "mint_");
+  await performMint(ctx, telegramId, normalizeAddressInput(address), chain);
 }
 
 async function handleConfirmMint(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const address = normalizeAddressInput(data.replace(/^confirm_mint_/, ""));
-  await performMint(ctx, telegramId, address);
+  const { address, chain } = parseChainCallback(data, "confirm_mint_", true);
+  await performMint(ctx, telegramId, normalizeAddressInput(address), chain);
 }
 
 async function promptImport(ctx: Context): Promise<void> {
@@ -1070,66 +1103,69 @@ export async function handleText(ctx: Context): Promise<void> {
 async function performScan(
   ctx: Context,
   telegramId: bigint,
-  address: string
+  address: string,
+  chainOverride?: ChainId
 ): Promise<void> {
-  const chain = await resolveUserChain(telegramId);
-  await ctx.reply(`🔍 Scanning contract \`${shortenAddress(address)}\` on ${networkBadge(chain)}...`, {
-    parse_mode: "Markdown",
-  });
+  const chain = chainOverride ?? (await resolveUserChain(telegramId));
+  await ctx.reply(
+    `🔍 Scanning contract <code>${htmlEscape(shortenAddress(address))}</code> on ${htmlEscape(networkBadge(chain))}...`,
+    { parse_mode: "HTML" }
+  );
 
   try {
     const result = await withChainContext(chain, () => scanContract(address, chain));
 
     if (!result.isContract) {
       await ctx.reply(
-        `❌ No contract found at \`${shortenAddress(address)}\``,
+        `❌ No contract found at <code>${htmlEscape(shortenAddress(address))}</code>`,
         {
           reply_markup: backToMainKeyboard(),
-          parse_mode: "Markdown",
+          parse_mode: "HTML",
         }
       );
       return;
     }
 
-    let text = `🔍 **Contract Analysis & Security Audit** — ${networkBadge(chain)}\n\n`;
-    text += `Contract: \`${result.contractAddress}\`\n`;
+    let text = `🔍 <b>Contract Analysis & Security Audit</b> — ${htmlEscape(networkBadge(chain))}\n\n`;
+    text += `Contract: <code>${htmlEscape(result.contractAddress)}</code>\n`;
     text += `Verified: ${result.isVerified ? "✅ Yes" : "⚠️ Bytecode only"}\n`;
-    text += `🛡 **Security Status:** ${
+    text += `🛡 <b>Security Status:</b> ${
       result.security.isSafe ? "✅ SAFE / CLEAN" : "🚨 HIGH RISK / HONEYPOT"
     }\n`;
-    text += `Risk Score: \`${result.security.riskScore} / 100\`\n\n`;
+    text += `Risk Score: <code>${result.security.riskScore} / 100</code>\n\n`;
 
     if (result.security.warnings.length > 0) {
-      text += `⚠️ **Security Warnings:**\n`;
+      text += `⚠️ <b>Security Warnings:</b>\n`;
       for (const w of result.security.warnings) {
-        text += `• ${w}\n`;
+        text += `• ${htmlEscape(w)}\n`;
       }
       text += `\n`;
     }
 
     if (result.mintFunctions.length > 0 && result.security.isSafe) {
-      text += `**Free Mint Functions Found:**\n`;
+      text += `<b>Free Mint Functions Found:</b>\n`;
       for (const fn of result.mintFunctions) {
-        text += `• ${fn.name}(${fn.args.join(", ")}) — ✅ Free\n`;
+        text += `• ${htmlEscape(fn.name)}(${fn.args.map((a) => htmlEscape(a)).join(", ")}) — ✅ Free\n`;
       }
       text += `\n🚀 Safe free mint confirmed!`;
 
       await addToWatchlist(telegramId, address);
 
       await ctx.reply(text, {
-        reply_markup: confirmMintKeyboard(address),
-        parse_mode: "Markdown",
+        reply_markup: confirmMintKeyboard(address, chain),
+        parse_mode: "HTML",
       });
     } else {
-      text += result.warning || "No free mint functions detected.";
+      text += htmlEscape(result.warning || "No free mint functions detected.");
       await ctx.reply(text, {
         reply_markup: backToMainKeyboard(),
-        parse_mode: "Markdown",
+        parse_mode: "HTML",
       });
     }
   } catch (error) {
-    await ctx.reply(`❌ Scan failed: ${errorMessage(error)}`, {
+    await ctx.reply(`❌ Scan failed: ${htmlEscape(errorMessage(error))}`, {
       reply_markup: backToMainKeyboard(),
+      parse_mode: "HTML",
     });
   }
 }
@@ -1137,19 +1173,20 @@ async function performScan(
 async function performMint(
   ctx: Context,
   telegramId: bigint,
-  address: string
+  address: string,
+  chainOverride?: ChainId
 ): Promise<void> {
-  const chain = await resolveUserChain(telegramId);
+  const chain = chainOverride ?? (await resolveUserChain(telegramId));
   const gasCheck = await withChainContext(chain, () => checkGasSafety(telegramId));
   if (!gasCheck.safe) {
     await ctx.reply(
-      `⚠️ **MINT ABORTED (HIGH GAS)**\n\n` +
-        `Current Network Gas: \`${gasCheck.currentGwei.toFixed(4)} Gwei\`\n` +
-        `Your Configured Max: \`${gasCheck.maxGwei} Gwei\`\n\n` +
-        `The bot paused this mint to prevent burning high gas fees. You can adjust your limit in **🛡 Settings / Gas**`,
+      `⚠️ <b>MINT ABORTED (HIGH GAS)</b>\n\n` +
+        `Current Network Gas: <code>${gasCheck.currentGwei.toFixed(4)} Gwei</code>\n` +
+        `Your Configured Max: <code>${gasCheck.maxGwei} Gwei</code>\n\n` +
+        `The bot paused this mint to prevent burning high gas fees. You can adjust your limit in <b>🛡 Settings / Gas</b>`,
       {
         reply_markup: backToMainKeyboard(),
-        parse_mode: "Markdown",
+        parse_mode: "HTML",
       }
     );
     return;
@@ -1169,12 +1206,12 @@ async function performMint(
   const multiplier = getUserMintQuantity(telegramId);
 
   await ctx.reply(
-    `🚀 **Starting Mint** — ${networkBadge(chain)}\n\n` +
-      `Contract: \`${shortenAddress(address)}\`\n` +
+    `🚀 <b>Starting Mint</b> — ${htmlEscape(networkBadge(chain))}\n\n` +
+      `Contract: <code>${htmlEscape(shortenAddress(address))}</code>\n` +
       `Active Wallets: ${activeCount} (x${multiplier} each)\n` +
-      `Gas Price: \`${gasCheck.currentGwei.toFixed(4)} Gwei\` (Safe ✅)\n\n` +
+      `Gas Price: <code>${gasCheck.currentGwei.toFixed(4)} Gwei</code> (Safe ✅)\n\n` +
       `Minting in progress...`,
-    { parse_mode: "Markdown" }
+    { parse_mode: "HTML" }
   );
 
   try {
@@ -1190,32 +1227,33 @@ async function performMint(
 
     for (const r of result.results) {
       const statusIcon = r.success ? "✅" : "❌";
-      let card = `${statusIcon} **${r.label}** — ${r.success ? "Minted!" : "Failed"}\n`;
-      card += `Wallet: \`${shortenAddress(r.walletAddress)}\`\n`;
+      let card = `${statusIcon} <b>${htmlEscape(r.label)}</b> — ${r.success ? "Minted!" : "Failed"}\n`;
+      card += `Wallet: <code>${htmlEscape(shortenAddress(r.walletAddress))}</code>\n`;
 
       if (r.txHash && r.basescanUrl) {
-        card += `TX: [${shortenAddress(r.txHash, 8, 8)}](${r.basescanUrl})\n`;
+        card += `TX: <a href="${htmlEscape(r.basescanUrl)}">${shortenAddress(r.txHash, 8, 8)}</a>\n`;
       }
       if (r.error) {
-        card += `Error: ${r.error}\n`;
+        card += `Error: ${htmlEscape(r.error)}\n`;
       }
 
       await ctx.reply(card, {
-        parse_mode: "Markdown",
+        parse_mode: "HTML",
         link_preview_options: { is_disabled: true },
       });
     }
 
     await ctx.reply(
-      `📊 **Mint Summary** — ${networkBadge(chain)}\n\nContract: \`${shortenAddress(address)}\`\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${result.totalFailed}\nTotal Attempts: ${result.results.length}`,
+      `📊 <b>Mint Summary</b> — ${htmlEscape(networkBadge(chain))}\n\nContract: <code>${htmlEscape(shortenAddress(address))}</code>\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${result.totalFailed}\nTotal Attempts: ${result.results.length}`,
       {
         reply_markup: backToMainKeyboard(),
-        parse_mode: "Markdown",
+        parse_mode: "HTML",
       }
     );
   } catch (error) {
-    await ctx.reply(`❌ Mint failed: ${errorMessage(error)}`, {
+    await ctx.reply(`❌ Mint failed: ${htmlEscape(errorMessage(error))}`, {
       reply_markup: backToMainKeyboard(),
+      parse_mode: "HTML",
     });
   }
 }
