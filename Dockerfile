@@ -35,4 +35,4 @@ COPY --from=builder /app/dist ./dist
 EXPOSE 3000
 
 # DATABASE_URL must be provided at runtime (Railway injects your Postgres URL).
-CMD ["sh", "-c", "npx prisma db push --skip-generate && node dist/main.js"]
+CMD ["sh", "-c", "npx prisma db push --accept-data-loss --skip-generate && node dist/main.js"]
