@@ -9,7 +9,11 @@ import {
   guideCommand,
 } from "./command.js";
 import { chainCommand, chainCallback } from "./chainCommand.js";
-import { channelGateMiddleware } from "./channelGate.js";
+import {
+  channelGateMiddleware,
+  gateStatusReport,
+  isGateOwner,
+} from "./channelGate.js";
 import { getBotStats, formatStatsLine } from "../core/stats.js";
 import { ensureUser } from "../core/wallet.js";
 import { withChainContext } from "../core/chainContext.js";
@@ -101,6 +105,21 @@ export function createBot(): Bot {
   bot.command("portfolio", async (ctx) => {
     const telegramId = BigInt(ctx.from?.id ?? 0);
     await showPortfolio(ctx, telegramId);
+  });
+
+  // Owner-only diagnostic for the channel gate (see channelGate.ts).
+  bot.command("gate_status", async (ctx) => {
+    const userId = ctx.from?.id ?? 0;
+    if (!isGateOwner(userId)) {
+      await ctx
+        .reply(
+          "🔒 /gate_status is restricted to the bot owner.\nAdd your Telegram user id to GATE_OWNER_IDS and redeploy."
+        )
+        .catch(() => undefined);
+      return;
+    }
+    const report = await gateStatusReport(ctx);
+    await ctx.reply(report).catch(() => undefined);
   });
 
   bot.on("callback_query:data", async (ctx, next) => {
