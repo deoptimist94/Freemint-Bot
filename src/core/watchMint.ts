@@ -68,6 +68,8 @@ const MAX_CONCURRENT_PER_CONTRACT = 3;
 const MAX_CONCURRENT_PER_USER = 5;
 const REASON_CHANGE_MIN_INTERVAL_MS = 30_000;
 
+// Revert reasons that will never clear on their own — no point polling through
+// them, so the watcher stops immediately and reports the gate.
 const PERMANENT_REASONS =
   /whitelist|allowlist|not\s+(on|in)\s+(the\s+)?(list|whitelist)|signature|invalid\s+signature|insufficient|sold\s*out|max\s*(mint|supply)|already\s+minted|mint\s*(ended|closed)|forbidden|unauthorized/i;
 
@@ -108,6 +110,10 @@ function classifyGate(reason: string): string | undefined {
   return undefined;
 }
 
+// Encodes free-mint calldata for the detected function. Nonce-ish args (uint)
+// get 1, address args get the wallet, bytes32[] gets [], everything else gets
+// a zero default — good enough to make the simulate call answer "will this
+// mint now?".
 function buildMintCalldata(
   fn: MintFunctionInfo,
   fromAddress: Address
@@ -282,6 +288,16 @@ export function stopWatchMint(
   return stopped;
 }
 
+// Backward-compatible alias — command.ts (Message A /whois + /bypass --stop
+// and watch_stop_ callbacks) imports { stopWatch }.
+export function stopWatch(
+  userId: bigint,
+  address: string,
+  chain?: ChainId
+): number {
+  return stopWatchMint(userId, address, chain);
+}
+
 export async function startWatchMint(
   options: WatchOptions
 ): Promise<WatchResult> {
@@ -355,6 +371,9 @@ export async function startWatchMint(
   let lastGateNotifyAt = 0;
 
   try {
+    // Scan on the SAME chain the watcher will fire on — the scanner's
+    // explorer/ABI switch (Etherscan V2 for Base, Blockscout for Robinhood)
+    // lives in scanner.ts.
     const result = await scanContract(address, chain);
     const fn = getBestMintFunction(result.mintFunctions);
     if (!fn) {
