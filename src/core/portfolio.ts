@@ -1,6 +1,7 @@
 import { type Address, type Hex } from "viem";
 import { getPublicClient, getWalletClient } from "./chain.js";
 import { fetchCollectionFloor } from "./autoLister.js";
+import { getChainConfig, getDefaultChainId, type ChainId } from "./chains.js";
 
 export interface PortfolioItem {
   contractAddress: string;
@@ -32,7 +33,6 @@ interface OwnedNft {
   collectionName: string;
 }
 
-const ALCHEMY_NFT_V3 = "https://base-mainnet.g.alchemy.com/nft/v3";
 const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_NFTS_PER_WALLET = 300;
 const MAX_PAGES = 5;
@@ -41,8 +41,19 @@ const PAGE_SIZE = 100;
 const FLOOR_CONCURRENCY = 6;
 const FLOOR_TIME_BUDGET_MS = 25_000;
 
-function alchemyApiKey(): string {
+function alchemyKey(chain: ChainId): string {
+  if (chain === "robinhood") {
+    return (
+      process.env.ROBINHOOD_ALCHEMY_API_KEY ||
+      process.env.ALCHEMY_API_KEY ||
+      ""
+    ).trim();
+  }
   return (process.env.ALCHEMY_API_KEY || "").trim();
+}
+
+function alchemyNftBase(chain: ChainId): string {
+  return getChainConfig(chain).alchemyNftBase;
 }
 
 function normalizeTokenId(raw: unknown): string {
@@ -80,16 +91,15 @@ async function fetchJson(url: string): Promise<any | null> {
 }
 
 async function fetchNftsAlchemy(
-  walletAddress: string
+  walletAddress: string,
+  chain: ChainId
 ): Promise<{ nfts: OwnedNft[]; error?: string }> {
-  const key = alchemyApiKey();
-  if (!key) {
-    return { nfts: [], error: "missing_key" };
-  }
+  const key = alchemyKey(chain);
+  if (!key) return { nfts: [], error: "missing_key" };
 
   const nfts: OwnedNft[] = [];
-  let pageKey: string | undefined;
   let error: string | undefined;
+  let pageKey: string | undefined;
 
   try {
     for (let page = 0; page < MAX_PAGES; page++) {
@@ -101,7 +111,7 @@ async function fetchNftsAlchemy(
       if (pageKey) params.set("pageKey", pageKey);
 
       const data = await fetchJson(
-        `${ALCHEMY_NFT_V3}/${key}/getNFTsForOwner?${params.toString()}`
+        `${alchemyNftBase(chain)}/${key}/getNFTsForOwner?${params.toString()}`
       );
       if (!data) {
         error =
@@ -139,9 +149,11 @@ async function fetchNftsAlchemy(
 }
 
 export async function fetchWalletPortfolio(
-  walletAddress: string
+  walletAddress: string,
+  chain: ChainId = getDefaultChainId()
 ): Promise<WalletPortfolio> {
-  const { nfts, error } = await fetchNftsAlchemy(walletAddress);
+  const config = getChainConfig(chain);
+  const { nfts, error } = await fetchNftsAlchemy(walletAddress, chain);
 
   if (nfts.length === 0) {
     if (error) {
@@ -150,7 +162,9 @@ export async function fetchWalletPortfolio(
         totalFloorValueEth: 0,
         error:
           error === "missing_key"
-            ? "Set ALCHEMY_API_KEY (free at dashboard.alchemy.com) — Etherscan/Reservoir free tiers cannot list Base NFTs."
+            ? chain === "robinhood"
+              ? "Set ALCHEMY_API_KEY with the Robinhood network enabled (or ROBINHOOD_ALCHEMY_API_KEY) — free at dashboard.alchemy.com."
+              : "Set ALCHEMY_API_KEY (free at dashboard.alchemy.com) — Etherscan/Reservoir free tiers cannot list Base NFTs."
             : error,
       };
     }
@@ -164,7 +178,7 @@ export async function fetchWalletPortfolio(
     collectionName: n.collectionName || "",
     floorPriceEth: 0,
     topBidEth: 0,
-    openseaUrl: `https://opensea.io/assets/base/${n.contractAddress}/${n.tokenId}`,
+    openseaUrl: `https://opensea.io/assets/${config.openseaChain}/${n.contractAddress}/${n.tokenId}`,
   }));
 
   // ONE floor lookup per unique contract — Onchain Blocks (100+ tokens) = 1 call.
@@ -190,7 +204,8 @@ export async function fetchWalletPortfolio(
       try {
         const floor = await fetchCollectionFloor(
           contract,
-          tokenByContract.get(contract)
+          tokenByContract.get(contract),
+          chain
         );
         floorByContract.set(contract, {
           floorPriceEth: floor.floorPriceEth,
@@ -229,8 +244,17 @@ export async function fetchWalletPortfolio(
 export async function executeSell(
   privateKey: string,
   contractAddress: string,
-  tokenId: string
+  tokenId: string,
+  chain: ChainId = "base"
 ): Promise<SellResult> {
+  // Reservoir does not support Robinhood Chain yet — no best-bid execution.
+  if (chain !== "base") {
+    return {
+      success: false,
+      error: "🔜 Sell coming soon on Robinhood Chain — marketplace support is not live yet.",
+    };
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
