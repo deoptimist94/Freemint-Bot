@@ -1,5 +1,10 @@
 import { getAddress } from "viem";
 import { getPublicClient } from "./chain.js";
+import {
+  getChainConfig,
+  getDefaultChainId,
+  type ChainId,
+} from "./chains.js";
 
 export interface SecurityReport {
   isSafe: boolean;
@@ -26,9 +31,12 @@ async function fetchJsonWithTimeout(url: string, timeoutMs: number): Promise<any
   }
 }
 
-export async function auditContractSecurity(contractAddress: string): Promise<SecurityReport> {
+export async function auditContractSecurity(
+  contractAddress: string,
+  chain: ChainId = getDefaultChainId()
+): Promise<SecurityReport> {
   const cleanAddr = getAddress(contractAddress);
-  const publicClient = getPublicClient();
+  const publicClient = getPublicClient(chain);
 
   const report: SecurityReport = {
     isSafe: true,
@@ -37,6 +45,37 @@ export async function auditContractSecurity(contractAddress: string): Promise<Se
     riskScore: 0,
     warnings: [],
   };
+
+  // Robinhood Chain: GoPlus does not index RH yet — bytecode-only screening.
+  // isSafe stays true so RH free mints can proceed; riskScore 5 = "verified, lightly vetted".
+  if (chain !== "base") {
+    const config = getChainConfig(chain);
+    try {
+      const bytecode = await publicClient.getBytecode({ address: cleanAddr });
+      if (!bytecode || bytecode === "0x") {
+        return {
+          ...report,
+          isSafe: false,
+          riskScore: 100,
+          warnings: ["No contract bytecode deployed at this address"],
+        };
+      }
+    } catch (err) {
+      return {
+        ...report,
+        isSafe: false,
+        riskScore: 100,
+        warnings: [
+          `Unable to read contract bytecode (RPC error): ${err instanceof Error ? err.message : String(err)}`,
+        ],
+      };
+    }
+    return {
+      ...report,
+      riskScore: 5,
+      warnings: [`GoPlus screening not available for ${config.name} — bytecode verified only`],
+    };
+  }
 
   // 1. Bytecode verification (always required)
   try {
