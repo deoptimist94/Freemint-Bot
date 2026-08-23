@@ -1,4 +1,9 @@
-import { createWalletClient, http, type Address, type Hex } from "viem";
+import {
+  createWalletClient,
+  http,
+  type Address,
+  type Hex,
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 import { getPublicClient, getBaseRpcUrl } from "./chain.js";
@@ -11,8 +16,10 @@ export interface FloorData {
 
 const ALCHEMY_NFT_V3 = "https://base-mainnet.g.alchemy.com/nft/v3";
 const RESERVOIR_BASE = "https://api-base.reservoir.tools";
+const OPENSEA_ASSET_BASE = "https://opensea.io/assets/base";
 const REQUEST_TIMEOUT_MS = 10_000;
 const FLOOR_CACHE_TTL_MS = 5 * 60_000;
+const FLOOR_ZERO_CACHE_TTL_MS = 60_000;
 const LOG_THROTTLE_MS = 15 * 60_000;
 
 const floorCache = new Map<string, { data: FloorData; expiresAt: number }>();
@@ -55,10 +62,28 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any | null> {
 
 function asEth(raw: unknown): number {
   if (raw === null || raw === undefined) return 0;
-  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) return raw;
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+  }
   if (typeof raw === "string") {
-    const n = Number(raw);
-    if (Number.isFinite(n) && n >= 0) return n;
+    const v = Number(raw);
+    return Number.isFinite(v) && v >= 0 ? v : 0;
+  }
+  if (Array.isArray(raw)) {
+    let best = 0;
+    for (const m of raw) {
+      const p = asEth(m);
+      if (p > 0 && (best === 0 || p < best)) best = p;
+    }
+    return best;
+  }
+  if (raw && typeof raw === "object") {
+    let best = 0;
+    for (const m of Object.values(raw as Record<string, unknown>)) {
+      const p = asEth(m);
+      if (p > 0 && (best === 0 || p < best)) best = p;
+    }
+    return best;
   }
   return 0;
 }
@@ -69,7 +94,7 @@ function weiToEth(raw: unknown): number {
       return Number(BigInt(raw)) / 1e18;
     }
     if (typeof raw === "number" && Number.isFinite(raw)) {
-      return raw > 1e9 ? raw / 1e18 : raw;
+      return raw / 1e18;
     }
   } catch {
     /* fall through */
@@ -77,17 +102,13 @@ function weiToEth(raw: unknown): number {
   return 0;
 }
 
-// Alchemy getFloorPrice — try every marketplace object it returns.
+// Alchemy getFloorPrice returns { [marketplace]: { floorPrice } } or { floorPrice }.
+// Be shape-agnostic: scan every nested value for floorPrice/floor_price, keep min positive.
 function parseAlchemyFloor(floorJson: any): number {
   if (!floorJson || typeof floorJson !== "object") return 0;
-  const markets = [
-    floorJson.openSea,
-    floorJson.opensea,
-    floorJson.looksRare,
-    floorJson.looksrare,
-    floorJson.x2y2,
-    floorJson.blur,
-  ];
+  const markets = Array.isArray(floorJson)
+    ? floorJson
+    : Object.values(floorJson);
   let best = 0;
   for (const m of markets) {
     if (!m || typeof m !== "object") continue;
@@ -154,10 +175,48 @@ async function fetchReservoirFloor(
   };
 }
 
-// Live floor + top bid + collection name.
-// Sources (in parallel): Alchemy NFT API + Reservoir Base. Best non-zero wins.
+// Keyless last-resort: OpenSea asset/collection pages embed JSON with
+// "floor_price" in ETH. First positive match wins.
+async function fetchOpenSeaHtmlFloor(
+  contractAddress: string,
+  tokenId?: string
+): Promise<number> {
+  const url = tokenId
+    ? `${OPENSEA_ASSET_BASE}/${contractAddress}/${tokenId}`
+    : `${OPENSEA_ASSET_BASE}/${contractAddress}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      headers: {
+        Accept: "text/html",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      },
+      signal: controller.signal,
+    });
+    if (!res.ok) return 0;
+    const html = await res.text();
+    const re = /"floor_price"\s*:\s*([0-9]*\.?[0-9]+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(html)) !== null) {
+      const v = Number(match[1]);
+      if (v > 0) return v;
+    }
+    return 0;
+  } catch {
+    return 0;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Live floor + top bid + collection name. Ladder: Reservoir -> Alchemy -> OpenSea HTML.
+// Diagnostics log per-source values so a failed source is identifiable in Railway logs.
+// Zero results are cached only 60s so a transient API failure can't poison the floor.
 export async function fetchCollectionFloor(
-  contractAddress: string
+  contractAddress: string,
+  tokenId?: string
 ): Promise<FloorData> {
   const key = contractAddress.toLowerCase();
   const cached = floorCache.get(key);
@@ -168,12 +227,31 @@ export async function fetchCollectionFloor(
     fetchReservoirFloor(contractAddress),
   ]);
 
-  const floorPriceEth =
+  let floorPriceEth =
     reservoir.floorPriceEth && reservoir.floorPriceEth > 0
       ? reservoir.floorPriceEth
       : alchemy.floorPriceEth && alchemy.floorPriceEth > 0
         ? alchemy.floorPriceEth
         : 0;
+
+  let openSeaHtmlFloor = 0;
+  if (floorPriceEth === 0) {
+    openSeaHtmlFloor = await fetchOpenSeaHtmlFloor(contractAddress, tokenId);
+    if (openSeaHtmlFloor > 0) {
+      floorPriceEth = openSeaHtmlFloor;
+      throttledLog(
+        `floor-recovered:${key}`,
+        `Floor for ${contractAddress} recovered via OpenSea HTML fallback: ${openSeaHtmlFloor} ETH`
+      );
+    }
+  }
+
+  if (floorPriceEth === 0) {
+    throttledLog(
+      `floor:${key}`,
+      `Floor empty for ${contractAddress} — alchemy:${alchemy.floorPriceEth ?? "n/a"} reservoir:${reservoir.floorPriceEth ?? "n/a"} openSeaHtml:${openSeaHtmlFloor} (check ALCHEMY_API_KEY / RESERVOIR_API_KEY on Railway)`
+    );
+  }
 
   const topBidEth =
     reservoir.topBidEth && reservoir.topBidEth > 0 ? reservoir.topBidEth : 0;
@@ -185,14 +263,12 @@ export async function fetchCollectionFloor(
 
   const data: FloorData = { floorPriceEth, topBidEth, collectionName };
 
-  if (floorPriceEth === 0 && topBidEth === 0) {
-    throttledLog(
-      `floor:${key}`,
-      `Floor fetch empty for ${contractAddress} (Alchemy + Reservoir both returned 0 — collection may have no live listings)`
-    );
-  }
-
-  floorCache.set(key, { data, expiresAt: Date.now() + FLOOR_CACHE_TTL_MS });
+  floorCache.set(key, {
+    data,
+    expiresAt:
+      Date.now() +
+      (floorPriceEth > 0 ? FLOOR_CACHE_TTL_MS : FLOOR_ZERO_CACHE_TTL_MS),
+  });
   return data;
 }
 
