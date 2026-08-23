@@ -100,9 +100,9 @@ export function startFloorWatcher(bot: Bot<any>, intervalSeconds: number = 300) 
               if (currentFloor > 0 && currentFloor > lastFloor) {
                 setFloor(tokenKey, currentFloor);
 
-                // Register the exact item so the alert's Sell button resolves
-                // instantly and never reports "Token not found in your wallets".
-                setSellTarget(userIdBigInt, item.tokenId, {
+                // Register the exact item (wallet-scoped key) so the alert's Sell
+                // button resolves instantly and never reports "Token not found".
+                setSellTarget(userIdBigInt, wallet.id, item.tokenId, {
                   walletId: wallet.id,
                   contractAddress: item.contractAddress,
                   tokenId: item.tokenId,
