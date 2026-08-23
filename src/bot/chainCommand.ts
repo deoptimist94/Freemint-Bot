@@ -59,6 +59,14 @@ export async function chainCallback(ctx: Context): Promise<void> {
   await setUserChainSelection(telegramId, selection);
   await ctx.answerCallbackQuery(`Chain set to ${selectionLabel(selection)}`);
   await ctx
-    .editMessageReplyMarkup({ reply_markup: chainKeyboard(selection) })
+    .editMessageText(
+      "🌐 Chain selection\n\n" +
+        "Choose which chain(s) Freemint-Bot operates on for you:\n" +
+        "⛽ Base — full support (scan, audit, bypass, mint, portfolio, sell)\n" +
+        "🏹 Robinhood Chain — scanning, watching, minting & portfolio (sell coming soon)\n" +
+        "Both — run every action on both chains.\n\n" +
+        `Current: ${selectionLabel(selection)}`,
+      { reply_markup: chainKeyboard(selection) }
+    )
     .catch(() => undefined);
 }
