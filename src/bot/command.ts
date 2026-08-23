@@ -95,19 +95,17 @@ export async function bypassCommand(ctx: Context): Promise<void> {
       const armed = armAutoMint(ctx, userId, address, result);
       if (armed) {
         text +=
-          `\n\n🔔 **Auto-mint armed** — the engine will fire at the public window and report the outcome here.\n` +
-          `🧾 Job ID: \`${armed.id}\``;
+          `\n\n🔔 Auto-mint armed — the engine will fire at the public window and report the outcome here.\n` +
+          `🧾 Job ID: ${armed.id}`;
       } else {
         text +=
           `\n\n⏰ No usable public window was detected — nothing armed. ` +
-          `Run \`--probe\` first to inspect state.`;
+          `Run --probe first to inspect state.`;
       }
     }
 
-    await ctx.reply(text, {
-      reply_markup: backToMainKeyboard(),
-      parse_mode: "Markdown",
-    });
+    // Plain text only — never parse_mode Markdown (probe/error strings break entities).
+    await ctx.reply(text, { reply_markup: backToMainKeyboard() });
   } catch (err) {
     await ctx.reply(
       `❌ Bypass engine error: ${err instanceof Error ? err.message : String(err)}`,
@@ -141,35 +139,25 @@ export async function bypassCallback(ctx: Context): Promise<void> {
     };
   }
 
+  const text = formatBypassResult(result);
   const chatId = ctx.callbackQuery?.message?.chat?.id;
   if (chatId === undefined) {
-    await ctx.reply(formatBypassResult(result), {
-      reply_markup: backToMainKeyboard(),
-    });
+    await ctx.reply(text, { reply_markup: backToMainKeyboard() });
     return;
   }
 
   try {
-    await ctx.api.editMessageText(
-      chatId,
-      progress.message_id,
-      formatBypassResult(result),
-      { reply_markup: backToMainKeyboard() }
-    );
+    await ctx.api.editMessageText(chatId, progress.message_id, text, {
+      reply_markup: backToMainKeyboard(),
+    });
   } catch (err) {
-    // Telegram 400 "message is not modified" — safe to ignore
     if (err instanceof Error && /message is not modified/i.test(err.message)) {
       return;
     }
-    await ctx.reply(formatBypassResult(result), {
-      reply_markup: backToMainKeyboard(),
-    });
+    await ctx.reply(text, { reply_markup: backToMainKeyboard() });
   }
 }
 
-// ---------------------------------------------------------------------------
-// Auto-mint scheduler (in-memory)
-// ---------------------------------------------------------------------------
 interface ScheduledJob {
   id: string;
   userId: bigint;
@@ -181,8 +169,8 @@ interface ScheduledJob {
 
 const scheduledJobs = new Map<string, ScheduledJob>();
 const MAX_JOBS = 50;
-const MIN_DELAY_MS = 10_000; // never fire sooner than 10s after arming
-const MAX_DELAY_MS = 48 * 60 * 60 * 1000; // never wait longer than 48h
+const MIN_DELAY_MS = 10_000;
+const MAX_DELAY_MS = 48 * 60 * 60 * 1000;
 
 function armAutoMint(
   ctx: Context,
@@ -210,8 +198,7 @@ function armAutoMint(
       await ctx.api
         .sendMessage(
           chatId,
-          `🔔 **Scheduled mint fired**\n\n${formatBypassResult(fireResult)}`,
-          { parse_mode: "Markdown" }
+          `🔔 Scheduled mint fired\n\n${formatBypassResult(fireResult)}`
         )
         .catch(() => undefined);
     } catch (err) {
@@ -250,7 +237,7 @@ function formatBypassResult(result: BypassResult): string {
   if (result.probe && result.probe.length > 0) {
     lines.push(`🔍 Probe (${result.probe.length} view reads):`);
     for (const row of result.probe.slice(0, 10)) {
-      lines.push(`   • ${row.name} = \`${String(row.value).slice(0, 60)}\``);
+      lines.push(`   • ${row.name} = ${String(row.value).slice(0, 60)}`);
     }
     if (result.probe.length > 10) {
       lines.push(`   …and ${result.probe.length - 10} more`);
