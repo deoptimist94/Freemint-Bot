@@ -1,7 +1,13 @@
 import { Bot } from "grammy";
 import { handleCallback, handleText, showPortfolio } from "./handlers.js";
 import { backToMainKeyboard } from "./keyboards.js";
-import { whoisCommand, bypassCommand, bypassCallback } from "./command.js";
+import {
+  whoisCommand,
+  bypassCommand,
+  bypassCallback,
+  watchStopCallback,
+} from "./command.js";
+import { getBotStats, formatStatsLine } from "../core/stats.js";
 
 export function createBot(): Bot {
   const token = process.env.BOT_TOKEN;
@@ -10,6 +16,14 @@ export function createBot(): Bot {
   const bot = new Bot(token);
 
   bot.command("start", async (ctx) => {
+    let statsLine = "";
+    try {
+      const stats = await getBotStats();
+      statsLine = `\n\n📊 ${formatStatsLine(stats)}`;
+    } catch (err) {
+      console.error("Stats error:", err);
+    }
+
     await ctx.reply(
       "👋 Welcome to Freemint-Bot!\n\n" +
         "I scan Base-chain NFT contracts for free mints, audit security, " +
@@ -18,7 +32,8 @@ export function createBot(): Bot {
         "/whois <contract> — contract intelligence report\n" +
         "/bypass <contract> — run the bypass engine\n" +
         "/portfolio — view NFTs across your wallets\n\n" +
-        "Use the menu below to get started.",
+        "Use the menu below to get started." +
+        statsLine,
       { reply_markup: backToMainKeyboard() }
     );
   });
@@ -28,6 +43,7 @@ export function createBot(): Bot {
       "🤖 Freemint-Bot help\n\n" +
         "/whois <contract address> — security, verified status, mint functions\n" +
         "/bypass <contract address> — analyze gates & attempt a bypass\n" +
+        "/bypass <contract> --watch — poll-and-fire FCFS mint watcher\n" +
         "/portfolio — view and sell your Base NFTs\n\n" +
         "Tip: after /whois, tap 🚀 Attempt Bypass to run the engine instantly.",
       { reply_markup: backToMainKeyboard() }
@@ -42,6 +58,10 @@ export function createBot(): Bot {
   });
 
   bot.on("callback_query:data", async (ctx, next) => {
+    if (ctx.callbackQuery.data.startsWith("watch_stop_")) {
+      await watchStopCallback(ctx);
+      return;
+    }
     if (ctx.callbackQuery.data.startsWith("bypass_")) {
       await bypassCallback(ctx);
       return;
