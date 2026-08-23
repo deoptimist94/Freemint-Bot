@@ -11,12 +11,38 @@ import {
 import { chainCommand, chainCallback } from "./chainCommand.js";
 import { getBotStats, formatStatsLine } from "../core/stats.js";
 import { ensureUser } from "../core/wallet.js";
+import { withChainContext } from "../core/chainContext.js";
+import { getUserChainSelection } from "../core/userChain.js";
+import type { ChainId } from "../core/chains.js";
 
 export function createBot(): Bot {
   const token = process.env.BOT_TOKEN;
   if (!token) throw new Error("BOT_TOKEN is not set in environment variables");
 
   const bot = new Bot(token);
+
+  // Resolve the user's /chain preference for every update and run the whole
+  // update inside that chain context, so scan/whois/bypass/watch/portfolio
+  // all operate on the chosen chain without touching their call sites.
+  // NOTE: "both" currently executes on Base (primary). True dual-chain
+  // stacking (scan/whois on both, one watcher per chain, per-chain portfolio
+  // grouping) lands in the next update — it needs the action-layer wiring.
+  bot.use(async (ctx, next) => {
+    const fromId = ctx.from?.id;
+    if (fromId === undefined) {
+      await next();
+      return;
+    }
+    try {
+      const selection = await getUserChainSelection(BigInt(fromId));
+      const chain: ChainId =
+        selection === "robinhood" ? "robinhood" : "base";
+      await withChainContext(chain, () => next());
+    } catch (err) {
+      console.error("Chain context error:", err);
+      await next();
+    }
+  });
 
   bot.command("start", async (ctx) => {
     const telegramId = BigInt(ctx.from?.id ?? 0);
@@ -55,7 +81,7 @@ export function createBot(): Bot {
         "/whois <contract address> — security, verified status, mint functions\n" +
         "/bypass <contract address> — analyze gates & attempt a bypass\n" +
         "/bypass <contract> --watch — poll-and-fire FCFS mint watcher\n" +
-        "/portfolio — view and sell your Base NFTs\n" +
+        "/portfolio — view and sell your NFTs\n" +
         "/guide — full user guide with examples\n\n" +
         "Tip: after /whois, tap 🚀 Attempt Bypass to run the engine instantly.",
       { reply_markup: backToMainKeyboard() }
