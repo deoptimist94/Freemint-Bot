@@ -1,5 +1,6 @@
 import { getAddress } from "viem";
 import { getPublicClient } from "./chain.js";
+import { type ChainId } from "./chains.js";
 
 // Common 4-byte free-mint selectors (executable mints only)
 const MINT_SELECTORS = new Set([
@@ -27,7 +28,8 @@ const MAX_SEEN = 2000;
 const BASE_RECONNECT_MS = 2_000;
 const MAX_RECONNECT_MS = 30_000;
 
-export class BaseDropListener {
+export class DropListener {
+  private chain: ChainId;
   private isRunning = false;
   private unwatch: (() => void) | null = null;
   private seenContracts = new Set<string>();
@@ -35,19 +37,20 @@ export class BaseDropListener {
   private reconnectDelay = BASE_RECONNECT_MS;
   private onDropDetected: DropCallback;
 
-  constructor(onDropDetected: DropCallback) {
+  constructor(chain: ChainId, onDropDetected: DropCallback) {
+    this.chain = chain;
     this.onDropDetected = onDropDetected;
   }
 
   public start() {
     if (this.isRunning) return;
     this.isRunning = true;
-    console.log("📡 Free-Mint Auto-Discovery Listener active on Base...");
+    console.log(`📡 Free-Mint Auto-Discovery Listener active on ${this.chain}...`);
     this.subscribe();
   }
 
   private subscribe() {
-    const client = getPublicClient();
+    const client = getPublicClient(this.chain);
 
     this.unwatch = client.watchBlocks({
       includeTransactions: true,
@@ -56,7 +59,7 @@ export class BaseDropListener {
         await this.handleBlock(block);
       },
       onError: (error) => {
-        console.error("Block watcher error:", error);
+        console.error(`Block watcher error (${this.chain}):`, error);
         this.scheduleReconnect();
       },
     });
@@ -76,7 +79,7 @@ export class BaseDropListener {
 
     const delay = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_MS);
-    console.log(`🔁 Block watcher re-subscribing in ${delay}ms...`);
+    console.log(`🔁 Block watcher (${this.chain}) re-subscribing in ${delay}ms...`);
 
     setTimeout(() => {
       if (!this.isRunning) return;
@@ -84,7 +87,7 @@ export class BaseDropListener {
         this.subscribe();
         this.reconnectDelay = BASE_RECONNECT_MS;
       } catch (err) {
-        console.error("Block watcher re-subscribe failed:", err);
+        console.error(`Block watcher (${this.chain}) re-subscribe failed:`, err);
         this.scheduleReconnect();
       }
     }, delay);
@@ -120,14 +123,14 @@ export class BaseDropListener {
 
       if (!this.rememberContract(contractAddr)) continue;
 
-      console.log(`🎯 Free-mint candidate: ${contractAddr} (sig: ${selector})`);
+      console.log(`🎯 Free-mint candidate: ${contractAddr} (sig: ${selector}, chain: ${this.chain})`);
 
       this.onDropDetected({
         contractAddress: contractAddr,
         selector,
         txHash: tx.hash,
         timestamp: Date.now(),
-      }).catch((err) => console.error("Drop handler error:", err));
+      }).catch((err) => console.error(`Drop handler error (${this.chain}):`, err));
     }
   }
 
@@ -137,6 +140,13 @@ export class BaseDropListener {
       this.unwatch();
       this.unwatch = null;
     }
-    console.log("🛑 Auto-Discovery Listener stopped.");
+    console.log(`🛑 Auto-Discovery Listener (${this.chain}) stopped.`);
+  }
+}
+
+// Backward-compatible alias — any existing `new BaseDropListener(cb)` keeps working.
+export class BaseDropListener extends DropListener {
+  constructor(onDropDetected: DropCallback) {
+    super("base", onDropDetected);
   }
 }
