@@ -1,4 +1,4 @@
-import type { Context, InlineKeyboardMarkup } from "grammy";
+import type { Context } from "grammy";
 import {
   getUserChainSelection,
   setUserChainSelection,
@@ -7,7 +7,11 @@ import {
   type ChainSelection,
 } from "../core/userChain.js";
 
-export function chainKeyboard(selection: ChainSelection): InlineKeyboardMarkup {
+type ChainKeyboardMarkup = {
+  inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+};
+
+export function chainKeyboard(selection: ChainSelection): ChainKeyboardMarkup {
   const mark = (s: ChainSelection): string => (s === selection ? "✅ " : "");
   return {
     inline_keyboard: [
