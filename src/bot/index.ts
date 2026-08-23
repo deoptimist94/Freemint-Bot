@@ -9,6 +9,7 @@ import {
   guideCommand,
 } from "./command.js";
 import { chainCommand, chainCallback } from "./chainCommand.js";
+import { channelGateMiddleware } from "./channelGate.js";
 import { getBotStats, formatStatsLine } from "../core/stats.js";
 import { ensureUser } from "../core/wallet.js";
 import { withChainContext } from "../core/chainContext.js";
@@ -20,6 +21,11 @@ export function createBot(): Bot {
   if (!token) throw new Error("BOT_TOKEN is not set in environment variables");
 
   const bot = new Bot(token);
+
+  // Channel membership gate — registered FIRST so it runs before every
+  // command/handler and blocks non-members from using the bot at all.
+  // No-op when REQUIRED_CHANNEL is not set.
+  bot.use(channelGateMiddleware());
 
   // Resolve the user's /chain preference for every update and run the whole
   // update inside that chain context, so scan/whois/bypass/watch/portfolio
