@@ -376,11 +376,10 @@ export async function startWatchMint(
   let lastGateNotifyAt = 0;
 
   try {
-    // NOTE: scanContract stays single-arg in Batch 1 (scanner is still
-    // Base-only). The chain-aware scanner switch lands in Batch 2; until
-    // then, a Robinhood watch simulates/fires on the Robinhood RPC but
-    // resolves the mint function via the Base scanner.
-    const result = await scanContract(address);
+    // Scan on the SAME chain the watcher will fire on — the scanner's
+    // explorer/ABI switch (Etherscan V2 for Base, Blockscout for Robinhood)
+    // lives in scanner.ts.
+    const result = await scanContract(address, chain);
     const fn = getBestMintFunction(result.mintFunctions);
     if (!fn) {
       const reason =
