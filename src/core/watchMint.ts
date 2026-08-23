@@ -7,10 +7,16 @@ import {
 } from "viem";
 import {
   getPublicClient,
-  getAddressFromPrivateKey,
   getWalletClient,
+  getAddressFromPrivateKey,
   normalizeAddressInput,
+  shortenAddress,
 } from "./chain.js";
+import {
+  getChainConfig,
+  getDefaultChainId,
+  type ChainId,
+} from "./chains.js";
 import { getWallets, getWalletPrivateKey } from "./wallet.js";
 import {
   scanContract,
@@ -48,10 +54,10 @@ export interface WatchHandle {
 
 export interface WatchOptions {
   userId: bigint;
-  rawAddress: string;
+  address: string;
+  chain?: ChainId;
   pollIntervalMs?: number;
   maxDurationMs?: number;
-  notify?: (message: string) => void | Promise<void>;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 2_500;
@@ -61,103 +67,143 @@ const MAX_CONCURRENT_PER_CONTRACT = 3;
 const MAX_CONCURRENT_PER_USER = 5;
 const REASON_CHANGE_MIN_INTERVAL_MS = 30_000;
 
+// Revert reasons that will never clear on their own — no point polling through
+// them, so the watcher stops immediately and reports the gate.
 const PERMANENT_REASONS =
   /whitelist|allowlist|not\s+(on|in)\s+(the\s+)?(list|whitelist)|signature|invalid\s+signature|insufficient|sold\s*out|max\s*(mint|supply)|already\s+minted|mint\s*(ended|closed)|forbidden|unauthorized/i;
 
 const activeWatches = new Map<string, WatchHandle[]>();
 
-function watchKey(userId: bigint, address: string): string {
-  return `${userId.toString()}:${address.toLowerCase()}`;
+// Chain-prefixed so a Base watch and a Robinhood watch on the same contract
+// are tracked independently.
+function watchKey(
+  userId: bigint,
+  address: string,
+  chain: ChainId = "base"
+): string {
+  return `${chain}:${userId.toString()}:${address.toLowerCase()}`;
 }
 
-export function isWatchActive(userId: bigint, address: string): boolean {
-  return (activeWatches.get(watchKey(userId, address)) ?? []).length > 0;
+export function isWatchActive(
+  userId: bigint,
+  address: string,
+  chain: ChainId = "base"
+): boolean {
+  const key = watchKey(userId, address, chain);
+  return (activeWatches.get(key) ?? []).some((h) => !h.stopped);
 }
 
 export function activeWatchCount(userId: bigint): number {
-  let total = 0;
-  const prefix = `${userId.toString()}:`;
+  let count = 0;
   for (const [key, handles] of activeWatches) {
-    if (key.startsWith(prefix)) total += handles.length;
+    if (key.includes(`:${userId.toString()}:`)) {
+      count += handles.filter((h) => !h.stopped).length;
+    }
   }
-  return total;
+  return count;
 }
 
-export function stopWatch(userId: bigint, address: string): number {
-  const key = watchKey(userId, address);
-  const handles = activeWatches.get(key);
-  if (!handles || handles.length === 0) return 0;
-  for (const handle of handles) handle.stop();
-  activeWatches.delete(key);
-  return handles.length;
+// Stops watchers for (userId, address). With a chain given, only that chain's
+// watchers stop; without one, all chains are stopped. Returns how many were
+// actually stopped.
+export function stopWatch(
+  userId: bigint,
+  address: string,
+  chain?: ChainId
+): number {
+  const addr = address.toLowerCase();
+  let stopped = 0;
+  for (const [key, handles] of activeWatches) {
+    const matches = chain
+      ? key === watchKey(userId, address, chain)
+      : key.endsWith(`:${userId.toString()}:${addr}`);
+    if (!matches) continue;
+    for (const handle of handles) {
+      if (!handle.stopped) {
+        handle.stop();
+        stopped += 1;
+      }
+    }
+  }
+  return stopped;
 }
 
-const sleep = (ms: number) =>
-  new Promise<void>((resolve) => setTimeout(resolve, ms));
-
-function shortReason(reason: string): string {
-  const cleaned = reason.replace(/\s+/g, " ").trim();
-  return cleaned.length > 80 ? `${cleaned.slice(0, 80)}…` : cleaned;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function classifyGate(reason: string): string {
-  if (/whitelist|allowlist/i.test(reason)) return "whitelist";
-  if (/signature/i.test(reason)) return "signature";
-  if (/payment|insufficient|funds|price|cost/i.test(reason)) return "payment";
-  if (/paused/i.test(reason)) return "paused";
-  if (/sold\s*out|max\s*(mint|supply)|already|minted/i.test(reason))
-    return "soldout";
-  if (/not\s+(open|live|started|active)|soon|waiting|coming/i.test(reason))
-    return "timed";
-  return "unknown";
+function shortReason(message: string): string {
+  let reason = message
+    .replace(/execution reverted:/g, "")
+    .replace(/Error:/g, "")
+    .replace(/VM Exception while processing transaction:/g, "")
+    .replace(/revert$/i, "")
+    .trim()
+    .split("\n")[0]
+    .trim();
+  if (reason.length > 220) reason = `${reason.slice(0, 220)}...`;
+  return reason || "unknown error";
 }
 
-function buildArgs(types: string[], fromAddress: string): unknown[] {
-  return types.map((type) => {
-    if (type.startsWith("uint") || type.startsWith("int")) return 1n;
-    if (type === "address") return getAddress(fromAddress);
-    if (type === "bool") return true;
-    if (type.endsWith("[]")) return [];
-    if (type.startsWith("bytes")) return "0x";
-    return "0x";
-  });
+function classifyGate(reason: string): string | undefined {
+  const r = reason.toLowerCase();
+  if (/whitelist|allowlist/.test(r)) return "whitelist";
+  if (/signature/.test(r)) return "signature";
+  if (/insufficient|payment|funds|balance|price/.test(r)) return "payment";
+  if (/sold\s*out|max\s*(mint|supply)/.test(r)) return "soldout";
+  if (/paused/.test(r)) return "paused";
+  if (/not\s+started|too\s+early/.test(r)) return "not_started";
+  return undefined;
 }
 
+// Encodes free-mint calldata for the detected function. Nonce-ish args (uint)
+// get 1, address args get the wallet, bytes32[] gets [], everything else gets
+// a zero default — good enough to make the simulate call answer "will this
+// mint now?".
 function buildMintCalldata(
   fn: MintFunctionInfo,
-  fromAddress: string
-): Hex | null {
+  fromAddress: Address
+): Hex | undefined {
   try {
-    const abiItem = parseAbi([
-      `function ${fn.name}(${fn.args.join(",")})`,
-    ] as const);
-    return encodeFunctionData({
-      abi: abiItem,
-      functionName: fn.name,
-      args: buildArgs(fn.args, fromAddress) as any,
+    const abi = parseAbi([`function ${fn.name}(${fn.args.join(", ")})`]);
+    const args = fn.args.map((arg) => {
+      if (/^uint(\d+)?$/.test(arg)) return 1n;
+      if (/^address$/.test(arg)) return getAddress(fromAddress);
+      if (/^bytes(\d+)?(\[\])?$/.test(arg)) {
+        return arg.endsWith("[]") ? [] : "0x";
+      }
+      return "0x";
     });
+    return encodeFunctionData({ abi, functionName: fn.name, args });
   } catch {
-    return null;
+    return undefined;
   }
+}
+
+interface SimulateResult {
+  ok: boolean;
+  error?: string;
 }
 
 async function simulateMintCall(
   contractAddress: Address,
-  fromAddress: string,
-  data: Hex
-): Promise<{ ok: boolean; error?: string }> {
+  from: Address,
+  data: Hex,
+  chain: ChainId
+): Promise<SimulateResult> {
   try {
-    const client = getPublicClient();
-    await client.call({
-      data,
+    await getPublicClient(chain).call({
+      account: from,
       to: contractAddress,
-      account: getAddress(fromAddress),
+      data,
       value: 0n,
     });
     return { ok: true };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: message };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
   }
 }
 
@@ -165,76 +211,89 @@ async function fireMint(
   userId: bigint,
   contractAddress: string,
   hexKey: Hex,
-  fromAddress: string,
+  fromAddress: Address,
   data: Hex,
   attempts: number,
   startedAt: number,
-  notify: (message: string) => void | Promise<void>
+  chain: ChainId,
+  safeNotify: (message: string) => void
 ): Promise<WatchResult> {
+  const { badge, explorerBaseUrl } = getChainConfig(chain);
   try {
-    const publicClient = getPublicClient();
-    const walletClient = getWalletClient(hexKey);
-
-    let gas: bigint;
-    try {
-      gas =
-        (await publicClient.estimateGas({
-          account: getAddress(fromAddress),
-          to: contractAddress as Address,
-          data,
-          value: 0n,
-        })) + 100_000n;
-    } catch {
-      gas = 1_500_000n;
-    }
-
-    const txHash = await walletClient.sendTransaction({
+    const hash = await getWalletClient(hexKey, chain).sendTransaction({
       to: contractAddress as Address,
       data,
-      value: 0n,
-      gas,
     });
-
-    const receipt = await publicClient.waitForTransactionReceipt({
-      hash: txHash,
-      timeout: RECEIPT_TIMEOUT_MS,
-    });
-
-    const success = receipt.status === "success";
-    await prisma.bypassLog
-      .create({
-        data: {
-          userId,
+    const txUrl = `${explorerBaseUrl}/tx/${hash}`;
+    try {
+      const receipt = await getPublicClient(chain).waitForTransactionReceipt({
+        hash,
+        timeout: RECEIPT_TIMEOUT_MS,
+      });
+      if (receipt.status === "success") {
+        prisma.mintHistory
+          .create({
+            data: {
+              userId,
+              contractAddress,
+              txHash: hash,
+              status: "success",
+            },
+          })
+          .catch(() => {});
+        safeNotify(
+          `🎉 ${badge} **MINTED!**\nContract: \`${contractAddress}\`\nTX: [${shortenAddress(hash, 8, 8)}](${txUrl})\nFired after ${attempts} attempt${attempts === 1 ? "" : "s"} (${Math.round((Date.now() - startedAt) / 1000)}s).`
+        );
+        return {
+          state: "fired",
           contractAddress,
-          strategyId: "watch",
+          txHash: hash,
           walletAddress: fromAddress,
-          success,
-          txHash,
-          error: success ? undefined : `Receipt status ${receipt.status}`,
-        },
-      })
-      .catch(() => undefined);
-
-    const result: WatchResult = {
-      state: success ? "fired" : "failed",
-      contractAddress,
-      walletAddress: fromAddress,
-      txHash,
-      attempts,
-      elapsedMs: Date.now() - startedAt,
-      reason: success
-        ? undefined
-        : `Transaction mined but reverted (status ${receipt.status}).`,
-    };
-    await notify(
-      success
-        ? `🎯 MINT FIRED!\n\nTx: ${txHash}\nWallet: ${fromAddress}`
-        : `⚠️ Mint tx sent but reverted: ${txHash}`
+          attempts,
+          elapsedMs: Date.now() - startedAt,
+        };
+      }
+      prisma.mintHistory
+        .create({
+          data: {
+            userId,
+            contractAddress,
+            txHash: hash,
+            status: "failed",
+          },
+        })
+        .catch(() => {});
+      safeNotify(
+        `❌ ${badge} Transaction reverted on-chain (receipt status: failed).\nTX: ${txUrl}`
+      );
+      return {
+        state: "failed",
+        contractAddress,
+        txHash: hash,
+        walletAddress: fromAddress,
+        attempts,
+        elapsedMs: Date.now() - startedAt,
+      };
+    } catch (err) {
+      const reason = shortReason(
+        err instanceof Error ? err.message : String(err)
+      );
+      safeNotify(`❌ ${badge} Mint transaction failed: ${reason}`);
+      return {
+        state: "failed",
+        contractAddress,
+        txHash: hash,
+        walletAddress: fromAddress,
+        attempts,
+        elapsedMs: Date.now() - startedAt,
+        reason,
+      };
+    }
+  } catch (err) {
+    const reason = shortReason(
+      err instanceof Error ? err.message : String(err)
     );
-    return result;
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    await notify(`❌ Mint failed: ${shortReason(reason)}`);
+    safeNotify(`❌ ${badge} Mint transaction failed: ${reason}`);
     return {
       state: "failed",
       contractAddress,
@@ -249,50 +308,51 @@ async function fireMint(
 export async function startWatchMint(
   options: WatchOptions
 ): Promise<WatchResult> {
-  const address = normalizeAddressInput(options.rawAddress);
-  if (!address) throw new Error("Invalid address");
+  const chain = options.chain ?? getDefaultChainId();
+  const { badge, name: chainName } = getChainConfig(chain);
+  const address = normalizeAddressInput(options.address);
+
+  const notify = (message: string) => {
+    console.log(`[watch] ${message}`);
+  };
+  const safeNotify = (message: string) => {
+    try {
+      notify(message);
+    } catch {
+      console.log(`[watch] ${message}`);
+    }
+  };
 
   const startedAt = Date.now();
   const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const maxDurationMs = options.maxDurationMs ?? DEFAULT_MAX_DURATION_MS;
   const deadline = startedAt + maxDurationMs;
-  const notify =
-    options.notify ??
-    (async (message: string) => {
-      console.log(`[watch] ${message}`);
-    });
 
-  const safeNotify = async (message: string): Promise<void> => {
-    try {
-      await notify(message);
-    } catch {
-      // Telegram send failures must never kill the watcher loop
-    }
-  };
+  const key = watchKey(options.userId, address, chain);
 
-  const key = watchKey(options.userId, address);
   if ((activeWatches.get(key) ?? []).length >= MAX_CONCURRENT_PER_CONTRACT) {
-    const reason =
-      "A watcher is already active for this contract. Stop it with /bypass <addr> --stop or the ⏹ button.";
-    await safeNotify(`⛔ ${reason}`);
+    safeNotify(
+      `⛔ ${badge} Watch limit reached for ${address} on ${chainName} — max ${MAX_CONCURRENT_PER_CONTRACT} concurrent watchers per contract.`
+    );
     return {
       state: "blocked",
       contractAddress: address,
       attempts: 0,
       elapsedMs: 0,
-      reason,
+      reason: "per-contract limit",
     };
   }
+
   if (activeWatchCount(options.userId) >= MAX_CONCURRENT_PER_USER) {
-    const reason =
-      "Too many active watchers (max 5). Stop one first with /bypass <addr> --stop.";
-    await safeNotify(`⛔ ${reason}`);
+    safeNotify(
+      `⛔ ${badge} Watch limit reached — max ${MAX_CONCURRENT_PER_USER} concurrent watchers per user.`
+    );
     return {
       state: "blocked",
       contractAddress: address,
       attempts: 0,
       elapsedMs: 0,
-      reason,
+      reason: "per-user limit",
     };
   }
 
@@ -308,94 +368,76 @@ export async function startWatchMint(
       stopped = true;
     },
   };
+
   const handles = activeWatches.get(key) ?? [];
   handles.push(handle);
   activeWatches.set(key, handles);
 
+  let lastGateNotifyAt = 0;
+
   try {
+    // NOTE: scanContract stays single-arg in Batch 1 (scanner is still
+    // Base-only). The chain-aware scanner switch lands in Batch 2; until
+    // then, a Robinhood watch simulates/fires on the Robinhood RPC but
+    // resolves the mint function via the Base scanner.
     const result = await scanContract(address);
     const fn = getBestMintFunction(result.mintFunctions);
-
     if (!fn) {
       const reason =
         result.warning ?? "No free mint function found on this contract.";
-      await safeNotify(`⛔ ${reason}`);
+      safeNotify(`⛔ ${badge} ${reason}`);
       return {
         state: "blocked",
         contractAddress: address,
         attempts: 0,
-        elapsedMs: 0,
+        elapsedMs: Date.now() - startedAt,
         reason,
       };
     }
 
-    const wallets = await getWallets(options.userId);
-    const candidate = wallets.find((w) => w.isActive) ?? wallets[0];
-    if (!candidate) {
-      const reason = "No wallet found. Add a wallet in the Portfolio menu first.";
-      await safeNotify(`⛔ ${reason}`);
+    const wallet = getWallets().find((w) => w.isActive);
+    if (!wallet) {
+      const reason = "No active wallet found.";
+      safeNotify(`⛔ ${badge} ${reason}`);
       return {
         state: "blocked",
         contractAddress: address,
         attempts: 0,
-        elapsedMs: 0,
+        elapsedMs: Date.now() - startedAt,
         reason,
       };
     }
 
-    const privateKey = await getWalletPrivateKey(candidate.id).catch(
-      () => null
-    );
-    if (!privateKey) {
-      const reason = "Could not unlock the wallet key for this contract.";
-      await safeNotify(`⛔ ${reason}`);
-      return {
-        state: "blocked",
-        contractAddress: address,
-        attempts: 0,
-        elapsedMs: 0,
-        reason,
-      };
-    }
-
-    const hexKey = (
-      privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
-    ) as Hex;
+    const hexKey = getWalletPrivateKey(wallet.id);
     const fromAddress = getAddressFromPrivateKey(hexKey);
-
     const data = buildMintCalldata(fn, fromAddress);
     if (!data) {
-      const reason = `Could not encode mint call for ${fn.name}(${fn.args.join(", ")})`;
-      await safeNotify(`⛔ ${reason}`);
+      const reason = `Could not build calldata for ${fn.name}().`;
+      safeNotify(`⛔ ${badge} ${reason}`);
       return {
         state: "blocked",
         contractAddress: address,
         attempts: 0,
-        elapsedMs: 0,
+        elapsedMs: Date.now() - startedAt,
         reason,
       };
     }
 
-    await safeNotify(
-      `👀 Watching ${fn.name}() on ${address} — polling every ${Math.round(pollIntervalMs / 1000)}s.\n` +
-        `Will fire the instant the gate opens. Max watch window: ${Math.round(maxDurationMs / 60_000)} min.`
+    safeNotify(
+      `👀 ${badge} Watching ${fn.name}() on ${address} (${chainName}) — polling every ${pollIntervalMs}ms.`
     );
 
     let attempts = 0;
-    let lastReasonCategory = "";
-    let lastReasonChangeAt = 0;
-    let final: WatchResult | undefined;
-
     while (!stopped && Date.now() < deadline) {
-      attempts++;
+      attempts += 1;
       const sim = await simulateMintCall(
         address as Address,
         fromAddress,
-        data
+        data,
+        chain
       );
-
       if (sim.ok) {
-        final = await fireMint(
+        return await fireMint(
           options.userId,
           address,
           hexKey,
@@ -403,72 +445,58 @@ export async function startWatchMint(
           data,
           attempts,
           startedAt,
+          chain,
           safeNotify
         );
-        break;
       }
-
-      const reason = sim.error ?? "Unknown revert";
-      if (PERMANENT_REASONS.test(reason)) {
-        const gateType = classifyGate(reason);
-        await safeNotify(
-          `⛔ Mint blocked — permanent gate detected: ${gateType}.\n${shortReason(reason)}\n\nStopping the watcher.`
+      const simReason = shortReason(sim.error ?? "");
+      if (PERMANENT_REASONS.test(sim.error ?? "")) {
+        const gateType = classifyGate(sim.error ?? "");
+        safeNotify(
+          `⛔ ${badge} Mint blocked — permanent gate detected: ${gateType ?? "unknown"} (${simReason}). Stopping watcher.`
         );
-        final = {
+        return {
           state: "blocked",
           contractAddress: address,
           gateType,
           walletAddress: fromAddress,
           attempts,
           elapsedMs: Date.now() - startedAt,
-          reason,
+          reason: simReason,
         };
-        break;
       }
-
-      const category = classifyGate(reason);
-      if (
-        category !== lastReasonCategory &&
-        Date.now() - lastReasonChangeAt >= REASON_CHANGE_MIN_INTERVAL_MS
-      ) {
-        lastReasonCategory = category;
-        lastReasonChangeAt = Date.now();
-        await safeNotify(
-          `🔄 Gate signal: ${shortReason(reason)}\n(attempt #${attempts}, still watching…)`
+      if (Date.now() - lastGateNotifyAt >= REASON_CHANGE_MIN_INTERVAL_MS) {
+        lastGateNotifyAt = Date.now();
+        safeNotify(
+          `🔄 ${badge} Gate signal: ${simReason} — retrying in ${pollIntervalMs}ms.`
         );
       }
-
       await sleep(pollIntervalMs);
     }
 
-    if (final) return final;
-
     if (stopped) {
-      await safeNotify(`⏹ Watcher stopped (${attempts} attempts).`);
+      safeNotify(`⏹ ${badge} Watcher stopped (${address}).`);
       return {
         state: "stopped",
         contractAddress: address,
-        walletAddress: fromAddress,
         attempts,
         elapsedMs: Date.now() - startedAt,
-        reason: "Stopped by user",
       };
     }
-
-    await safeNotify(
-      `⏰ Watch window expired after ${Math.round(maxDurationMs / 60_000)} min — the mint never opened.`
+    safeNotify(
+      `⏰ ${badge} Watch window expired for ${address} (${chainName}) after ${Math.round((Date.now() - startedAt) / 1000)}s.`
     );
     return {
       state: "timeout",
       contractAddress: address,
-      walletAddress: fromAddress,
       attempts,
       elapsedMs: Date.now() - startedAt,
-      reason: "Watch window expired",
     };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    await safeNotify(`❌ Watch failed: ${shortReason(reason)}`);
+  } catch (err) {
+    const reason = shortReason(
+      err instanceof Error ? err.message : String(err)
+    );
+    safeNotify(`❌ ${badge} Watch failed: ${reason}`);
     return {
       state: "failed",
       contractAddress: address,
@@ -480,10 +508,7 @@ export async function startWatchMint(
     const remaining = (activeWatches.get(key) ?? []).filter(
       (h) => h !== handle
     );
-    if (remaining.length > 0) {
-      activeWatches.set(key, remaining);
-    } else {
-      activeWatches.delete(key);
-    }
+    if (remaining.length > 0) activeWatches.set(key, remaining);
+    else activeWatches.delete(key);
   }
 }
