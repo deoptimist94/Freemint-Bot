@@ -23,6 +23,7 @@ import {
   executeSell,
   type PortfolioItem,
 } from "../core/portfolio.js";
+import { getSellTarget, setSellTarget } from "../core/sellCache.js";
 import { sweepDustToMaster } from "../core/sweeper.js";
 import { sweepAllNFTsToMaster } from "../core/nftSweeper.js";
 import { fundSubWallets } from "../core/funder.js";
@@ -158,6 +159,18 @@ async function showFundMenu(ctx: Context, telegramId: bigint): Promise<void> {
   });
 }
 
+const MAX_ITEMS_PER_WALLET = 15;
+const MAX_SELL_BUTTONS_PER_WALLET = 8;
+const MAX_TEXT_LENGTH = 3500;
+
+// Telegram Markdown: escape user-controlled strings (collection names, labels)
+// so dynamic values can't break entity parsing and kill the whole message.
+function mdEscape(text: string): string {
+  return text
+    .replace(/[\r\n]+/g, " ")
+    .replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
 export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<void> {
   if (ctx.callbackQuery) {
     await ctx.answerCallbackQuery({ text: "⏳ Loading portfolio..." }).catch(() => undefined);
@@ -171,45 +184,87 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
     return;
   }
 
+  // Fetch every wallet in parallel; each fetch is internally time-bounded
+  // (single Alchemy page + concurrent floor lookups with a hard budget).
+  const results = await Promise.allSettled(
+    wallets.map(async (wallet) => ({
+      wallet,
+      portfolio: await fetchWalletPortfolio(wallet.address),
+    }))
+  );
+
   let totalValue = 0;
   const lines: string[] = [];
   const kb = new InlineKeyboard();
   let hasButtons = false;
 
-  for (const wallet of wallets) {
-    try {
-      const portfolio = await fetchWalletPortfolio(wallet.address);
-      if (portfolio.error) {
-        lines.push(`👛 **${wallet.label}** — ⚠️ ${portfolio.error}`);
-        continue;
-      }
-      totalValue += portfolio.totalFloorValueEth;
-      if (portfolio.items.length === 0) {
-        lines.push(`👛 **${wallet.label}** — no NFTs found`);
-        continue;
-      }
-      lines.push(`👛 **${wallet.label}** (\`${wallet.address}\`)`);
-      for (const item of portfolio.items) {
-        lines.push(
-          `   🖼 #${item.tokenId} — ${item.collectionName || item.name} (floor ${item.floorPriceEth} ETH)`
-        );
-        const cb = `sell_${item.tokenId}_${wallet.id}`;
-        if (cb.length <= 64) {
-          kb.text(`💰 Sell #${item.tokenId}`, cb);
-          hasButtons = true;
-        } else {
-          kb.url(`Sell #${item.tokenId} on OpenSea`, item.openseaUrl);
-          hasButtons = true;
-        }
-      }
-      kb.row();
-    } catch (err) {
-      lines.push(`👛 **${wallet.label}** — portfolio error`);
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const wallet = wallets[i];
+    if (r.status === "rejected") {
+      lines.push(`👛 **${mdEscape(wallet.label)}** — ⚠️ portfolio error`);
+      continue;
     }
+    const { portfolio } = r.value;
+    if (portfolio.error) {
+      lines.push(`👛 **${mdEscape(wallet.label)}** — ⚠️ ${mdEscape(portfolio.error)}`);
+      continue;
+    }
+    totalValue += portfolio.totalFloorValueEth;
+    if (portfolio.items.length === 0) {
+      lines.push(`👛 **${mdEscape(wallet.label)}** — no NFTs found`);
+      continue;
+    }
+
+    const shown = portfolio.items.slice(0, MAX_ITEMS_PER_WALLET);
+    lines.push(`👛 **${mdEscape(wallet.label)}** (\`${wallet.address}\`)`);
+    for (const item of shown) {
+      lines.push(
+        `   🖼 #${item.tokenId} — ${mdEscape(item.collectionName || item.name)} (floor ${item.floorPriceEth} ETH)`
+      );
+      // Register the exact item so a later Sell tap resolves instantly and
+      // never fails with "Token not found in your wallets" on a transient API hiccup.
+      setSellTarget(telegramId, item.tokenId, {
+        walletId: wallet.id,
+        contractAddress: item.contractAddress,
+        tokenId: item.tokenId,
+        collectionName: item.collectionName || item.name,
+        openseaUrl: item.openseaUrl,
+        floorPriceEth: item.floorPriceEth,
+        topBidEth: item.topBidEth,
+      });
+    }
+    const extra = portfolio.items.length - shown.length;
+    if (extra > 0) lines.push(`   …and ${extra} more`);
+
+    let buttons = 0;
+    for (const item of shown) {
+      if (buttons >= MAX_SELL_BUTTONS_PER_WALLET) break;
+      const cb = `sell_${item.tokenId}_${wallet.id}`;
+      if (cb.length <= 64) {
+        kb.text(`💰 Sell #${item.tokenId}`, cb);
+        hasButtons = true;
+        buttons++;
+      } else {
+        kb.url(`Sell #${item.tokenId} on OpenSea`, item.openseaUrl);
+        hasButtons = true;
+        buttons++;
+      }
+    }
+    kb.row();
   }
 
+  // Build the message and, if needed, drop trailing item lines until it fits
+  // comfortably under Telegram's 4096-char hard limit. Dropping whole lines
+  // keeps the Markdown balanced so entity parsing can never fail.
   let text = `💼 **Portfolio**\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
   if (hasButtons) text += `\n\nSell instantly into the top bid with the buttons below.`;
+  while (text.length > MAX_TEXT_LENGTH && lines.length > 0) {
+    lines.pop();
+    text = `💼 **Portfolio**\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
+    if (hasButtons) text += `\n\nSell instantly into the top bid with the buttons below.`;
+  }
+
   if (hasButtons) kb.row();
   kb.text("🔁 Refresh", "portfolio").text("🏠 Main Menu", "main_menu");
 
@@ -479,11 +534,47 @@ interface SellTarget {
 
 async function resolveSellTarget(telegramId: bigint, tokenId: string): Promise<SellTarget | null> {
   const wallets = await getWallets(telegramId);
+
+  // 1) Fast path: the portfolio view and floor alerts already registered the
+  //    exact item, so a Sell tap resolves instantly — no live re-fetch that can
+  //    fail with a transient Alchemy error and produce "Token not found".
+  const cached = getSellTarget(telegramId, tokenId);
+  if (cached) {
+    const wallet = wallets.find((w) => w.id === cached.walletId);
+    if (wallet) {
+      return {
+        wallet,
+        item: {
+          contractAddress: cached.contractAddress,
+          tokenId: cached.tokenId,
+          name: cached.collectionName,
+          collectionName: cached.collectionName,
+          floorPriceEth: cached.floorPriceEth,
+          topBidEth: cached.topBidEth,
+          openseaUrl: cached.openseaUrl,
+        },
+      };
+    }
+    // Wallet was deleted — fall through to a live lookup.
+  }
+
+  // 2) Live fallback across all wallets (each fetch is time-bounded).
   for (const wallet of wallets) {
     try {
       const portfolio = await fetchWalletPortfolio(wallet.address);
       const item = portfolio.items.find((i) => i.tokenId === tokenId);
-      if (item) return { wallet, item };
+      if (item) {
+        setSellTarget(telegramId, tokenId, {
+          walletId: wallet.id,
+          contractAddress: item.contractAddress,
+          tokenId: item.tokenId,
+          collectionName: item.collectionName || item.name,
+          openseaUrl: item.openseaUrl,
+          floorPriceEth: item.floorPriceEth,
+          topBidEth: item.topBidEth,
+        });
+        return { wallet, item };
+      }
     } catch {
       // try next wallet
     }
@@ -512,9 +603,13 @@ async function handleSell(ctx: Context, telegramId: bigint, data: string): Promi
   kb.url("🔗 View on OpenSea", target.item.openseaUrl);
 
   await ctx.answerCallbackQuery();
+  const bidLine =
+    target.item.topBidEth > 0
+      ? `Top bid: \`${target.item.topBidEth}\` ETH`
+      : `Top bid: \`None\` — if there is no live bid, the dump will fail with \"No active bids\".`;
   await editOrReply(
     ctx,
-    `💼 **Confirm Sell**\n\nCollection: ${target.item.collectionName || target.item.name}\nToken: \`#${tokenId}\`\nFloor: \`${target.item.floorPriceEth}\` ETH\nTop bid: \`${target.item.topBidEth > 0 ? `${target.item.topBidEth}` : "None"}\` ETH\n\nSell instantly into the top bid at \`0\` wei?`,
+    `💼 **Confirm Sell**\n\nCollection: ${mdEscape(target.item.collectionName || target.item.name)}\nToken: \`#${tokenId}\`\nFloor: \`${target.item.floorPriceEth}\` ETH\n${bidLine}\n\nSell into the top bid (accepting any price)?`,
     { reply_markup: kb, parse_mode: "Markdown" }
   );
 }
