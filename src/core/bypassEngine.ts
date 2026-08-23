@@ -584,7 +584,7 @@ async function readNftBalance(
       functionName: "balanceOf",
       args: [walletAddress],
     } as any);
-    return typeof value === "bigint" ? value : BigInt(value ?? 0);
+    return typeof value === "bigint" ? value : BigInt(String(value ?? 0));
   } catch {
     return null;
   }
@@ -774,8 +774,8 @@ async function tryDirectMint(
         receiptTimeout,
       ]);
 
-      if (receipt.status === "0") {
-        const error = `TX ${txHash} reverted on-chain (status 0) — mint call did not execute`;
+      if (receipt.status !== "success") {
+        const error = `TX ${txHash} reverted on-chain (status ${receipt.status}) — mint call did not execute`;
         await logBypass(
           userId,
           address,
@@ -993,8 +993,8 @@ async function tryMatrix(
         receiptTimeout,
       ]);
 
-      if (receipt.status === "0") {
-        const error = `TX ${txHash} reverted on-chain (status 0) — mint call did not execute`;
+      if (receipt.status !== "success") {
+        const error = `TX ${txHash} reverted on-chain (status ${receipt.status}) — mint call did not execute`;
         await logBypass(
           userId,
           address,
