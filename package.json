@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "build": "tsc && prisma generate",
-    "start": "prisma db push && node dist/main.js",
+    "start": "prisma db push --accept-data-loss && node dist/main.js",
     "dev": "tsx src/main.ts",
-    "db:push": "prisma db push",
+    "db:push": "prisma db push --accept-data-loss",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev --name init"
   },
