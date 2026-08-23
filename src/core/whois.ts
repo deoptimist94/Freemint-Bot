@@ -5,6 +5,7 @@ import {
   MintFunctionInfo,
 } from "./scanner.js";
 import { normalizeAddressInput, shortenAddress } from "./chain.js";
+import { getDefaultChainId, type ChainId } from "./chains.js";
 
 export interface WhoisReport {
   contractAddress: string;
@@ -21,11 +22,14 @@ export interface WhoisReport {
   warning?: string;
 }
 
-export async function runWhois(rawAddress: string): Promise<WhoisReport> {
+export async function runWhois(
+  rawAddress: string,
+  chain: ChainId = getDefaultChainId()
+): Promise<WhoisReport> {
   const address = normalizeAddressInput(rawAddress);
   if (!address) throw new Error("Invalid address");
 
-  const result: ScanResult = await scanContract(address);
+  const result: ScanResult = await scanContract(address, chain);
   const bestMint =
     result.mintFunctions.length > 0
       ? getBestMintFunction(result.mintFunctions)
