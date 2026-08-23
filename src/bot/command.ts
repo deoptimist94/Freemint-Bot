@@ -7,6 +7,7 @@ import {
 import { runWhois, formatWhoisReport } from "../core/whois.js";
 import { executeBypass } from "../core/bypassEngine.js";
 import type { BypassResult } from "../core/bypassEngine.js";
+import { startWatchMint, stopWatch } from "../core/watchMint.js";
 import { backToMainKeyboard } from "./keyboards.js";
 
 export async function whoisCommand(ctx: Context): Promise<void> {
@@ -53,14 +54,18 @@ export async function bypassCommand(ctx: Context): Promise<void> {
 
   if (!raw) {
     await ctx.reply(
-      "❌ Usage: /bypass <contract address> [--dry] [--probe] [--schedule]\n\n" +
-        "--dry: simulate only, no transaction is sent.\n" +
-        "--probe: map contract state & mint surface (no transaction).\n" +
-        "--schedule: arm an auto-mint at the detected public window.\n\n" +
+      "❌ Usage: /bypass <contract address> [flags]\n\n" +
+        "Flags:\n" +
+        "--dry — simulate only, no transaction\n" +
+        "--probe — map contract state & mint surface\n" +
+        "--schedule — arm auto-mint at the public window\n" +
+        "--watch — poll-and-fire: fire instantly when the mint opens (FCFS)\n" +
+        "--stop — stop active watcher(s) for this contract\n\n" +
         "Examples:\n" +
         "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --dry\n" +
         "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --probe\n" +
-        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --probe --schedule",
+        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --probe --schedule\n" +
+        "/bypass 0xcd555B393D18c6253CfdDa3Cc591E508D1Ff750E --watch",
       { reply_markup: backToMainKeyboard() }
     );
     return;
@@ -78,8 +83,62 @@ export async function bypassCommand(ctx: Context): Promise<void> {
   const dryRun = flags.includes("--dry") || flags.includes("--simulate");
   const probeOnly = flags.includes("--probe");
   const schedule = flags.includes("--schedule");
-
+  const watch = flags.includes("--watch");
+  const stop = flags.includes("--stop");
   const userId = BigInt(ctx.from?.id ?? 0);
+
+  if (stop) {
+    const stopped = stopWatch(userId, address);
+    await ctx.reply(
+      stopped > 0
+        ? `⏹ Stopped ${stopped} watcher(s) for ${shortenAddress(address)}.`
+        : `ℹ️ No active watcher for ${shortenAddress(address)}.`,
+      { reply_markup: backToMainKeyboard() }
+    );
+    return;
+  }
+
+  if (watch) {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) {
+      await ctx.reply("❌ Could not resolve chat to send watch updates.", {
+        reply_markup: backToMainKeyboard(),
+      });
+      return;
+    }
+    const stopKeyboard = () =>
+      new InlineKeyboard()
+        .text("⏹ Stop Watching", `watch_stop_${address}`)
+        .row()
+        .text("🏠 Main Menu", "main_menu");
+
+    await ctx.reply(
+      "👀 Watch mode armed — polling the contract every 2.5s.\n\n" +
+        "The engine will fire the instant the mint opens (FCFS).\n" +
+        "Progress updates will be posted here. Use the ⏹ button or /bypass <addr> --stop to cancel.",
+      { reply_markup: stopKeyboard() }
+    );
+
+    startWatchMint({
+      userId,
+      rawAddress: address,
+      notify: (msg) =>
+        ctx.api
+          .sendMessage(chatId, msg, { reply_markup: stopKeyboard() })
+          .then(() => undefined)
+          .catch(() => undefined),
+    }).catch((err) =>
+      ctx.api
+        .sendMessage(
+          chatId,
+          `❌ Watch error: ${err instanceof Error ? err.message : String(err)}`,
+          { reply_markup: backToMainKeyboard() }
+        )
+        .catch(() => undefined)
+    );
+    return;
+  }
+
   const statusLine = probeOnly
     ? "🧪 PROBE MODE — mapping contract state & mint surface. No transaction will be sent..."
     : dryRun
@@ -155,6 +214,37 @@ export async function bypassCallback(ctx: Context): Promise<void> {
       return;
     }
     await ctx.reply(text, { reply_markup: backToMainKeyboard() });
+  }
+}
+
+export async function watchStopCallback(ctx: Context): Promise<void> {
+  const data = ctx.callbackQuery?.data ?? "";
+  const address = normalizeAddressInput(data.replace(/^watch_stop_/, ""));
+  if (!address || !isValidAddress(address)) {
+    await ctx.answerCallbackQuery({ text: "❌ Invalid address in callback" });
+    return;
+  }
+
+  const userId = BigInt(ctx.from?.id ?? 0);
+  const stopped = stopWatch(userId, address);
+  await ctx.answerCallbackQuery({
+    text: stopped > 0 ? "⏹ Watcher stopped" : "No active watcher",
+  });
+
+  const msg = ctx.callbackQuery?.message;
+  if (msg) {
+    try {
+      await ctx.api.editMessageText(
+        msg.chat.id,
+        msg.message_id,
+        stopped > 0
+          ? `⏹ Watcher stopped for ${shortenAddress(address)}.`
+          : `ℹ️ No active watcher for ${shortenAddress(address)}.`,
+        { reply_markup: backToMainKeyboard() }
+      );
+    } catch {
+      // message already gone or not modified — ignore
+    }
   }
 }
 
