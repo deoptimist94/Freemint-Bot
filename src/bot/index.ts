@@ -6,8 +6,10 @@ import {
   bypassCommand,
   bypassCallback,
   watchStopCallback,
+  guideCommand,
 } from "./command.js";
 import { getBotStats, formatStatsLine } from "../core/stats.js";
+import { ensureUser } from "../core/wallet.js";
 
 export function createBot(): Bot {
   const token = process.env.BOT_TOKEN;
@@ -16,6 +18,11 @@ export function createBot(): Bot {
   const bot = new Bot(token);
 
   bot.command("start", async (ctx) => {
+    const telegramId = BigInt(ctx.from?.id ?? 0);
+    await ensureUser(telegramId).catch((err) =>
+      console.error("ensureUser error:", err)
+    );
+
     let statsLine = "";
     try {
       const stats = await getBotStats();
@@ -31,7 +38,8 @@ export function createBot(): Bot {
         "Commands:\n" +
         "/whois <contract> — contract intelligence report\n" +
         "/bypass <contract> — run the bypass engine\n" +
-        "/portfolio — view NFTs across your wallets\n\n" +
+        "/portfolio — view NFTs across your wallets\n" +
+        "/guide — full user guide\n\n" +
         "Use the menu below to get started." +
         statsLine,
       { reply_markup: backToMainKeyboard() }
@@ -44,12 +52,14 @@ export function createBot(): Bot {
         "/whois <contract address> — security, verified status, mint functions\n" +
         "/bypass <contract address> — analyze gates & attempt a bypass\n" +
         "/bypass <contract> --watch — poll-and-fire FCFS mint watcher\n" +
-        "/portfolio — view and sell your Base NFTs\n\n" +
+        "/portfolio — view and sell your Base NFTs\n" +
+        "/guide — full user guide with examples\n\n" +
         "Tip: after /whois, tap 🚀 Attempt Bypass to run the engine instantly.",
       { reply_markup: backToMainKeyboard() }
     );
   });
 
+  bot.command("guide", (ctx) => guideCommand(ctx));
   bot.command("whois", (ctx) => whoisCommand(ctx));
   bot.command("bypass", (ctx) => bypassCommand(ctx));
   bot.command("portfolio", async (ctx) => {
