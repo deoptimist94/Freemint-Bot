@@ -1,11 +1,10 @@
-// In-memory sell-target cache.
+// In-memory sell-target cache, scoped per user AND wallet.
 //
-// The sell flow resolves a `sell_<tokenId>_<walletId>` callback by re-fetching
-// every wallet's portfolio live. Any transient Alchemy failure then produces
-// the confusing "Token not found in your wallets" toast. This cache is
-// registered by the floor watcher and the portfolio view (which already hold
-// the exact item), so the dump/confirm path resolves instantly and only falls
-// back to a live lookup when the entry is missing or stale.
+// Keys are `${walletId}::${tokenId}` inside a per-user Map, so two wallets
+// holding the same tokenId from different collections can never collide.
+// The cache is registered by the floor watcher and the portfolio view (which
+// already hold the exact item), so the dump/confirm path resolves instantly
+// and only falls back to a live lookup when the entry is missing or stale.
 
 export interface CachedSellTarget {
   walletId: string;
@@ -27,6 +26,7 @@ const userOrder: string[] = [];
 
 export function setSellTarget(
   userId: bigint,
+  walletId: string,
   tokenId: string,
   target: Omit<CachedSellTarget, "cachedAt">
 ): void {
@@ -41,7 +41,7 @@ export function setSellTarget(
       if (oldest) cache.delete(oldest);
     }
   }
-  userMap.set(tokenId, { ...target, cachedAt: Date.now() });
+  userMap.set(`${walletId}::${tokenId}`, { ...target, cachedAt: Date.now() });
   if (userMap.size > MAX_PER_USER) {
     let oldestToken: string | undefined;
     let oldestAt = Infinity;
@@ -55,13 +55,17 @@ export function setSellTarget(
   }
 }
 
-export function getSellTarget(userId: bigint, tokenId: string): CachedSellTarget | undefined {
+export function getSellTarget(
+  userId: bigint,
+  walletId: string,
+  tokenId: string
+): CachedSellTarget | undefined {
   const userMap = cache.get(userId.toString());
   if (!userMap) return undefined;
-  const target = userMap.get(tokenId);
+  const target = userMap.get(`${walletId}::${tokenId}`);
   if (!target) return undefined;
   if (Date.now() - target.cachedAt > TTL_MS) {
-    userMap.delete(tokenId);
+    userMap.delete(`${walletId}::${tokenId}`);
     return undefined;
   }
   return target;
