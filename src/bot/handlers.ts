@@ -14,7 +14,12 @@ import {
 } from "../core/chain.js";
 import { scanContract } from "../core/scanner.js";
 import { getChainConfig, type ChainId } from "../core/chains.js";
-import { getUserChainSelection, getPrimaryChain } from "../core/userChain.js";
+import {
+  getUserChainSelection,
+  getPrimaryChain,
+  getChainsForSelection,
+  selectionLabel,
+} from "../core/userChain.js";
 import { withChainContext } from "../core/chainContext.js";
 import {
   batchMint,
@@ -253,12 +258,20 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
     return;
   }
 
-  const chain = await resolveUserChain(telegramId);
+  const selection = await getUserChainSelection(telegramId);
+  const chains = getChainsForSelection(selection);
 
   const results = await Promise.allSettled(
     wallets.map(async (wallet) => ({
       wallet,
-      portfolio: await withChainContext(chain, () => fetchWalletPortfolio(wallet.address)),
+      portfolios: await Promise.all(
+        chains.map(async (chain) => ({
+          chain,
+          portfolio: await withChainContext(chain, () =>
+            fetchWalletPortfolio(wallet.address, chain)
+          ),
+        }))
+      ),
     }))
   );
 
@@ -274,64 +287,87 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
       lines.push(`👛 **${mdEscape(wallet.label)}** — ⚠️ portfolio error`);
       continue;
     }
-    const { portfolio } = r.value;
-    if (portfolio.error) {
-      lines.push(`👛 **${mdEscape(wallet.label)}** — ⚠️ ${mdEscape(portfolio.error)}`);
-      continue;
-    }
-    totalValue += portfolio.totalFloorValueEth;
-    if (portfolio.items.length === 0) {
+
+    const anyItems = r.value.portfolios.some(
+      (p) => p.portfolio.items.length > 0
+    );
+    if (!anyItems) {
       lines.push(`👛 **${mdEscape(wallet.label)}** — no NFTs found`);
       continue;
     }
 
-    for (const item of portfolio.items) {
-      setSellTarget(telegramId, wallet.id, item.tokenId, {
-        walletId: wallet.id,
-        contractAddress: item.contractAddress,
-        tokenId: item.tokenId,
-        collectionName: item.collectionName || item.name,
-        openseaUrl: item.openseaUrl,
-        floorPriceEth: item.floorPriceEth,
-        topBidEth: item.topBidEth,
-      });
-    }
-
-    const groups = groupItems(portfolio.items);
-    lines.push(`👛 **${mdEscape(wallet.label)}** (\`${wallet.address}\`)`);
-    for (const g of groups) {
-      const shown = g.items.slice(0, TOKENS_PER_COLLECTION);
-      const ids = shown.map((it) => `#${it.tokenId}`).join(", ");
-      const extra = g.items.length - shown.length;
-      const floorLine =
-        g.floorPriceEth > 0 ? ` — floor ${g.floorPriceEth} ETH` : " — no floor data";
-      lines.push(`🖼 ${mdEscape(g.name)}${floorLine}`);
-      lines.push(`   ${ids}${extra > 0 ? ` …(+${extra})` : ""}`);
-    }
-
+    let pushedHeader = false;
     let buttons = 0;
-    for (const g of groups) {
-      if (buttons >= MAX_COLLECTION_BUTTONS) break;
-      const firstToken = g.items[0].tokenId;
-      const cb = `sell_${firstToken}_${wallet.id}`;
-      if (cb.length <= 64) {
-        kb.text(`💰 Sell ${g.name}`, cb);
-        hasButtons = true;
-        buttons++;
-      } else {
-        kb.url(`View ${g.name} on OpenSea`, g.openseaUrl);
-        hasButtons = true;
-        buttons++;
+    for (const { chain, portfolio } of r.value.portfolios) {
+      if (portfolio.error) {
+        lines.push(`👛 **${mdEscape(wallet.label)}** — ⚠️ ${mdEscape(portfolio.error)}`);
+        continue;
+      }
+      if (portfolio.items.length === 0) continue;
+      totalValue += portfolio.totalFloorValueEth;
+
+      if (!pushedHeader) {
+        lines.push(`👛 **${mdEscape(wallet.label)}** (\`${wallet.address}\`)`);
+        pushedHeader = true;
+      }
+
+      if (chains.length > 1) {
+        lines.push(`**${networkBadge(chain)}**`);
+      }
+
+      // Sell targets are Base-only: executeSell is Base-only (Reservoir has no
+      // Robinhood support), and registering Robinhood items here could collide
+      // on shared tokenIds in the sell cache.
+      if (chain === "base") {
+        for (const item of portfolio.items) {
+          setSellTarget(telegramId, wallet.id, item.tokenId, {
+            walletId: wallet.id,
+            contractAddress: item.contractAddress,
+            tokenId: item.tokenId,
+            collectionName: item.collectionName || item.name,
+            openseaUrl: item.openseaUrl,
+            floorPriceEth: item.floorPriceEth,
+            topBidEth: item.topBidEth,
+          });
+        }
+      }
+
+      const groups = groupItems(portfolio.items);
+      for (const g of groups) {
+        const shown = g.items.slice(0, TOKENS_PER_COLLECTION);
+        const ids = shown.map((it) => `#${it.tokenId}`).join(", ");
+        const extra = g.items.length - shown.length;
+        const floorLine =
+          g.floorPriceEth > 0 ? ` — floor ${g.floorPriceEth} ETH` : " — no floor data";
+        lines.push(`🖼 ${mdEscape(g.name)}${floorLine}`);
+        lines.push(`   ${ids}${extra > 0 ? ` …(+${extra})` : ""}`);
+      }
+
+      if (chain === "base") {
+        for (const g of groups) {
+          if (buttons >= MAX_COLLECTION_BUTTONS) break;
+          const firstToken = g.items[0].tokenId;
+          const cb = `sell_${firstToken}_${wallet.id}`;
+          if (cb.length <= 64) {
+            kb.text(`💰 Sell ${g.name}`, cb);
+            hasButtons = true;
+            buttons++;
+          } else {
+            kb.url(`View ${g.name} on OpenSea`, g.openseaUrl);
+            hasButtons = true;
+            buttons++;
+          }
+        }
       }
     }
     kb.row();
   }
 
-  let text = `💼 **Portfolio** — ${networkBadge(chain)}\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
+  let text = `💼 **Portfolio** — ${selectionLabel(selection)}\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
   if (hasButtons) text += `\n\nSell into the top bid with the buttons below (each sells the lowest token of that collection).`;
   while (text.length > MAX_TEXT_LENGTH && lines.length > 0) {
     lines.pop();
-    text = `💼 **Portfolio** — ${networkBadge(chain)}\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
+    text = `💼 **Portfolio** — ${selectionLabel(selection)}\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
     if (hasButtons) text += `\n\nSell into the top bid with the buttons below (each sells the lowest token of that collection).`;
   }
 
