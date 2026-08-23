@@ -34,10 +34,16 @@ interface OwnedNft {
 
 const ALCHEMY_NFT_V3 = "https://base-mainnet.g.alchemy.com/nft/v3";
 const REQUEST_TIMEOUT_MS = 12_000;
-const MAX_NFTS_PER_WALLET = 100;
+const MAX_NFTS_PER_WALLET = 300;
+const MAX_PAGES = 5;
+const PAGE_SIZE = 100;
 // Floors are fetched once per unique contract (not once per token).
 const FLOOR_CONCURRENCY = 6;
 const FLOOR_TIME_BUDGET_MS = 25_000;
+
+function alchemyApiKey(): string {
+  return (process.env.ALCHEMY_API_KEY || "").trim();
+}
 
 function normalizeTokenId(raw: unknown): string {
   const s = String(raw ?? "0");
@@ -76,19 +82,21 @@ async function fetchJson(url: string): Promise<any | null> {
 async function fetchNftsAlchemy(
   walletAddress: string
 ): Promise<{ nfts: OwnedNft[]; error?: string }> {
-  const key = (process.env.ALCHEMY_API_KEY || "").trim();
-  if (!key) return { nfts: [], error: "missing_key" };
+  const key = alchemyApiKey();
+  if (!key) {
+    return { nfts: [], error: "missing_key" };
+  }
 
   const nfts: OwnedNft[] = [];
   let pageKey: string | undefined;
   let error: string | undefined;
 
   try {
-    for (let page = 0; page < Math.ceil(MAX_NFTS_PER_WALLET / 100); page++) {
+    for (let page = 0; page < MAX_PAGES; page++) {
       const params = new URLSearchParams({
         owner: walletAddress,
         withMetadata: "true",
-        pageSize: "100",
+        pageSize: String(PAGE_SIZE),
       });
       if (pageKey) params.set("pageKey", pageKey);
 
@@ -159,8 +167,14 @@ export async function fetchWalletPortfolio(
     openseaUrl: `https://opensea.io/assets/base/${n.contractAddress}/${n.tokenId}`,
   }));
 
-  // ONE floor lookup per unique contract — Onchain Blocks (50 tokens) = 1 call.
+  // ONE floor lookup per unique contract — Onchain Blocks (100+ tokens) = 1 call.
   const uniqueContracts = [...new Set(nfts.map((n) => n.contractAddress))];
+  const tokenByContract = new Map<string, string>();
+  for (const n of nfts) {
+    if (!tokenByContract.has(n.contractAddress)) {
+      tokenByContract.set(n.contractAddress, n.tokenId);
+    }
+  }
   const floorByContract = new Map<
     string,
     { floorPriceEth: number; topBidEth: number; collectionName: string }
@@ -174,7 +188,10 @@ export async function fetchWalletPortfolio(
       const idx = next++;
       const contract = uniqueContracts[idx];
       try {
-        const floor = await fetchCollectionFloor(contract);
+        const floor = await fetchCollectionFloor(
+          contract,
+          tokenByContract.get(contract)
+        );
         floorByContract.set(contract, {
           floorPriceEth: floor.floorPriceEth,
           topBidEth: floor.topBidEth,
