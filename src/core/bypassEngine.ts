@@ -356,6 +356,8 @@ function encodeCall(fn: MintFunctionInfo, args: unknown[]): Hex {
   });
 }
 
+// decodeErrorResult returns readonly tuple args — unwrap through unknown to
+// avoid the TS2352 "neither type sufficiently overlaps" build error.
 function asDecodedError(decoded: unknown): {
   errorName: string;
   args: readonly unknown[];
@@ -415,10 +417,7 @@ export function decodeRevertReason(raw: unknown, abi?: Abi | null): string {
           data: data as Hex,
         })
       );
-      if (
-        decoded.errorName === "Error" &&
-        typeof decoded.args[0] === "string"
-      ) {
+      if (decoded.errorName === "Error" && typeof decoded.args[0] === "string") {
         return decoded.args[0];
       }
       if (decoded.errorName === "Panic") {
@@ -461,6 +460,31 @@ interface SimResult {
   error?: string;
 }
 
+// RPC transport failures (rate limit, timeout, 5xx) are NOT mint reverts —
+// they get retried, then surfaced as RPC_TRANSPORT so they are never
+// misclassified as a gate.
+function isRpcTransportError(err: unknown): boolean {
+  const msg = (
+    err instanceof Error
+      ? `${err.message} ${err.name}`
+      : typeof err === "string"
+        ? err
+        : JSON.stringify(err ?? "")
+  ).toLowerCase();
+  return (
+    /rpc request failed|http request failed|fetch failed|econnreset|etimedout|socket hang up|429|502|503|504|timeout|rate limit|too many requests|network|econnrefused|enotfound/.test(
+      msg
+    ) &&
+    !/execution reverted|revert|not whitelisted|insufficient|unauthorized/.test(
+      msg
+    )
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 async function simulateCall(
   client: ReturnType<typeof getPublicClient>,
   address: Address,
@@ -468,12 +492,25 @@ async function simulateCall(
   from: Address,
   abi?: Abi | null
 ): Promise<SimResult> {
-  try {
-    await client.call({ account: from, to: address, data });
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: decodeRevertReason(err, abi) };
+  let lastRpc: string | undefined;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await client.call({ account: from, to: address, data });
+      return { ok: true };
+    } catch (err) {
+      if (isRpcTransportError(err)) {
+        lastRpc = err instanceof Error ? err.message : String(err);
+        await sleep(300 * (attempt + 1));
+        continue;
+      }
+      // Real on-chain revert — decode it.
+      return { ok: false, error: decodeRevertReason(err, abi) };
+    }
   }
+  return {
+    ok: false,
+    error: `RPC_TRANSPORT: ${lastRpc ?? "RPC Request failed"}`,
+  };
 }
 
 // Prisma BypassLog fields: walletAddress + success (NOT fromAddress/ok)
@@ -638,7 +675,7 @@ function buildProbeMatrix(
       try {
         rows.push({ fn, args: variant, data: encodeCall(fn, variant) });
       } catch {
-        // skip
+        // skip unencodable variant
       }
     }
 
@@ -651,7 +688,7 @@ function buildProbeMatrix(
       try {
         rows.push({ fn, args: variant, data: encodeCall(fn, variant) });
       } catch {
-        // skip
+        // skip unencodable variant
       }
     }
   }
@@ -666,13 +703,7 @@ async function findWorkingCall(
   abi: Abi
 ): Promise<ProbeRowCall | null> {
   for (const row of rows) {
-    const sim = await simulateCall(
-      client,
-      address,
-      row.data,
-      fromAddress,
-      abi
-    );
+    const sim = await simulateCall(client, address, row.data, fromAddress, abi);
     if (sim.ok) return row;
   }
   return null;
@@ -920,6 +951,17 @@ export async function executeBypass(
       simError = sim.error;
     }
   }
+
+  // Transport failures are NOT gate signals — surface them clearly instead of
+  // misclassifying the contract as mint_open/whitelist from a dead RPC.
+  if (simError && simError.startsWith("RPC_TRANSPORT:")) {
+    const error =
+      `RPC unavailable during simulation (${simError.replace(/^RPC_TRANSPORT:\s*/, "")}). ` +
+      `Set BASE_RPC_URL to a private Alchemy/QuickNode Base endpoint, or ensure ALCHEMY_API_KEY is set so the bot can use Alchemy RPC automatically.`;
+    await logBypass(userId, address, "none", "", false, undefined, error);
+    return { ...base, gateType: "unknown", error };
+  }
+
   const classified = simError ? classifyRevertReason(simError) : undefined;
   if (classified) base.gateType = classified;
 
@@ -979,6 +1021,15 @@ export async function executeBypass(
       );
       if (matrix) return matrix;
     }
+  }
+
+  // If the ladder only ever hit RPC errors, say so instead of a fake gate.
+  if (base.error && base.error.includes("RPC_TRANSPORT")) {
+    const error =
+      `RPC unavailable during bypass attempts. ` +
+      `Set BASE_RPC_URL or ALCHEMY_API_KEY so simulations can reach Base.`;
+    await logBypass(userId, address, base.strategyId, "", false, undefined, error);
+    return { ...base, gateType: "unknown", error };
   }
 
   const error = buildFinalError(
