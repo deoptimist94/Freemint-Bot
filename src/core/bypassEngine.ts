@@ -21,9 +21,6 @@ import {
   type MintFunctionInfo,
   type ScanResult,
 } from "./scanner.js";
-import { getChainConfig, getDefaultChainId, type ChainId } from "./chains.js";
-import { getUserChainSelection, getPrimaryChain } from "./userChain.js";
-import { withChainContext } from "./chainContext.js";
 import { prisma } from "../db/client.js";
 
 export type GateType =
@@ -49,7 +46,6 @@ export interface BypassResult {
   state?: string;
   probe?: ProbeRow[];
   publicMintAt?: { atMs: number; label: string } | null;
-  chain?: ChainId;
 }
 
 export interface BypassPlan {
@@ -525,8 +521,7 @@ async function logBypass(
   walletAddress: string,
   success: boolean,
   txHash?: string,
-  error?: string,
-  chain: ChainId = getDefaultChainId()
+  error?: string
 ): Promise<void> {
   try {
     await prisma.bypassLog.create({
@@ -538,12 +533,147 @@ async function logBypass(
         success,
         txHash: txHash ?? null,
         error: error ?? null,
-        chain,
       },
     });
   } catch {
     // logging must never break the user-facing flow
   }
+}
+
+// ---------------------------------------------------------------------------
+// Post-receipt NFT verification (Fix A)
+// ---------------------------------------------------------------------------
+
+const TRANSFER_TOPIC_721_20 =
+  "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const TRANSFER_TOPIC_1155_SINGLE =
+  "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62";
+const TRANSFER_TOPIC_1155_BATCH =
+  "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb";
+
+function shortAddr(a: string): string {
+  return a.length > 12 ? `${a.slice(0, 6)}..${a.slice(-4)}` : a;
+}
+
+function hasReadableBalanceOf(abi: Abi | null): boolean {
+  if (!abi) return false;
+  return (abi as Array<{
+    type?: string;
+    name?: string;
+    inputs?: Array<{ type: string }>;
+  }>).some(
+    (item) =>
+      item.type === "function" &&
+      item.name === "balanceOf" &&
+      Array.isArray(item.inputs) &&
+      item.inputs.length === 1 &&
+      item.inputs[0].type === "address"
+  );
+}
+
+async function readNftBalance(
+  client: ReturnType<typeof getPublicClient>,
+  contractAddress: Address,
+  walletAddress: Address,
+  abi: Abi
+): Promise<bigint | null> {
+  try {
+    const value = await client.readContract({
+      address: contractAddress,
+      abi: abi as any,
+      functionName: "balanceOf",
+      args: [walletAddress],
+    } as any);
+    return typeof value === "bigint" ? value : BigInt(value ?? 0);
+  } catch {
+    return null;
+  }
+}
+
+async function verifyNftReceived(
+  client: ReturnType<typeof getPublicClient>,
+  contractAddress: Address,
+  walletAddress: Address,
+  abi: Abi | null,
+  beforeBalance: bigint | null,
+  blockNumber?: bigint
+): Promise<{ received: boolean; detail: string }> {
+  const wallet = walletAddress.toLowerCase();
+  const transferTopics = [
+    TRANSFER_TOPIC_721_20,
+    TRANSFER_TOPIC_1155_SINGLE,
+    TRANSFER_TOPIC_1155_BATCH,
+  ];
+
+  // Primary check: any Transfer* log in the mined block that credits the
+  // minter wallet. Topic layout: 721/20 -> Transfer(from,to,id) => "to" is
+  // topics[2]; 1155 -> TransferSingle/Batch(operator,from,to,...) => "to" is
+  // topics[3]. A gated no-op mints NOTHING, so no log matches.
+  let logsChecked = false;
+  try {
+    const logs = await client.getLogs({
+      address: contractAddress,
+      fromBlock: blockNumber ?? "earliest",
+      toBlock: blockNumber ?? "latest",
+      topics: [transferTopics],
+    } as any);
+    logsChecked = true;
+    for (const log of logs as Array<{
+      topics?: string[];
+      transactionHash?: string;
+    }>) {
+      const sig = (log.topics?.[0] ?? "").toLowerCase();
+      const recipientIdx =
+        sig === TRANSFER_TOPIC_1155_SINGLE ||
+        sig === TRANSFER_TOPIC_1155_BATCH
+          ? 3
+          : 2;
+      const to = (log.topics?.[recipientIdx] ?? "").toLowerCase();
+      if (to === wallet) {
+        return {
+          received: true,
+          detail: `Transfer log ${shortAddr(sig)} credits ${shortAddr(walletAddress)}`,
+        };
+      }
+    }
+  } catch {
+    // Log query is best-effort; fall through to the balance-delta check.
+  }
+
+  // Fallback: balanceOf() delta for ERC721/ERC20-style contracts.
+  if (beforeBalance !== null && abi) {
+    try {
+      const after = await readNftBalance(
+        client,
+        contractAddress,
+        walletAddress,
+        abi
+      );
+      if (after !== null) {
+        if (after > beforeBalance) {
+          return {
+            received: true,
+            detail: `balanceOf ${beforeBalance} -> ${after}`,
+          };
+        }
+        return {
+          received: false,
+          detail: logsChecked
+            ? `no Transfer log to ${shortAddr(walletAddress)} and balanceOf unchanged (${beforeBalance})`
+            : `balanceOf unchanged (${beforeBalance}); Transfer logs unreadable`,
+        };
+      }
+    } catch {
+      // balance read failed — report below
+    }
+  }
+
+  return {
+    received: false,
+    detail: logsChecked
+      ? `no Transfer log to ${shortAddr(walletAddress)} found in block ${blockNumber ?? "history"}`
+      : "no Transfer log found and balanceOf is not readable on this contract",
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -558,8 +688,7 @@ async function tryDirectMint(
   client: ReturnType<typeof getPublicClient>,
   attempts: WalletInfo[],
   options: BypassOptions,
-  base: BypassResult,
-  chain: ChainId
+  base: BypassResult
 ): Promise<BypassResult | null> {
   const targetFn = plan.targetFn;
   if (!targetFn) return null;
@@ -603,8 +732,7 @@ async function tryDirectMint(
         fromAddress,
         true,
         undefined,
-        "dry-run (simulation only)",
-        chain
+        "dry-run (simulation only)"
       );
       return {
         ...base,
@@ -614,6 +742,18 @@ async function tryDirectMint(
         dryRun: true,
       };
     }
+
+    // Fix A: snapshot the minter's balance before sending, so a mined-but-
+    // no-op tx (whitelist/allowlist silent accept) can be detected.
+    const beforeBalance =
+      result.abi && hasReadableBalanceOf(result.abi)
+        ? await readNftBalance(
+            client,
+            address as Address,
+            fromAddress,
+            result.abi
+          )
+        : null;
 
     try {
       const walletClient = getWalletClient(hexKey);
@@ -629,12 +769,64 @@ async function tryDirectMint(
         )
       );
       receiptTimeout.catch(() => undefined);
-      await Promise.race([
+      const receipt = await Promise.race([
         client.waitForTransactionReceipt({ hash: txHash }),
         receiptTimeout,
       ]);
 
-      await logBypass(userId, address, strategyId, fromAddress, true, txHash, undefined, chain);
+      if (receipt.status === "0") {
+        const error = `TX ${txHash} reverted on-chain (status 0) — mint call did not execute`;
+        await logBypass(
+          userId,
+          address,
+          strategyId,
+          fromAddress,
+          false,
+          txHash,
+          error
+        );
+        return {
+          ...base,
+          success: false,
+          strategyId,
+          walletAddress: fromAddress,
+          txHash,
+          error,
+        };
+      }
+
+      // Fix A: a mined receipt is NOT proof of a mint. Verify the wallet
+      // actually received an NFT (Transfer log or balanceOf delta).
+      const verify = await verifyNftReceived(
+        client,
+        address as Address,
+        fromAddress,
+        result.abi ?? null,
+        beforeBalance,
+        receipt.blockNumber
+      );
+      if (!verify.received) {
+        const error = `TX ${txHash} mined but no NFT received (${verify.detail}) — likely gated (whitelist/allowlist) and the call silently no-oped`;
+        await logBypass(
+          userId,
+          address,
+          strategyId,
+          fromAddress,
+          false,
+          txHash,
+          error
+        );
+        return {
+          ...base,
+          success: false,
+          strategyId,
+          walletAddress: fromAddress,
+          txHash,
+          error,
+        };
+      }
+
+      await logBypass(userId, address, strategyId, fromAddress, true, txHash);
       return {
         ...base,
         success: true,
@@ -726,8 +918,7 @@ async function tryMatrix(
   options: BypassOptions,
   base: BypassResult,
   fns: MintFunctionInfo[],
-  strategyId: string,
-  chain: ChainId
+  strategyId: string
 ): Promise<BypassResult | null> {
   if (!result.abi || fns.length === 0) return null;
 
@@ -761,8 +952,7 @@ async function tryMatrix(
         fromAddress,
         true,
         undefined,
-        "dry-run (simulation only)",
-        chain
+        "dry-run (simulation only)"
       );
       return {
         ...base,
@@ -771,6 +961,18 @@ async function tryMatrix(
         dryRun: true,
       };
     }
+
+    // Fix A: snapshot the minter's balance before sending (same as
+    // tryDirectMint) so a silent no-op tx is never reported as success.
+    const beforeBalance =
+      result.abi && hasReadableBalanceOf(result.abi)
+        ? await readNftBalance(
+            client,
+            address as Address,
+            fromAddress,
+            result.abi
+          )
+        : null;
 
     try {
       const walletClient = getWalletClient(hexKey);
@@ -786,15 +988,67 @@ async function tryMatrix(
         )
       );
       receiptTimeout.catch(() => undefined);
-      await Promise.race([
+      const receipt = await Promise.race([
         client.waitForTransactionReceipt({ hash: txHash }),
         receiptTimeout,
       ]);
 
-      await logBypass(userId, address, strategyId, fromAddress, true, txHash, undefined, chain);
+      if (receipt.status === "0") {
+        const error = `TX ${txHash} reverted on-chain (status 0) — mint call did not execute`;
+        await logBypass(
+          userId,
+          address,
+          strategyId,
+          fromAddress,
+          false,
+          txHash,
+          error
+        );
+        return {
+          ...base,
+          success: false,
+          strategyId,
+          walletAddress: fromAddress,
+          txHash,
+          error,
+        };
+      }
+
+      // Fix A: verify the wallet actually received an NFT.
+      const verify = await verifyNftReceived(
+        client,
+        address as Address,
+        fromAddress,
+        result.abi,
+        beforeBalance,
+        receipt.blockNumber
+      );
+      if (!verify.received) {
+        const error = `TX ${txHash} mined but no NFT received (${verify.detail}) — likely gated (whitelist/allowlist) and the call silently no-oped`;
+        await logBypass(
+          userId,
+          address,
+          strategyId,
+          fromAddress,
+          false,
+          txHash,
+          error
+        );
+        return {
+          ...base,
+          success: false,
+          strategyId,
+          walletAddress: fromAddress,
+          txHash,
+          error,
+        };
+      }
+
+      await logBypass(userId, address, strategyId, fromAddress, true, txHash);
       return {
         ...base,
         success: true,
+        strategyId,
         walletAddress: fromAddress,
         txHash,
       };
@@ -862,15 +1116,6 @@ function buildFinalError(
 // Orchestrator
 // ---------------------------------------------------------------------------
 
-function chainRpcHint(chain: ChainId): string {
-  return chain === "robinhood"
-    ? `Set ROBINHOOD_RPC_URL to a private Robinhood Chain RPC endpoint, or ensure ROBINHOOD_ALCHEMY_API_KEY is set so the bot can use Alchemy RPC automatically.`
-    : `Set BASE_RPC_URL to a private Alchemy/QuickNode Base endpoint, or ensure ALCHEMY_API_KEY is set so the bot can use Alchemy RPC automatically.`;
-}
-
-// Chain is resolved per-user (getUserChainSelection → getPrimaryChain) and the
-// whole run executes inside withChainContext so getPublicClient() /
-// getWalletClient() / checkGasSafety() all inherit the correct chain.
 export async function executeBypass(
   userId: bigint,
   rawAddress: string,
@@ -879,17 +1124,7 @@ export async function executeBypass(
   const address = normalizeAddressInput(rawAddress);
   if (!address) throw new Error("Invalid address");
 
-  const chain: ChainId = getPrimaryChain(await getUserChainSelection(userId));
-  return withChainContext(chain, () => runBypass(userId, address, chain, options));
-}
-
-async function runBypass(
-  userId: bigint,
-  address: string,
-  chain: ChainId,
-  options: BypassOptions
-): Promise<BypassResult> {
-  const result: ScanResult = await scanContract(address, chain);
+  const result: ScanResult = await scanContract(address);
   const client = getPublicClient();
 
   const probe = await probeStateVariables(
@@ -909,7 +1144,6 @@ async function runBypass(
     state,
     probe,
     publicMintAt,
-    chain,
   };
 
   if (options.probeOnly) {
@@ -923,8 +1157,7 @@ async function runBypass(
       "",
       true,
       undefined,
-      "probe-only (no tx)",
-      chain
+      "probe-only (no tx)"
     );
     return base;
   }
@@ -932,14 +1165,14 @@ async function runBypass(
   const gas = await checkGasSafety(userId);
   if (!gas.safe) {
     const error = `Gas too high to proceed: ${gas.currentGwei} gwei (ceiling ${gas.maxGwei} gwei)`;
-    await logBypass(userId, address, "none", "", false, undefined, error, chain);
+    await logBypass(userId, address, "none", "", false, undefined, error);
     return { ...base, error };
   }
 
   const wallets = await getWallets(userId);
   if (wallets.length === 0) {
     const error = "No wallet found. Add a wallet in the Portfolio menu first.";
-    await logBypass(userId, address, "none", "", false, undefined, error, chain);
+    await logBypass(userId, address, "none", "", false, undefined, error);
     return { ...base, error };
   }
 
@@ -988,8 +1221,8 @@ async function runBypass(
   if (simError && simError.startsWith("RPC_TRANSPORT:")) {
     const error =
       `RPC unavailable during simulation (${simError.replace(/^RPC_TRANSPORT:\s*/, "")}). ` +
-      chainRpcHint(chain);
-    await logBypass(userId, address, "none", "", false, undefined, error, chain);
+      `Set BASE_RPC_URL to a private Alchemy/QuickNode Base endpoint, or ensure ALCHEMY_API_KEY is set so the bot can use Alchemy RPC automatically.`;
+    await logBypass(userId, address, "none", "", false, undefined, error);
     return { ...base, gateType: "unknown", error };
   }
 
@@ -1009,8 +1242,7 @@ async function runBypass(
       client,
       attempts,
       options,
-      base,
-      chain
+      base
     );
     if (direct) return direct;
   }
@@ -1031,8 +1263,7 @@ async function runBypass(
         options,
         base,
         pubFns,
-        "public_path",
-        chain
+        "public_path"
       );
       if (pub) return pub;
     }
@@ -1050,8 +1281,7 @@ async function runBypass(
         options,
         base,
         allFns,
-        "probe_matrix",
-        chain
+        "probe_matrix"
       );
       if (matrix) return matrix;
     }
@@ -1061,10 +1291,8 @@ async function runBypass(
   if (base.error && base.error.includes("RPC_TRANSPORT")) {
     const error =
       `RPC unavailable during bypass attempts. ` +
-      (chain === "robinhood"
-        ? `Set ROBINHOOD_RPC_URL or ROBINHOOD_ALCHEMY_API_KEY so simulations can reach ${getChainConfig(chain).name}.`
-        : `Set BASE_RPC_URL or ALCHEMY_API_KEY so simulations can reach ${getChainConfig(chain).name}.`);
-    await logBypass(userId, address, base.strategyId, "", false, undefined, error, chain);
+      `Set BASE_RPC_URL or ALCHEMY_API_KEY so simulations can reach Base.`;
+    await logBypass(userId, address, base.strategyId, "", false, undefined, error);
     return { ...base, gateType: "unknown", error };
   }
 
@@ -1074,6 +1302,6 @@ async function runBypass(
     publicMintAt,
     plan.reason
   );
-  await logBypass(userId, address, base.strategyId, "", false, undefined, error, chain);
+  await logBypass(userId, address, base.strategyId, "", false, undefined, error);
   return { ...base, error };
 }
