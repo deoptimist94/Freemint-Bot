@@ -3,11 +3,12 @@
 // Every chain-specific fact (RPC resolution, explorer, ABI source, NFT API,
 // floor ladder, badge) lives here so that scanner / autoLister / portfolio /
 // watch / UI only ever branch on a ChainId and read the rest from
-// getChainConfig(). Batch 3's /chain toggle and 🌐 button use
+// getChainConfig(). The /chain toggle and 🌐 button use
 // ChainSelection + parseChainSelection on top of this.
 
 import { type Chain } from "viem";
 import { base } from "viem/chains";
+import { getContextChain } from "./chainContext.js";
 
 export type ChainId = "base" | "robinhood";
 export type ChainSelection = ChainId | "both";
@@ -46,9 +47,12 @@ export function resolveRobinhoodRpcUrl(): string {
   );
 }
 
-// --- Server-wide default chain ----------------------------------------------
+// --- Default chain resolution ----------------------------------------------
+// Priority: per-request user context (Batch 4 middleware) → CHAIN env → base.
 
 export function getDefaultChainId(): ChainId {
+  const ctx = getContextChain();
+  if (ctx) return ctx;
   const raw = (process.env.CHAIN || "").trim().toLowerCase();
   if (raw === "robinhood" || raw === "rh" || raw === "hood") return "robinhood";
   return "base";
