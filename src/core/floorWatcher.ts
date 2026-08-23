@@ -3,6 +3,7 @@ import { prisma } from "../db/client.js";
 import { fetchWalletPortfolio } from "./portfolio.js";
 import { shortenAddress } from "./chain.js";
 import { getAutoSellConfig, processAutoSellForToken } from "./autoSeller.js";
+import { setSellTarget } from "./sellCache.js";
 
 const knownFloors = new Map<string, number>();
 const knownFloorsOrder: string[] = [];
@@ -99,6 +100,18 @@ export function startFloorWatcher(bot: Bot<any>, intervalSeconds: number = 300) 
               if (currentFloor > 0 && currentFloor > lastFloor) {
                 setFloor(tokenKey, currentFloor);
 
+                // Register the exact item so the alert's Sell button resolves
+                // instantly and never reports "Token not found in your wallets".
+                setSellTarget(userIdBigInt, item.tokenId, {
+                  walletId: wallet.id,
+                  contractAddress: item.contractAddress,
+                  tokenId: item.tokenId,
+                  collectionName: item.collectionName || item.name,
+                  openseaUrl: item.openseaUrl,
+                  floorPriceEth: item.floorPriceEth,
+                  topBidEth: item.topBidEth,
+                });
+
                 const alertMsg =
                   `🔥 *NFT VALUE DETECTED!*\n\n` +
                   `🎨 *Collection:* ${item.collectionName}\n` +
@@ -119,11 +132,17 @@ export function startFloorWatcher(bot: Bot<any>, intervalSeconds: number = 300) 
                   confirmCb.length <= 64 &&
                   cancelCb.length <= 64;
 
+                // Honest button: "Dump" means fill an existing bid. When no bid
+                // data exists, say so instead of pretending there is a bid.
+                const dumpLabel =
+                  currentBid > 0
+                    ? `💰 Dump Now #${item.tokenId} (${currentBid} ETH)`
+                    : `💰 Dump Now #${item.tokenId} (no bid known)`;
                 const inlineKeyboard = canUseCallbacks
                   ? [
                       [
                         {
-                          text: `💰 Liquidate Now #${item.tokenId} (${currentBid > 0 ? `${currentBid} ETH` : "Dump"})`,
+                          text: dumpLabel,
                           callback_data: sellCb,
                         },
                       ],
