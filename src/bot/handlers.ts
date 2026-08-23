@@ -159,8 +159,9 @@ async function showFundMenu(ctx: Context, telegramId: bigint): Promise<void> {
   });
 }
 
-const MAX_ITEMS_PER_WALLET = 15;
-const MAX_SELL_BUTTONS_PER_WALLET = 8;
+// Grouped portfolio view: one line per collection instead of one line per NFT.
+const TOKENS_PER_COLLECTION = 40;
+const MAX_COLLECTION_BUTTONS = 8;
 const MAX_TEXT_LENGTH = 3500;
 
 // Telegram Markdown: escape user-controlled strings (collection names, labels)
@@ -169,6 +170,57 @@ function mdEscape(text: string): string {
   return text
     .replace(/[\r\n]+/g, " ")
     .replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
+interface CollectionGroup {
+  key: string; // `${contractAddress.toLowerCase()}::${name}`
+  contractAddress: string;
+  name: string;
+  items: PortfolioItem[];
+  floorPriceEth: number;
+  openseaUrl: string;
+}
+
+function groupItems(items: PortfolioItem[]): CollectionGroup[] {
+  const byKey = new Map<string, CollectionGroup>();
+  for (const item of items) {
+    const name = (item.collectionName || item.name || "Unknown").trim();
+    const key = `${item.contractAddress.toLowerCase()}::${name}`;
+    let g = byKey.get(key);
+    if (!g) {
+      g = {
+        key,
+        contractAddress: item.contractAddress,
+        name,
+        items: [],
+        floorPriceEth: 0,
+        openseaUrl: item.openseaUrl,
+      };
+      byKey.set(key, g);
+    }
+    g.items.push(item);
+    if (item.floorPriceEth > g.floorPriceEth) g.floorPriceEth = item.floorPriceEth;
+  }
+
+  const groups = [...byKey.values()];
+  for (const g of groups) {
+    g.items.sort((a, b) => {
+      try {
+        const an = BigInt(a.tokenId);
+        const bn = BigInt(b.tokenId);
+        return an < bn ? -1 : an > bn ? 1 : 0;
+      } catch {
+        return a.tokenId.localeCompare(b.tokenId);
+      }
+    });
+  }
+  // Highest floor first, then largest holdings — the collections that matter
+  // most are always at the top of the wallet section.
+  groups.sort((a, b) => {
+    if (b.floorPriceEth !== a.floorPriceEth) return b.floorPriceEth - a.floorPriceEth;
+    return b.items.length - a.items.length;
+  });
+  return groups;
 }
 
 export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<void> {
@@ -216,15 +268,11 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
       continue;
     }
 
-    const shown = portfolio.items.slice(0, MAX_ITEMS_PER_WALLET);
-    lines.push(`👛 **${mdEscape(wallet.label)}** (\`${wallet.address}\`)`);
-    for (const item of shown) {
-      lines.push(
-        `   🖼 #${item.tokenId} — ${mdEscape(item.collectionName || item.name)} (floor ${item.floorPriceEth} ETH)`
-      );
-      // Register the exact item so a later Sell tap resolves instantly and
-      // never fails with "Token not found in your wallets" on a transient API hiccup.
-      setSellTarget(telegramId, item.tokenId, {
+    // Register EVERY item this wallet holds (fetch caps at 100) so any token a
+    // user later taps via a collection button resolves instantly and never
+    // fails with "Token not found in your wallets" on a transient API hiccup.
+    for (const item of portfolio.items) {
+      setSellTarget(telegramId, wallet.id, item.tokenId, {
         walletId: wallet.id,
         contractAddress: item.contractAddress,
         tokenId: item.tokenId,
@@ -234,19 +282,33 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
         topBidEth: item.topBidEth,
       });
     }
-    const extra = portfolio.items.length - shown.length;
-    if (extra > 0) lines.push(`   …and ${extra} more`);
 
+    // Grouped view: one line per collection, token ids inline.
+    const groups = groupItems(portfolio.items);
+    lines.push(`👛 **${mdEscape(wallet.label)}** (\`${wallet.address}\`)`);
+    for (const g of groups) {
+      const shown = g.items.slice(0, TOKENS_PER_COLLECTION);
+      const ids = shown.map((it) => `#${it.tokenId}`).join(", ");
+      const extra = g.items.length - shown.length;
+      const floorLine =
+        g.floorPriceEth > 0 ? ` — floor ${g.floorPriceEth} ETH` : " — no floor data";
+      lines.push(`🖼 ${mdEscape(g.name)}${floorLine}`);
+      lines.push(`   ${ids}${extra > 0 ? ` …(+${extra})` : ""}`);
+    }
+
+    // One sell button per collection (sells that collection's lowest token).
+    // Capped at 8; oversized callbacks fall back to an OpenSea link.
     let buttons = 0;
-    for (const item of shown) {
-      if (buttons >= MAX_SELL_BUTTONS_PER_WALLET) break;
-      const cb = `sell_${item.tokenId}_${wallet.id}`;
+    for (const g of groups) {
+      if (buttons >= MAX_COLLECTION_BUTTONS) break;
+      const firstToken = g.items[0].tokenId;
+      const cb = `sell_${firstToken}_${wallet.id}`;
       if (cb.length <= 64) {
-        kb.text(`💰 Sell #${item.tokenId}`, cb);
+        kb.text(`💰 Sell ${g.name}`, cb);
         hasButtons = true;
         buttons++;
       } else {
-        kb.url(`Sell #${item.tokenId} on OpenSea`, item.openseaUrl);
+        kb.url(`View ${g.name} on OpenSea`, g.openseaUrl);
         hasButtons = true;
         buttons++;
       }
@@ -258,11 +320,11 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
   // comfortably under Telegram's 4096-char hard limit. Dropping whole lines
   // keeps the Markdown balanced so entity parsing can never fail.
   let text = `💼 **Portfolio**\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
-  if (hasButtons) text += `\n\nSell instantly into the top bid with the buttons below.`;
+  if (hasButtons) text += `\n\nSell into the top bid with the buttons below (each sells the lowest token of that collection).`;
   while (text.length > MAX_TEXT_LENGTH && lines.length > 0) {
     lines.pop();
     text = `💼 **Portfolio**\n\n${lines.join("\n")}\n\n**Total floor value: \`${totalValue}\` ETH**`;
-    if (hasButtons) text += `\n\nSell instantly into the top bid with the buttons below.`;
+    if (hasButtons) text += `\n\nSell into the top bid with the buttons below (each sells the lowest token of that collection).`;
   }
 
   if (hasButtons) kb.row();
@@ -328,7 +390,7 @@ async function showHelpText(ctx: Context): Promise<void> {
       `• 🚀 **Manual Mint** — mint a scanned contract\n` +
       `• 👁 **Watchlist** — track contracts\n` +
       `• 🛡 **Settings** — auto-sell, mint qty, gas ceiling\n\n` +
-      `Commands: /whois <addr> · /bypass <addr> · /portfolio`,
+      `Commands: /whois <addr> · /bypass <addr> [--dry|--probe|--schedule] · /portfolio`,
     { reply_markup: backToMainKeyboard(), parse_mode: "Markdown" }
   );
 }
@@ -469,7 +531,6 @@ async function runFund(ctx: Context, telegramId: bigint, amount: number): Promis
   } catch (err) {
     await editOrReply(ctx, `❌ **Funding failed**\n\n${errorMessage(err)}`, {
       reply_markup: backToMainKeyboard(),
-      parse_mode: "Markdown",
     });
   }
 }
@@ -521,10 +582,15 @@ async function runSweepNfts(ctx: Context, telegramId: bigint): Promise<void> {
 // ---------------------------------------------------------------------------
 // Sell flow (callback: sell_<tokenId>_<walletId>)
 // ---------------------------------------------------------------------------
-function parseSellPayload(data: string): { tokenId: string; walletId: string } {
-  const idx = data.lastIndexOf("_");
+// Prefix-aware parse: the old version ran lastIndexOf("_") over the WHOLE
+// callback, so `sell_404_w1` produced tokenId "sell_404" → cache miss →
+// "Token not found in your wallets". Stripping the prefix first fixes it for
+// sell_, confirm_sell_ and cancel_sell_ alike.
+function parseSellPayload(prefix: string, data: string): { tokenId: string; walletId: string } {
+  const rest = data.startsWith(prefix) ? data.slice(prefix.length) : data;
+  const idx = rest.lastIndexOf("_");
   if (idx === -1) return { tokenId: "", walletId: "" };
-  return { tokenId: data.slice(0, idx), walletId: data.slice(idx + 1) };
+  return { tokenId: rest.slice(0, idx), walletId: rest.slice(idx + 1) };
 }
 
 interface SellTarget {
@@ -532,63 +598,65 @@ interface SellTarget {
   item: PortfolioItem;
 }
 
-async function resolveSellTarget(telegramId: bigint, tokenId: string): Promise<SellTarget | null> {
+async function resolveSellTarget(
+  telegramId: bigint,
+  walletId: string,
+  tokenId: string
+): Promise<SellTarget | null> {
   const wallets = await getWallets(telegramId);
+  const wallet = wallets.find((w) => w.id === walletId);
+  if (!wallet) return null;
 
   // 1) Fast path: the portfolio view and floor alerts already registered the
-  //    exact item, so a Sell tap resolves instantly — no live re-fetch that can
-  //    fail with a transient Alchemy error and produce "Token not found".
-  const cached = getSellTarget(telegramId, tokenId);
+  //    exact item for this wallet+token, so a Sell tap resolves instantly —
+  //    no live re-fetch that can fail with a transient Alchemy error and
+  //    produce "Token not found".
+  const cached = getSellTarget(telegramId, walletId, tokenId);
   if (cached) {
-    const wallet = wallets.find((w) => w.id === cached.walletId);
-    if (wallet) {
-      return {
-        wallet,
-        item: {
-          contractAddress: cached.contractAddress,
-          tokenId: cached.tokenId,
-          name: cached.collectionName,
-          collectionName: cached.collectionName,
-          floorPriceEth: cached.floorPriceEth,
-          topBidEth: cached.topBidEth,
-          openseaUrl: cached.openseaUrl,
-        },
-      };
-    }
-    // Wallet was deleted — fall through to a live lookup.
+    return {
+      wallet,
+      item: {
+        contractAddress: cached.contractAddress,
+        tokenId: cached.tokenId,
+        name: cached.collectionName,
+        collectionName: cached.collectionName,
+        floorPriceEth: cached.floorPriceEth,
+        topBidEth: cached.topBidEth,
+        openseaUrl: cached.openseaUrl,
+      },
+    };
   }
 
-  // 2) Live fallback across all wallets (each fetch is time-bounded).
-  for (const wallet of wallets) {
-    try {
-      const portfolio = await fetchWalletPortfolio(wallet.address);
-      const item = portfolio.items.find((i) => i.tokenId === tokenId);
-      if (item) {
-        setSellTarget(telegramId, tokenId, {
-          walletId: wallet.id,
-          contractAddress: item.contractAddress,
-          tokenId: item.tokenId,
-          collectionName: item.collectionName || item.name,
-          openseaUrl: item.openseaUrl,
-          floorPriceEth: item.floorPriceEth,
-          topBidEth: item.topBidEth,
-        });
-        return { wallet, item };
-      }
-    } catch {
-      // try next wallet
+  // 2) Live fallback — restricted to the wallet named in the callback so a
+  //    stale or forged payload can never dump a token from a different wallet.
+  try {
+    const portfolio = await fetchWalletPortfolio(wallet.address);
+    const item = portfolio.items.find((i) => i.tokenId === tokenId);
+    if (item) {
+      setSellTarget(telegramId, walletId, tokenId, {
+        walletId: wallet.id,
+        contractAddress: item.contractAddress,
+        tokenId: item.tokenId,
+        collectionName: item.collectionName || item.name,
+        openseaUrl: item.openseaUrl,
+        floorPriceEth: item.floorPriceEth,
+        topBidEth: item.topBidEth,
+      });
+      return { wallet, item };
     }
+  } catch {
+    // live lookup failed — report not found rather than a cryptic error
   }
   return null;
 }
 
 async function handleSell(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const { tokenId, walletId } = parseSellPayload(data);
+  const { tokenId, walletId } = parseSellPayload("sell_", data);
   if (!tokenId || !walletId) {
     await ctx.answerCallbackQuery({ text: "Invalid sell payload" });
     return;
   }
-  const target = await resolveSellTarget(telegramId, tokenId);
+  const target = await resolveSellTarget(telegramId, walletId, tokenId);
   if (!target) {
     await ctx.answerCallbackQuery({ text: "Token not found in your wallets" });
     return;
@@ -606,7 +674,7 @@ async function handleSell(ctx: Context, telegramId: bigint, data: string): Promi
   const bidLine =
     target.item.topBidEth > 0
       ? `Top bid: \`${target.item.topBidEth}\` ETH`
-      : `Top bid: \`None\` — if there is no live bid, the dump will fail with \"No active bids\".`;
+      : `Top bid: \`None\` — if there is no live bid, the dump will fail with "No active bids".`;
   await editOrReply(
     ctx,
     `💼 **Confirm Sell**\n\nCollection: ${mdEscape(target.item.collectionName || target.item.name)}\nToken: \`#${tokenId}\`\nFloor: \`${target.item.floorPriceEth}\` ETH\n${bidLine}\n\nSell into the top bid (accepting any price)?`,
@@ -615,12 +683,12 @@ async function handleSell(ctx: Context, telegramId: bigint, data: string): Promi
 }
 
 async function handleConfirmSell(ctx: Context, telegramId: bigint, data: string): Promise<void> {
-  const { tokenId, walletId } = parseSellPayload(data);
+  const { tokenId, walletId } = parseSellPayload("confirm_sell_", data);
   if (!tokenId || !walletId) {
     await ctx.answerCallbackQuery({ text: "Invalid sell payload" });
     return;
   }
-  const target = await resolveSellTarget(telegramId, tokenId);
+  const target = await resolveSellTarget(telegramId, walletId, tokenId);
   if (!target) {
     await ctx.answerCallbackQuery({ text: "Token no longer held" });
     return;
@@ -654,7 +722,7 @@ async function handleConfirmSell(ctx: Context, telegramId: bigint, data: string)
 }
 
 async function handleCancelSell(ctx: Context, data: string): Promise<void> {
-  const { tokenId } = parseSellPayload(data);
+  const { tokenId } = parseSellPayload("cancel_sell_", data);
   await ctx.answerCallbackQuery({ text: "Sale cancelled" });
   await editOrReply(ctx, `❌ Sale of #${tokenId} cancelled.`, {
     reply_markup: backToMainKeyboard(),
