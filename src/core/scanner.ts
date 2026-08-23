@@ -10,6 +10,11 @@ import {
 } from "viem";
 import { getPublicClient } from "./chain.js";
 import { auditContractSecurity, type SecurityReport } from "./security.js";
+import {
+  getChainConfig,
+  getDefaultChainId,
+  type ChainId,
+} from "./chains.js";
 
 export interface MintFunctionInfo {
   name: string;
@@ -76,77 +81,66 @@ function explorerBaseUrl(): string {
   if (/basescan\.org/i.test(raw) || (raw.endsWith("/api") && !raw.includes("/v2/"))) {
     return ETHERSCAN_V2;
   }
-  return raw || ETHERSCAN_V2;
+  return raw;
 }
 
-async function fetchJson(url: string, timeoutMs = 12_000): Promise<any> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+async function getBytecode(address: Address, chain: ChainId): Promise<Hex | null> {
   try {
-    const res = await fetch(url, {
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`Non-JSON explorer response (${res.status}): ${text.slice(0, 120)}`);
-    }
-  } finally {
-    clearTimeout(timer);
+    return await getPublicClient(chain).getBytecode({ address });
+  } catch {
+    return null;
   }
 }
 
-async function fetchAbiFromEtherscanV2(
-  address: string
+async function fetchContractAbi(
+  address: Address,
+  chain: ChainId
 ): Promise<{ abi: Abi | null; isVerified: boolean; error?: string }> {
-  const apiKey = explorerApiKey();
+  if (chain !== "base") {
+    return fetchAbiFromBlockscout(address, chain);
+  }
+  // Base — unchanged Etherscan V2 path (honors BASESCAN_API_URL override)
   const baseUrl = explorerBaseUrl();
-  const params = new URLSearchParams({
-    chainid: BASE_CHAIN_ID,
-    module: "contract",
-    action: "getabi",
-    address,
-  });
-  if (apiKey) params.set("apikey", apiKey);
+  const isV2 = baseUrl === ETHERSCAN_V2;
+  const url = isV2
+    ? `${baseUrl}?chainid=${BASE_CHAIN_ID}&module=contract&action=getabi&address=${address}&apikey=${explorerApiKey()}`
+    : `${baseUrl}?module=contract&action=getabi&address=${address}&apikey=${explorerApiKey()}`;
+  return fetchAbiJson(url);
+}
 
+async function fetchAbiFromBlockscout(
+  address: Address,
+  chain: ChainId
+): Promise<{ abi: Abi | null; isVerified: boolean; error?: string }> {
+  const config = getChainConfig(chain);
+  const src = config.abiSource;
+  if (src.type !== "blockscout") {
+    return { abi: null, isVerified: false, error: `No ABI source configured for ${config.name}` };
+  }
+  const url = `${src.apiUrl}?module=contract&action=getabi&address=${address}`;
+  return fetchAbiJson(url);
+}
+
+async function fetchAbiJson(
+  url: string
+): Promise<{ abi: Abi | null; isVerified: boolean; error?: string }> {
   try {
-    const data = await fetchJson(`${baseUrl}?${params.toString()}`);
-    const result = data?.result;
-
-    if (typeof result === "string" && /deprecated\s+v1/i.test(result)) {
-      return {
-        abi: null,
-        isVerified: false,
-        error: "Explorer still on deprecated Basescan V1",
-      };
+    const res = await fetch(url);
+    const json = await res.json();
+    const raw = json?.result;
+    if (
+      (json?.status === "1" || json?.message === "OK") &&
+      typeof raw === "string" &&
+      raw.trim().startsWith("[")
+    ) {
+      try {
+        return { abi: JSON.parse(raw) as Abi, isVerified: true };
+      } catch {
+        return { abi: null, isVerified: false, error: "Explorer returned malformed ABI" };
+      }
     }
-    if (typeof result === "string" && /free api access is not supported/i.test(result)) {
-      return {
-        abi: null,
-        isVerified: false,
-        error: "Etherscan free tier does not cover Base — using Sourcify fallback",
-      };
-    }
-    if (typeof result === "string" && /missing\/invalid api key/i.test(result)) {
-      return {
-        abi: null,
-        isVerified: false,
-        error: "Missing/invalid Etherscan API key",
-      };
-    }
-    if (data?.status === "1" && typeof result === "string" && result.startsWith("[")) {
-      return { abi: JSON.parse(result) as Abi, isVerified: true };
-    }
-    if (typeof result === "string" && /not verified|unverified/i.test(result)) {
-      return { abi: null, isVerified: false };
-    }
-    return {
-      abi: null,
-      isVerified: false,
-      error: typeof result === "string" ? result.slice(0, 160) : data?.message,
-    };
+    const reason = typeof raw === "string" ? raw : (json?.message ?? "unverified");
+    return { abi: null, isVerified: false, error: reason };
   } catch (err) {
     return {
       abi: null,
@@ -156,167 +150,53 @@ async function fetchAbiFromEtherscanV2(
   }
 }
 
-async function fetchAbiFromSourcify(
-  address: string
-): Promise<{ abi: Abi | null; isVerified: boolean }> {
-  const url = `https://sourcify.dev/server/v2/contract/${BASE_CHAIN_ID}/${address}?fields=abi`;
-  try {
-    const data = await fetchJson(url);
-    if (Array.isArray(data?.abi) && data.abi.length > 0) {
-      return { abi: data.abi as Abi, isVerified: true };
+async function verifyIsNftContract(address: Address, abi: Abi, chain: ChainId): Promise<boolean> {
+  const client = getPublicClient(chain);
+  const erc165 = parseAbi([
+    "function supportsInterface(bytes4 interfaceId) view returns (bool)",
+  ] as const);
+  for (const interfaceId of ["0x80ac58cd", "0xd9b67a26"] as const) {
+    try {
+      const ok = await client.readContract({
+        address,
+        abi: erc165,
+        functionName: "supportsInterface",
+        args: [interfaceId as Hex],
+      });
+      if (ok === true) return true;
+    } catch {
+      // contract may not implement ERC-165 — fall through to ABI heuristic
     }
-    return { abi: null, isVerified: false };
-  } catch {
-    return { abi: null, isVerified: false };
   }
-}
-
-export async function fetchContractAbi(
-  address: string
-): Promise<{ abi: Abi | null; isVerified: boolean; error?: string }> {
-  const primary = await fetchAbiFromEtherscanV2(address);
-  if (primary.abi) return primary;
-
-  const sourcify = await fetchAbiFromSourcify(address);
-  if (sourcify.abi) return sourcify;
-
-  return primary;
-}
-
-export async function getBytecode(address: Address): Promise<Hex | null> {
-  const client = getPublicClient();
-  try {
-    const code = await client.getCode({ address });
-    if (!code || code === "0x") return null;
-    return code;
-  } catch (err) {
-    console.error("Error fetching bytecode from RPC:", err);
-    return null;
-  }
-}
-
-function abiHasFn(abi: Abi, names: string[]): boolean {
-  const set = new Set(names.map((n) => n.toLowerCase()));
-  return abi.some(
-    (item: any) => item?.type === "function" && set.has(String(item.name || "").toLowerCase())
+  const fnNames = new Set(
+    (abi as any[]).filter((i) => i.type === "function").map((i) => String(i.name ?? "").toLowerCase())
   );
+  return fnNames.has("ownerof") && (fnNames.has("tokenuri") || fnNames.has("uri"));
 }
 
-/** Hard reject ERC-20 / ERC-4626 / lending mTokens / DEXes */
+// ERC-20 / DeFi contracts should be skipped even if they expose a mint-like function.
 function looksLikeFungibleOrDefi(abi: Abi): boolean {
-  const hasDecimals = abiHasFn(abi, ["decimals"]);
-  const hasTotalSupply = abiHasFn(abi, ["totalSupply"]);
-  const hasTransfer = abiHasFn(abi, ["transfer"]);
-  const hasApprove = abiHasFn(abi, ["approve"]);
-  const hasAllowance = abiHasFn(abi, ["allowance"]);
-  const hasBalanceOf = abiHasFn(abi, ["balanceOf"]);
-  const hasOwnerOf = abiHasFn(abi, ["ownerOf"]);
-  const hasTokenUri = abiHasFn(abi, ["tokenURI", "uri"]);
-  const hasSafeTransferFrom = abiHasFn(abi, ["safeTransferFrom"]);
-
-  // Classic ERC-20 shape without NFT surface
-  if (
-    hasDecimals &&
-    hasTotalSupply &&
-    hasTransfer &&
-    hasApprove &&
-    hasBalanceOf &&
-    !hasOwnerOf &&
-    !hasTokenUri &&
-    !hasSafeTransferFrom
-  ) {
-    return true;
-  }
-
-  // ERC-4626 / compound-style vaults (Moonwell mUSDC etc.)
-  if (abiHasFn(abi, ["asset", "convertToShares", "convertToAssets", "previewDeposit", "previewMint"])) {
-    return true;
-  }
-  if (abiHasFn(abi, ["exchangeRateCurrent", "accrueInterest", "borrowBalanceCurrent", "underlying"])) {
-    return true;
-  }
-
-  // allowance without ownerOf is almost always fungible
-  if (hasAllowance && hasDecimals && !hasOwnerOf && !hasTokenUri) {
-    return true;
-  }
-
-  return false;
-}
-
-export async function verifyIsNftContract(address: Address, abi: Abi): Promise<boolean> {
-  if (looksLikeFungibleOrDefi(abi)) return false;
-
-  const hasNftFns = abi.some((item: any) => {
-    if (item.type !== "function") return false;
-    const name = (item.name?.toLowerCase() || "");
-    return (
-      name === "ownerof" ||
-      name === "tokenuri" ||
-      name === "uri" ||
-      name === "safetransferfrom" ||
-      name === "setapprovalforall"
-    );
-  });
-  if (hasNftFns) return true;
-
-  const client = getPublicClient();
-  try {
-    const supportsErc721 = await client
-      .readContract({
-        address,
-        abi: parseAbi(["function supportsInterface(bytes4 interfaceId) view returns (bool)"]),
-        functionName: "supportsInterface",
-        args: ["0x80ac58cd"],
-      })
-      .catch(() => false);
-
-    const supportsErc1155 = await client
-      .readContract({
-        address,
-        abi: parseAbi(["function supportsInterface(bytes4 interfaceId) view returns (bool)"]),
-        functionName: "supportsInterface",
-        args: ["0xd9b67a26"],
-      })
-      .catch(() => false);
-
-    if (supportsErc721 || supportsErc1155) return true;
-  } catch {
-    // ignore
-  }
-  return false;
-}
-
-function isExecutableMintName(name: string): boolean {
-  if (!/mint|claim|collect/i.test(name)) return false;
-  for (const re of MINT_NAME_BLOCKLIST) {
-    if (re.test(name)) return false;
-  }
-  return true;
+  const fnNames = new Set(
+    (abi as any[]).filter((i) => i.type === "function").map((i) => String(i.name ?? "").toLowerCase())
+  );
+  const erc20Markers = ["transfer", "transferfrom", "approve", "balanceof", "allowance", "totalsupply", "decimals"];
+  const hasErc20 = erc20Markers.some((n) => fnNames.has(n));
+  const hasNft = fnNames.has("ownerof") && (fnNames.has("tokenuri") || fnNames.has("uri"));
+  const defiMarkers = ["deposit", "withdraw", "lend", "borrow", "stake", "swap", "redeem", "farm", "supply"];
+  const hasDefi = [...fnNames].some((n) => defiMarkers.some((d) => n.includes(d)));
+  return (hasErc20 || hasDefi) && !hasNft;
 }
 
 export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
   const functions: MintFunctionInfo[] = [];
-
-  for (const item of abi) {
-    if (item.type !== "function") continue;
-
-    const fn = item as unknown as {
-      name: string;
-      inputs: Array<{ type: string; name: string }>;
-      stateMutability?: string;
-      payable?: boolean;
-    };
-
-    const mut = (fn.stateMutability || (fn.payable ? "payable" : "nonpayable")).toLowerCase();
-    // Never treat view/pure checkers as mint targets
-    if (mut === "view" || mut === "pure") continue;
-    if (!isExecutableMintName(fn.name)) continue;
-
-    const lower = fn.name.toLowerCase();
-    const isPaid =
-      mut === "payable" ||
-      PAID_MINT_PATTERNS.some((p) => lower.includes(p));
+  const items = (abi as any[]).filter((i) => i.type === "function");
+  for (const fn of items) {
+    const name = String(fn.name ?? "");
+    const lower = name.toLowerCase();
+    if (MINT_NAME_BLOCKLIST.some((re) => re.test(name))) continue;
+    if (!/(mint|claim|buy|purchase|airdrop|sale)/i.test(lower)) continue;
+    const mut = fn.stateMutability || "nonpayable";
+    const isPaid = PAID_MINT_PATTERNS.some((p) => lower.includes(p));
 
     try {
       const selector = getFunctionSelector({
@@ -343,7 +223,7 @@ export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
   return functions;
 }
 
-export async function scanContract(rawAddress: string): Promise<ScanResult> {
+export async function scanContract(rawAddress: string, chain: ChainId = getDefaultChainId()): Promise<ScanResult> {
   const cleanInput = rawAddress.trim();
   const hexAddress = cleanInput.startsWith("0x") ? cleanInput : `0x${cleanInput}`;
 
@@ -370,8 +250,8 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
   }
 
   const checksumAddress = getAddress(hexAddress);
-  const bytecode = await getBytecode(checksumAddress);
-  const { abi, isVerified, error: abiError } = await fetchContractAbi(checksumAddress);
+  const bytecode = await getBytecode(checksumAddress, chain);
+  const { abi, isVerified, error: abiError } = await fetchContractAbi(checksumAddress, chain);
 
   if (!bytecode && !abi) {
     return {
@@ -383,7 +263,7 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
       bytecode: null,
       isContract: false,
       security: emptySecurity(["No contract deployed"]),
-      warning: "No contract found at this address on Base.",
+      warning: `No contract found at this address on ${getChainConfig(chain).name}.`,
     };
   }
 
@@ -426,7 +306,7 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
     };
   }
 
-  const isNft = await verifyIsNftContract(checksumAddress, abi);
+  const isNft = await verifyIsNftContract(checksumAddress, abi, chain);
   if (!isNft) {
     return {
       contractAddress: checksumAddress,
@@ -447,7 +327,7 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
     };
   }
 
-  const security = await auditContractSecurity(checksumAddress);
+  const security = await auditContractSecurity(checksumAddress, chain);
   if (!security.isSafe) {
     return {
       contractAddress: checksumAddress,
@@ -498,9 +378,10 @@ export async function scanContract(rawAddress: string): Promise<ScanResult> {
 export async function simulateMint(
   contractAddress: string,
   fromAddress: string,
-  mintFunction: MintFunctionInfo
+  mintFunction: MintFunctionInfo,
+  chain: ChainId = getDefaultChainId()
 ): Promise<{ success: boolean; error?: string }> {
-  const client = getPublicClient();
+  const client = getPublicClient(chain);
   try {
     const abiItem = parseAbi([
       `function ${mintFunction.name}(${mintFunction.args.join(",")})`,
