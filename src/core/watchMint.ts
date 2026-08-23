@@ -236,6 +236,7 @@ async function fireMint(
             data: {
               userId,
               contractAddress,
+              chain,
               txHash: hash,
               status: "success",
             },
@@ -258,6 +259,7 @@ async function fireMint(
           data: {
             userId,
             contractAddress,
+            chain,
             txHash: hash,
             status: "failed",
           },
