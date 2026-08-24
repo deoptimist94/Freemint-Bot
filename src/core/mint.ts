@@ -120,7 +120,7 @@ function mintEventsInReceipt(
       const decoded = decodeEventLog({
         abi: STANDARD_TRANSFER_EVENTS,
         data: log.data,
-        topics: log.topics,
+        topics: log.topics as [Hex, ...Hex[]],
       }) as unknown as { args?: { from?: string; to?: string } };
       const from = (decoded.args?.from ?? "").toLowerCase();
       const to = (decoded.args?.to ?? "").toLowerCase();
