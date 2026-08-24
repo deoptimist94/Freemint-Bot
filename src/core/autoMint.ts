@@ -40,11 +40,18 @@ async function runAutoMintCycle(bot: Bot) {
 
         const result = await batchMint(user.telegramId, item.contractAddress);
 
-        if (result.results.length > 0) {
-          lastMintTime.set(key, now);
+        // Always notify — including the "nothing was sent" case. Previously a
+        // fail-closed batch (0 results) silently produced no message at all.
+        lastMintTime.set(key, now);
 
-          // Send notification to user
-          let message = `⚡ **Auto-Mint Executed**\n\n`;
+        let message: string;
+        if (result.results.length === 0) {
+          message =
+            `⏭️ **Auto-Mint Skipped**\n\n` +
+            `Contract: \`${item.contractAddress}\`\n` +
+            `Reason: ${result.abortReason ?? "no result returned"}`;
+        } else {
+          message = `⚡ **Auto-Mint Executed**\n\n`;
           message += `Contract: \`${item.contractAddress}\`\n`;
           message += `✅ Success: ${result.totalSuccess}\n`;
           message += `❌ Failed: ${result.totalFailed}\n\n`;
@@ -56,15 +63,15 @@ async function runAutoMintCycle(bot: Bot) {
             if (r.error) message += ` — ${r.error}`;
             message += `\n`;
           }
+        }
 
-          try {
-            await bot.api.sendMessage(user.telegramId.toString(), message, {
-              parse_mode: "Markdown",
-              link_preview_options: { is_disabled: true },
-            });
-          } catch (e) {
-            console.error(`Failed to notify user ${user.telegramId}:`, e);
-          }
+        try {
+          await bot.api.sendMessage(user.telegramId.toString(), message, {
+            parse_mode: "Markdown",
+            link_preview_options: { is_disabled: true },
+          });
+        } catch (e) {
+          console.error(`Failed to notify user ${user.telegramId}:`, e);
         }
       }
     } catch (error) {
