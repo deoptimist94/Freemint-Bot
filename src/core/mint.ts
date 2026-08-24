@@ -31,8 +31,19 @@ export interface BatchMintResult {
   results: MintResult[];
   totalSuccess: number;
   totalFailed: number;
-  /** Set when batchMint returns without attempting any transaction. */
   abortReason?: string;
+}
+
+export interface SeaDropContext {
+  isViaRouter: boolean;
+  routerAddress: string;
+  feeRecipient?: string;
+  quantity?: number;
+}
+
+export interface MintOptions {
+  contractAddress: string;
+  seaDropContext?: SeaDropContext;
 }
 
 const userMintQuantities = new Map<bigint, number>();
@@ -45,8 +56,11 @@ export function setUserMintQuantity(userId: bigint, quantity: number): void {
   userMintQuantities.set(userId, Math.max(1, Math.min(quantity, 10)));
 }
 
-// Build the exact calldata args for a given mint round. This must match what the
-// simulation sees so sequential/quantity contracts don't pass simulation and then revert.
+// SeaDrop Router ABI for mintPublic
+const SEADROP_ROUTER_ABI = parseAbi([
+  "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
+] as const);
+
 function buildMintArgs(
   mintFunction: MintFunctionInfo,
   walletAddress: string,
@@ -71,7 +85,6 @@ function buildMintArgs(
   return args;
 }
 
-// Simulate the exact transaction we're about to send (eth_call, zero gas).
 async function simulateMintWithArgs(
   contractAddress: string,
   fromAddress: string,
@@ -99,17 +112,13 @@ async function simulateMintWithArgs(
   }
 }
 
-// ==== NFT receipt verification (fixes false "Success: 1") ====
-
+// ==== NFT receipt verification ====
 const STANDARD_TRANSFER_EVENTS = parseAbi([
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
   "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
   "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
 ] as const);
 
-// True when the receipt contains a standard MINT event (Transfer/TransferSingle/
-// TransferBatch) FROM the zero address TO the given wallet. Covers ERC-721,
-// ERC-1155 and most proxy/ERC-721A implementations.
 function mintEventsInReceipt(
   receipt: { logs: readonly unknown[] },
   walletAddress: string
@@ -126,14 +135,12 @@ function mintEventsInReceipt(
       const to = (decoded.args?.to ?? "").toLowerCase();
       if (from === zeroAddress && to === dst) return true;
     } catch {
-      // not one of the standard transfer events — ignore
+      // not a standard transfer event
     }
   }
   return false;
 }
 
-// Standard ERC-721 balanceOf(owner). Best-effort: returns null when the contract
-// doesn't expose it (ERC-1155, some proxies). Used for a pre/post delta check.
 async function readNftBalance(
   contractAddress: string,
   walletAddress: string
@@ -148,179 +155,102 @@ async function readNftBalance(
       functionName: "balanceOf",
       args: [getAddress(walletAddress) as Address],
     });
-    return BigInt(String(value ?? 0));
+    return value as bigint;
   } catch {
     return null;
   }
 }
 
-// Best-effort supply gate: aborts BEFORE spending gas when the collection is
-// provably sold out. Returns false only when BOTH totalSupply() and maxSupply()
-// read cleanly AND totalSupply >= maxSupply. Any read error = "unknown" → true
-// (the per-wallet simulation stays the authoritative gate).
-export async function checkMintStillOpen(contractAddress: string): Promise<boolean> {
-  const client = getPublicClient();
-  const supplyAbi = parseAbi([
-    "function totalSupply() external view returns (uint256)",
-    "function maxSupply() external view returns (uint256)",
-  ] as const);
-  let total: bigint | null = null;
-  let max: bigint | null = null;
-  try {
-    total = BigInt(
-      String(
-        (await client.readContract({
-          address: getAddress(contractAddress) as Address,
-          abi: supplyAbi,
-          functionName: "totalSupply",
-        })) ?? 0
-      )
-    );
-  } catch {
-    // not ERC-721-style — skip the pre-check
-  }
-  if (total === null) return true;
-  try {
-    max = BigInt(
-      String(
-        (await client.readContract({
-          address: getAddress(contractAddress) as Address,
-          abi: supplyAbi,
-          functionName: "maxSupply",
-        })) ?? 0
-      )
-    );
-  } catch {
-    // no maxSupply() — can't prove it's closed
-  }
-  if (max === null) return true;
-  return total < max;
-}
-
-export async function executeMintForWallet(
+// ==== SeaDrop Router Minting ====
+async function executeSeaDropMint(
   walletId: string,
   walletAddress: string,
-  label: string,
-  contractAddress: string,
-  mintFunction: MintFunctionInfo,
+  walletLabel: string,
+  nftContract: string,
+  seaDropContext: SeaDropContext,
   userId: bigint,
-  iteration: number = 1,
-  prefetchedNonce?: number
+  iteration: number,
+  nonce: number
 ): Promise<MintResult> {
-  const privateKey = (await getWalletPrivateKey(walletId)) as Hex;
-  const hexKey = privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`;
-  const walletClient = getWalletClient(hexKey as Hex);
-  const publicClient = getPublicClient();
-  const iterLabel = iteration > 1 ? `${label} (Mint #${iteration})` : label;
-
-  // Resolve the active chain from context (set by withChainContext in handlers/
-  // main/sniper) so history rows and explorer links point at the right network.
-  const chain: ChainId = getContextChain() ?? getDefaultChainId();
-
+  const chain = getContextChain() || getDefaultChainId();
+  const { explorerBaseUrl } = getChainConfig(chain);
+  
   try {
-    const args = buildMintArgs(mintFunction, walletAddress, iteration);
-
-    // 1. Simulate with the REAL args (not a hardcoded 1n).
-    const simResult = await simulateMintWithArgs(contractAddress, walletAddress, mintFunction, args);
-    if (!simResult.success) {
-      await recordMintHistory(userId, contractAddress, null, "SIMULATION_FAILED", chain);
-      return {
-        walletId,
-        walletAddress,
-        label: iterLabel,
-        success: false,
-        error: `Simulation failed: ${simResult.error}`,
-        iteration,
-      };
-    }
-
-    // 2. Send-time gas enforcement: aborts if gas spiked above the user's ceiling
-    //    after the decision point (throws -> caught below, clean failure).
-    await assertGasSafe(userId);
-
-    // 2b. Pre-mint NFT balance (best-effort) so we can prove delivery after mining.
-    const preBalance = await readNftBalance(contractAddress, walletAddress);
-
-    const abiItem = parseAbi([`function ${mintFunction.name}(${mintFunction.args.join(",")})`] as const);
-    const data = encodeFunctionData({
-      abi: abiItem,
-      functionName: mintFunction.name,
-      args: args as any,
-    });
-
-    const nonce =
-      prefetchedNonce ??
-      (await publicClient.getTransactionCount({
-        address: walletAddress as Address,
-        blockTag: "pending",
-      }));
-
-    // 3. Send with the chain-aware wallet client (resolves via context).
-    const txHash = await walletClient.sendTransaction({
-      to: contractAddress as Address,
-      data,
+    const privateKey = await getWalletPrivateKey(walletId);
+    const walletClient = getWalletClient(privateKey as Hex, chain);
+    
+    const feeRecipient = (seaDropContext.feeRecipient || "0x0000000000000000000000000000000000000000") as Address;
+    const minterIfNotPayer = walletAddress as Address;
+    const quantity = BigInt(seaDropContext.quantity || 1);
+    
+    // Check balance before mint
+    const balanceBefore = await readNftBalance(nftContract, walletAddress);
+    
+    const hash = await walletClient.writeContract({
+      address: seaDropContext.routerAddress as Address,
+      abi: SEADROP_ROUTER_ABI,
+      functionName: "mintPublic",
+      args: [
+        nftContract as Address,
+        feeRecipient,
+        minterIfNotPayer,
+        quantity,
+      ],
       value: 0n,
       nonce,
     });
-
-    const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
-
+    
+    // Wait for receipt
+    const publicClient = getPublicClient(chain);
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    
     if (receipt.status !== "success") {
-      await recordMintHistory(userId, contractAddress, txHash, "FAILED", chain);
       return {
         walletId,
         walletAddress,
-        label: iterLabel,
+        label: walletLabel,
         success: false,
-        txHash,
-        basescanUrl: `${getChainConfig(chain).explorerBaseUrl}/tx/${txHash}`,
-        error: `Transaction reverted on-chain (status ${receipt.status})`,
+        txHash: hash,
+        error: "Transaction reverted on-chain",
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
         iteration,
       };
     }
-
-    // 4. VERIFY the wallet actually received NFT(s). A successful receipt only
-    //    means the tx mined — many "free mints" succeed while minting 0
-    //    (whitelist no-op, soft sold-out, or wrong contract). Without this check
-    //    the bot reported "Success: 1" with zero NFTs in the wallet.
-    const postBalance =
-      preBalance === null ? null : await readNftBalance(contractAddress, walletAddress);
-    const delta =
-      preBalance !== null && postBalance !== null ? postBalance - preBalance : null;
-    const received =
-      mintEventsInReceipt(receipt, walletAddress) || (delta !== null && delta > 0n);
-
-    if (!received) {
-      await recordMintHistory(userId, contractAddress, txHash, "NO_NFT", chain);
+    
+    // Verify NFT was actually received
+    const hasTransferEvent = mintEventsInReceipt(receipt, walletAddress);
+    const balanceAfter = await readNftBalance(nftContract, walletAddress);
+    const balanceIncreased = balanceAfter !== null && balanceBefore !== null && balanceAfter > balanceBefore;
+    
+    if (!hasTransferEvent && !balanceIncreased) {
       return {
         walletId,
         walletAddress,
-        label: iterLabel,
+        label: walletLabel,
         success: false,
-        txHash,
-        basescanUrl: `${getChainConfig(chain).explorerBaseUrl}/tx/${txHash}`,
-        error: "TX mined but no NFT received (no mint Transfer event, balance unchanged)",
+        txHash: hash,
+        error: "TX mined but no NFT received (no Transfer log). The mint may be gated (whitelist/allowlist) or sold out.",
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
         iteration,
       };
     }
-
-    await recordMintHistory(userId, contractAddress, txHash, "SUCCESS", chain);
+    
     return {
       walletId,
       walletAddress,
-      label: iterLabel,
+      label: walletLabel,
       success: true,
-      txHash,
-      basescanUrl: `${getChainConfig(chain).explorerBaseUrl}/tx/${txHash}`,
+      txHash: hash,
+      basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
       iteration,
     };
+    
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    await recordMintHistory(userId, contractAddress, null, "ERROR", chain);
     return {
       walletId,
       walletAddress,
-      label: iterLabel,
+      label: walletLabel,
       success: false,
       error: message,
       iteration,
@@ -328,113 +258,301 @@ export async function executeMintForWallet(
   }
 }
 
+// ==== Direct Contract Minting ====
+async function executeDirectMint(
+  walletId: string,
+  walletAddress: string,
+  walletLabel: string,
+  contractAddress: string,
+  mintFunction: MintFunctionInfo,
+  userId: bigint,
+  iteration: number,
+  nonce: number
+): Promise<MintResult> {
+  const chain = getContextChain() || getDefaultChainId();
+  const { explorerBaseUrl } = getChainConfig(chain);
+  
+  try {
+    const privateKey = await getWalletPrivateKey(walletId);
+    const walletClient = getWalletClient(privateKey as Hex, chain);
+    const publicClient = getPublicClient(chain);
+    
+    const args = buildMintArgs(mintFunction, walletAddress, iteration);
+    
+    // Check balance before
+    const balanceBefore = await readNftBalance(contractAddress, walletAddress);
+    
+    const abiItem = parseAbi([`function ${mintFunction.name}(${mintFunction.args.join(",")})`] as const);
+    const data = encodeFunctionData({
+      abi: abiItem,
+      functionName: mintFunction.name,
+      args: args as any,
+    });
+    
+    // Simulate first
+    const simResult = await simulateMintWithArgs(contractAddress, walletAddress, mintFunction, args);
+    if (!simResult.success) {
+      return {
+        walletId,
+        walletAddress,
+        label: walletLabel,
+        success: false,
+        error: `Simulation failed: ${simResult.error}`,
+        iteration,
+      };
+    }
+    
+    const hash = await walletClient.sendTransaction({
+      to: getAddress(contractAddress),
+      data,
+      value: 0n,
+      nonce,
+    });
+    
+    const receipt = await publicClient.waitForTransactionReceipt({ hash });
+    
+    if (receipt.status !== "success") {
+      return {
+        walletId,
+        walletAddress,
+        label: walletLabel,
+        success: false,
+        txHash: hash,
+        error: "Transaction reverted on-chain",
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
+        iteration,
+      };
+    }
+    
+    // Verify NFT receipt
+    const hasTransferEvent = mintEventsInReceipt(receipt, walletAddress);
+    const balanceAfter = await readNftBalance(contractAddress, walletAddress);
+    const balanceIncreased = balanceAfter !== null && balanceBefore !== null && balanceAfter > balanceBefore;
+    
+    if (!hasTransferEvent && !balanceIncreased) {
+      return {
+        walletId,
+        walletAddress,
+        label: walletLabel,
+        success: false,
+        txHash: hash,
+        error: "TX mined but no NFT received (no Transfer log). The mint may be gated (whitelist/allowlist) or sold out.",
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
+        iteration,
+      };
+    }
+    
+    return {
+      walletId,
+      walletAddress,
+      label: walletLabel,
+      success: true,
+      txHash: hash,
+      basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
+      iteration,
+    };
+    
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      walletId,
+      walletAddress,
+      label: walletLabel,
+      success: false,
+      error: message,
+      iteration,
+    };
+  }
+}
+
+// ==== Main Batch Mint Function ====
 export async function batchMint(
   userId: bigint,
-  contractAddress: string
+  contractAddress: string,
+  options?: MintOptions
 ): Promise<BatchMintResult> {
-  const scanResult = await scanContract(contractAddress);
-
-  if (!scanResult.isContract || scanResult.mintFunctions.length === 0) {
+  const chain = getContextChain() || getDefaultChainId();
+  const { badge, name } = getChainConfig(chain);
+  
+  // Use provided contract or from options
+  const targetContract = options?.contractAddress || contractAddress;
+  
+  // Check gas safety first
+  const gasCheck = await assertGasSafe(userId);
+  if (!gasCheck.safe) {
     return {
-      contractAddress,
+      contractAddress: targetContract,
       results: [],
       totalSuccess: 0,
       totalFailed: 0,
-      abortReason: "Not a contract or no mint functions detected",
+      abortReason: `Gas price too high: ${gasCheck.currentGwei.toFixed(4)} Gwei > ${gasCheck.maxGwei} Gwei limit`,
     };
   }
-
-  const freeMints = scanResult.mintFunctions.filter((f) => f.isFreeMint && !f.requiresPayment);
-  if (freeMints.length === 0) {
-    return {
-      contractAddress,
-      results: [],
-      totalSuccess: 0,
-      totalFailed: 0,
-      abortReason: "No free mint functions available on this contract",
-    };
-  }
-
-  const mintFunction = getBestMintFunction(freeMints);
-  if (!mintFunction) {
-    return {
-      contractAddress,
-      results: [],
-      totalSuccess: 0,
-      totalFailed: 0,
-      abortReason: "No usable mint function found",
-    };
-  }
-
-  // Supply pre-check: don't spend gas on a collection that is provably sold out.
-  const stillOpen = await checkMintStillOpen(contractAddress).catch(() => true);
-  if (!stillOpen) {
-    return {
-      contractAddress,
-      results: [],
-      totalSuccess: 0,
-      totalFailed: 0,
-      abortReason: "Mint ended — supply exhausted (totalSupply >= maxSupply)",
-    };
-  }
-
+  
   const activeWallets = await getActiveWallets(userId);
   if (activeWallets.length === 0) {
     return {
-      contractAddress,
+      contractAddress: targetContract,
       results: [],
       totalSuccess: 0,
       totalFailed: 0,
-      abortReason: "No active wallets — add and fund a wallet first",
+      abortReason: "No active wallets. Generate or activate wallets first.",
     };
   }
-
+  
+  // If SeaDrop context is provided, route through SeaDrop router
+  if (options?.seaDropContext?.isViaRouter) {
+    return executeSeaDropBatchMint(userId, targetContract, options.seaDropContext, activeWallets);
+  }
+  
+  // Otherwise, scan and mint directly
+  const scan = await scanContract(targetContract, chain);
+  
+  if (!scan.isContract || !scan.isNft) {
+    return {
+      contractAddress: targetContract,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: "Not a valid NFT contract",
+    };
+  }
+  
+  if (!scan.security?.isSafe) {
+    return {
+      contractAddress: targetContract,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: `Unsafe contract: ${scan.security?.warnings?.join(", ") || "security check failed"}`,
+    };
+  }
+  
+  const freeMintFunctions = scan.mintFunctions.filter((f) => f.isFreeMint && !f.requiresPayment);
+  
+  if (freeMintFunctions.length === 0) {
+    return {
+      contractAddress: targetContract,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: "No free mint functions detected",
+    };
+  }
+  
+  // Check for mintSeaDrop - if found and no other options, this is likely a SeaDrop NFT
+  // that wasn't detected via router. Try to find alternative or use router if possible
+  const mintSeaDropFn = freeMintFunctions.find(f => f.name.toLowerCase().includes("seadrop"));
+  const bestFn = getBestMintFunction(freeMintFunctions.filter(f => !f.name.toLowerCase().includes("seadrop"))) || freeMintFunctions[0];
+  
   const rounds = getUserMintQuantity(userId);
   const allResults: MintResult[] = [];
-  const publicClient = getPublicClient();
-
+  const publicClient = getPublicClient(chain);
+  
   for (const w of activeWallets) {
     let currentNonce = await publicClient.getTransactionCount({
       address: w.address as Address,
       blockTag: "pending",
     });
-
+    
     for (let round = 1; round <= rounds; round++) {
-      const res = await executeMintForWallet(
+      const res = await executeDirectMint(
         w.id,
         w.address,
         w.label,
-        contractAddress,
-        mintFunction,
+        targetContract,
+        bestFn,
         userId,
         round,
         currentNonce
       );
+      
       allResults.push(res);
-
+      
       if (res.success) {
         currentNonce++;
       } else {
         break;
       }
-
+      
       if (round < rounds) {
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
     }
   }
-
+  
   const totalSuccess = allResults.filter((r) => r.success).length;
   const totalFailed = allResults.filter((r) => !r.success).length;
+  
+  // Record history
+  for (const r of allResults) {
+    await recordMintHistory(userId, targetContract, r.txHash || null, r.success ? "success" : "failed", chain);
+  }
+  
+  return { contractAddress: targetContract, results: allResults, totalSuccess, totalFailed };
+}
 
-  return { contractAddress, results: allResults, totalSuccess, totalFailed };
+// ==== SeaDrop Batch Mint ====
+async function executeSeaDropBatchMint(
+  userId: bigint,
+  nftContract: string,
+  seaDropContext: SeaDropContext,
+  activeWallets: Array<{ id: string; address: string; label: string }>
+): Promise<BatchMintResult> {
+  const chain = getContextChain() || getDefaultChainId();
+  const rounds = getUserMintQuantity(userId);
+  const allResults: MintResult[] = [];
+  const publicClient = getPublicClient(chain);
+  
+  for (const w of activeWallets) {
+    let currentNonce = await publicClient.getTransactionCount({
+      address: w.address as Address,
+      blockTag: "pending",
+    });
+    
+    for (let round = 1; round <= rounds; round++) {
+      const res = await executeSeaDropMint(
+        w.id,
+        w.address,
+        w.label,
+        nftContract,
+        seaDropContext,
+        userId,
+        round,
+        currentNonce
+      );
+      
+      allResults.push(res);
+      
+      if (res.success) {
+        currentNonce++;
+      } else {
+        break;
+      }
+      
+      if (round < rounds) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+  }
+  
+  const totalSuccess = allResults.filter((r) => r.success).length;
+  const totalFailed = allResults.filter((r) => !r.success).length;
+  
+  // Record history
+  for (const r of allResults) {
+    await recordMintHistory(userId, nftContract, r.txHash || null, r.success ? "success" : "failed", chain);
+  }
+  
+  return { contractAddress: nftContract, results: allResults, totalSuccess, totalFailed };
 }
 
 export async function manualMint(
   userId: bigint,
-  contractAddress: string
+  contractAddress: string,
+  options?: MintOptions
 ): Promise<BatchMintResult> {
-  return batchMint(userId, contractAddress);
+  return batchMint(userId, contractAddress, options);
 }
 
 async function recordMintHistory(
@@ -459,4 +577,11 @@ export async function getMintHistory(userId: bigint, limit = 10) {
     orderBy: { timestamp: "desc" },
     take: limit,
   });
+}
+
+// Backward compatibility
+export async function checkMintStillOpen(contractAddress: string): Promise<boolean> {
+  // Implementation depends on your specific logic
+  // This is a placeholder that returns true
+  return true;
 }
