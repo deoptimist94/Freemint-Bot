@@ -13,7 +13,7 @@ import { startFloorWatcher } from "./core/floorWatcher.js";
 import { pollTrackedWalletsForUser } from "./core/sniperEngine.js";
 import { getWallets } from "./core/wallet.js";
 import { getAutoMintStatus } from "./core/watchlist.js";
-import { batchMint } from "./core/mint.js";
+import { batchMint, checkMintStillOpen } from "./core/mint.js";
 import { withChainContext } from "./core/chainContext.js";
 import { type ChainId, getChainConfig } from "./core/chains.js";
 import {
@@ -119,6 +119,17 @@ async function main() {
         return;
       }
 
+      // Extra supply gate: don't even alert when the collection is provably sold out.
+      const stillOpen = await withChainContext(chain, () =>
+        checkMintStillOpen(scan.contractAddress)
+      ).catch(() => true);
+      if (stillOpen === false) {
+        console.log(
+          `⏭ Drop ignored (supply exhausted) [${chain}]: ${drop.contractAddress}`
+        );
+        return;
+      }
+
       const activeUsers = (await (prisma as any).user.findMany({
         include: { wallets: true },
       })) as Array<any>;
@@ -176,9 +187,17 @@ async function main() {
             const result = await withChainContext(chain, () =>
               batchMint(BigInt(user.telegramId), scan.contractAddress)
             );
-            let msg =
-              `⚡ *Auto-Mint (discovery)* — ${badge} ${name}\n\nContract: \`${scan.contractAddress}\`\n` +
-              `✅ ${result.totalSuccess} · ❌ ${result.totalFailed}`;
+            let msg: string;
+            if (result.totalSuccess === 0 && result.abortReason) {
+              msg =
+                `⏭️ *Auto-Mint skipped (discovery)* — ${badge} ${name}\n\n` +
+                `Contract: \`${scan.contractAddress}\`\n` +
+                `Reason: ${result.abortReason}`;
+            } else {
+              msg =
+                `⚡ *Auto-Mint (discovery)* — ${badge} ${name}\n\nContract: \`${scan.contractAddress}\`\n` +
+                `✅ ${result.totalSuccess} · ❌ ${result.totalFailed}`;
+            }
             await bot.api
               .sendMessage(targetChatId, msg, { parse_mode: "Markdown" })
               .catch(() => undefined);
