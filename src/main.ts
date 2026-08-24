@@ -9,6 +9,7 @@ import {
   getBestMintFunction,
   simulateMint,
 } from "./core/scanner.js";
+import { evaluateSpamContract } from "./core/spamFilter.js";
 import { startFloorWatcher } from "./core/floorWatcher.js";
 import { pollTrackedWalletsForUser } from "./core/sniperEngine.js";
 import { getWallets } from "./core/wallet.js";
@@ -69,7 +70,7 @@ async function main() {
     }
   }, 12_000);
 
-  // Auto-discovery pipeline per chain)
+  // Auto-discovery pipeline per chain
   const handleDrop = (chain: ChainId) => async (drop: DropEvent) => {
     const { badge, name, explorerBaseUrl } = getChainConfig(chain);
     try {
@@ -90,6 +91,17 @@ async function main() {
       }
       if (!scan.mintFunctions.length) {
         console.log(`⏭ Drop ignored (no free mint) [${chain}]: ${drop.contractAddress}`);
+        return;
+      }
+
+      // Spam-quality gate — drop UnlimitedMint-style farms, known spam
+      // deployers, and old contracts running a perpetual free mint() BEFORE
+      // any simulation, alert, or auto-mint.
+      const spam = await evaluateSpamContract(scan, chain);
+      if (spam.isSpam) {
+        console.log(
+          `⏭ Drop ignored (spam filter) [${chain}]: ${drop.contractAddress} — ${spam.reason}`
+        );
         return;
       }
 
