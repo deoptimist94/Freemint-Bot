@@ -1,4 +1,12 @@
-import { type Address, type Hex, parseAbi, encodeFunctionData, getAddress } from "viem";
+import {
+  type Address,
+  type Hex,
+  parseAbi,
+  encodeFunctionData,
+  getAddress,
+  decodeEventLog,
+  zeroAddress,
+} from "viem";
 import { prisma } from "../db/client.js";
 import { getPublicClient, getWalletClient } from "./chain.js";
 import { assertGasSafe } from "./gasGuard.js";
@@ -23,6 +31,8 @@ export interface BatchMintResult {
   results: MintResult[];
   totalSuccess: number;
   totalFailed: number;
+  /** Set when batchMint returns without attempting any transaction. */
+  abortReason?: string;
 }
 
 const userMintQuantities = new Map<bigint, number>();
@@ -89,6 +99,104 @@ async function simulateMintWithArgs(
   }
 }
 
+// ==== NFT receipt verification (fixes false "Success: 1") ====
+
+const STANDARD_TRANSFER_EVENTS = parseAbi([
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
+  "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
+  "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
+] as const);
+
+// True when the receipt contains a standard MINT event (Transfer/TransferSingle/
+// TransferBatch) FROM the zero address TO the given wallet. Covers ERC-721,
+// ERC-1155 and most proxy/ERC-721A implementations.
+function mintEventsInReceipt(
+  receipt: { logs: readonly unknown[] },
+  walletAddress: string
+): boolean {
+  const dst = walletAddress.toLowerCase();
+  for (const log of receipt.logs as Array<{ data: Hex; topics: Hex[] }>) {
+    try {
+      const decoded = decodeEventLog({
+        abi: STANDARD_TRANSFER_EVENTS,
+        data: log.data,
+        topics: log.topics,
+      }) as unknown as { args?: { from?: string; to?: string } };
+      const from = (decoded.args?.from ?? "").toLowerCase();
+      const to = (decoded.args?.to ?? "").toLowerCase();
+      if (from === zeroAddress && to === dst) return true;
+    } catch {
+      // not one of the standard transfer events — ignore
+    }
+  }
+  return false;
+}
+
+// Standard ERC-721 balanceOf(owner). Best-effort: returns null when the contract
+// doesn't expose it (ERC-1155, some proxies). Used for a pre/post delta check.
+async function readNftBalance(
+  contractAddress: string,
+  walletAddress: string
+): Promise<bigint | null> {
+  const client = getPublicClient();
+  try {
+    const value = await client.readContract({
+      address: getAddress(contractAddress) as Address,
+      abi: parseAbi([
+        "function balanceOf(address owner) external view returns (uint256)",
+      ] as const),
+      functionName: "balanceOf",
+      args: [getAddress(walletAddress) as Address],
+    });
+    return BigInt(String(value ?? 0));
+  } catch {
+    return null;
+  }
+}
+
+// Best-effort supply gate: aborts BEFORE spending gas when the collection is
+// provably sold out. Returns false only when BOTH totalSupply() and maxSupply()
+// read cleanly AND totalSupply >= maxSupply. Any read error = "unknown" → true
+// (the per-wallet simulation stays the authoritative gate).
+export async function checkMintStillOpen(contractAddress: string): Promise<boolean> {
+  const client = getPublicClient();
+  const supplyAbi = parseAbi([
+    "function totalSupply() external view returns (uint256)",
+    "function maxSupply() external view returns (uint256)",
+  ] as const);
+  let total: bigint | null = null;
+  let max: bigint | null = null;
+  try {
+    total = BigInt(
+      String(
+        (await client.readContract({
+          address: getAddress(contractAddress) as Address,
+          abi: supplyAbi,
+          functionName: "totalSupply",
+        })) ?? 0
+      )
+    );
+  } catch {
+    // not ERC-721-style — skip the pre-check
+  }
+  if (total === null) return true;
+  try {
+    max = BigInt(
+      String(
+        (await client.readContract({
+          address: getAddress(contractAddress) as Address,
+          abi: supplyAbi,
+          functionName: "maxSupply",
+        })) ?? 0
+      )
+    );
+  } catch {
+    // no maxSupply() — can't prove it's closed
+  }
+  if (max === null) return true;
+  return total < max;
+}
+
 export async function executeMintForWallet(
   walletId: string,
   walletAddress: string,
@@ -130,6 +238,9 @@ export async function executeMintForWallet(
     //    after the decision point (throws -> caught below, clean failure).
     await assertGasSafe(userId);
 
+    // 2b. Pre-mint NFT balance (best-effort) so we can prove delivery after mining.
+    const preBalance = await readNftBalance(contractAddress, walletAddress);
+
     const abiItem = parseAbi([`function ${mintFunction.name}(${mintFunction.args.join(",")})`] as const);
     const data = encodeFunctionData({
       abi: abiItem,
@@ -154,17 +265,53 @@ export async function executeMintForWallet(
 
     const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
 
-    const status = receipt.status === "success" ? "SUCCESS" : "FAILED";
-    await recordMintHistory(userId, contractAddress, txHash, status, chain);
+    if (receipt.status !== "success") {
+      await recordMintHistory(userId, contractAddress, txHash, "FAILED", chain);
+      return {
+        walletId,
+        walletAddress,
+        label: iterLabel,
+        success: false,
+        txHash,
+        basescanUrl: `${getChainConfig(chain).explorerBaseUrl}/tx/${txHash}`,
+        error: `Transaction reverted on-chain (status ${receipt.status})`,
+        iteration,
+      };
+    }
 
+    // 4. VERIFY the wallet actually received NFT(s). A successful receipt only
+    //    means the tx mined — many "free mints" succeed while minting 0
+    //    (whitelist no-op, soft sold-out, or wrong contract). Without this check
+    //    the bot reported "Success: 1" with zero NFTs in the wallet.
+    const postBalance =
+      preBalance === null ? null : await readNftBalance(contractAddress, walletAddress);
+    const delta =
+      preBalance !== null && postBalance !== null ? postBalance - preBalance : null;
+    const received =
+      mintEventsInReceipt(receipt, walletAddress) || (delta !== null && delta > 0n);
+
+    if (!received) {
+      await recordMintHistory(userId, contractAddress, txHash, "NO_NFT", chain);
+      return {
+        walletId,
+        walletAddress,
+        label: iterLabel,
+        success: false,
+        txHash,
+        basescanUrl: `${getChainConfig(chain).explorerBaseUrl}/tx/${txHash}`,
+        error: "TX mined but no NFT received (no mint Transfer event, balance unchanged)",
+        iteration,
+      };
+    }
+
+    await recordMintHistory(userId, contractAddress, txHash, "SUCCESS", chain);
     return {
       walletId,
       walletAddress,
       label: iterLabel,
-      success: receipt.status === "success",
+      success: true,
       txHash,
       basescanUrl: `${getChainConfig(chain).explorerBaseUrl}/tx/${txHash}`,
-      error: receipt.status !== "success" ? "Transaction reverted on-chain" : undefined,
       iteration,
     };
   } catch (error) {
@@ -188,22 +335,58 @@ export async function batchMint(
   const scanResult = await scanContract(contractAddress);
 
   if (!scanResult.isContract || scanResult.mintFunctions.length === 0) {
-    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
+    return {
+      contractAddress,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: "Not a contract or no mint functions detected",
+    };
   }
 
   const freeMints = scanResult.mintFunctions.filter((f) => f.isFreeMint && !f.requiresPayment);
   if (freeMints.length === 0) {
-    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
+    return {
+      contractAddress,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: "No free mint functions available on this contract",
+    };
   }
 
   const mintFunction = getBestMintFunction(freeMints);
   if (!mintFunction) {
-    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
+    return {
+      contractAddress,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: "No usable mint function found",
+    };
+  }
+
+  // Supply pre-check: don't spend gas on a collection that is provably sold out.
+  const stillOpen = await checkMintStillOpen(contractAddress).catch(() => true);
+  if (!stillOpen) {
+    return {
+      contractAddress,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: "Mint ended — supply exhausted (totalSupply >= maxSupply)",
+    };
   }
 
   const activeWallets = await getActiveWallets(userId);
   if (activeWallets.length === 0) {
-    return { contractAddress, results: [], totalSuccess: 0, totalFailed: 0 };
+    return {
+      contractAddress,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: "No active wallets — add and fund a wallet first",
+    };
   }
 
   const rounds = getUserMintQuantity(userId);
