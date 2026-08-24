@@ -520,4 +520,54 @@ async function executeSeaDropBatchMint(
       }
       
       if (round < rounds) {
-        await new Promise((resolve)
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+  }
+  
+  const totalSuccess = allResults.filter((r) => r.success).length;
+  const totalFailed = allResults.filter((r) => !r.success).length;
+  
+  for (const r of allResults) {
+    await recordMintHistory(userId, nftContract, r.txHash || null, r.success ? "success" : "failed", chain);
+  }
+  
+  return { contractAddress: nftContract, results: allResults, totalSuccess, totalFailed };
+}
+
+export async function manualMint(
+  userId: bigint,
+  contractAddress: string,
+  options?: MintOptions
+): Promise<BatchMintResult> {
+  return batchMint(userId, contractAddress, options);
+}
+
+async function recordMintHistory(
+  userId: bigint,
+  contractAddress: string,
+  txHash: string | null,
+  status: string,
+  chain: ChainId
+): Promise<void> {
+  try {
+    await prisma.mintHistory.create({
+      data: { userId, contractAddress, txHash, status, chain },
+    });
+  } catch (err) {
+    console.error("Failed to record mint history:", err);
+  }
+}
+
+export async function getMintHistory(userId: bigint, limit = 10) {
+  return prisma.mintHistory.findMany({
+    where: { userId },
+    orderBy: { timestamp: "desc" },
+    take: limit,
+  });
+}
+
+// Backward compatibility
+export async function checkMintStillOpen(contractAddress: string): Promise<boolean> {
+  return true;
+}
