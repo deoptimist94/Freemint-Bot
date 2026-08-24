@@ -35,6 +35,7 @@ export interface ScanResult {
   isContract: boolean;
   security: SecurityReport;
   warning?: string;
+  isSeaDrop?: boolean; // NEW: Flag for SeaDrop contracts
 }
 
 type AbiInput = { type: string; name?: string };
@@ -81,6 +82,7 @@ const MINT_NAME_BLOCKLIST = [
   /adminmint/,
   /teamMint/i,
   /^mintTo$/i,
+  /^mintSeaDrop$/i, // NEW: Block mintSeaDrop for direct minting
 ];
 
 const ETHERSCAN_V2 = "https://api.etherscan.io/v2/api";
@@ -120,7 +122,7 @@ async function fetchContractAbi(
   chain: ChainId
 ): Promise<{ abi: Abi | null; isVerified: boolean; error?: string }> {
   const cfg = getChainConfig(chain);
-
+  
   // Robinhood / non-Base: Blockscout-style explorer when configured
   if (chain !== "base" && cfg.explorerApiUrl) {
     try {
@@ -154,7 +156,7 @@ async function fetchContractAbi(
       };
     }
   }
-
+  
   // Base: Etherscan V2 (or BASESCAN_API_URL override)
   try {
     const key = explorerApiKey();
@@ -167,12 +169,10 @@ async function fetchContractAbi(
     });
     if (isV2) qs.set("chainid", BASE_CHAIN_ID);
     if (key) qs.set("apikey", key);
-
     const url = `${base}?${qs.toString()}`;
     const res = await fetch(url);
     const json = (await res.json()) as ExplorerJson;
     const raw = json?.result;
-
     if (
       (json?.status === "1" || json?.message === "OK") &&
       typeof raw === "string" &&
@@ -188,7 +188,6 @@ async function fetchContractAbi(
         };
       }
     }
-
     const reason =
       typeof raw === "string" ? raw : (json?.message ?? "unverified");
     return { abi: null, isVerified: false, error: String(reason) };
@@ -210,7 +209,6 @@ async function verifyIsNftContract(
   const erc165 = parseAbi([
     "function supportsInterface(bytes4 interfaceId) view returns (bool)",
   ] as const);
-
   for (const interfaceId of ["0x80ac58cd", "0xd9b67a26"] as const) {
     try {
       const ok = await client.readContract({
@@ -224,7 +222,6 @@ async function verifyIsNftContract(
       // fall through to ABI heuristic
     }
   }
-
   const fnNames = new Set(
     (abi as AbiFn[])
       .filter((i) => i.type === "function")
@@ -272,23 +269,36 @@ function looksLikeFungibleOrDefi(abi: Abi): boolean {
   return (hasErc20 || hasDefi) && !hasNft;
 }
 
+// NEW: Detect SeaDrop contracts
+export function isSeaDropContract(abi: Abi | null): boolean {
+  if (!abi || !Array.isArray(abi)) return false;
+  const fnNames = abi
+    .filter((i: any) => i.type === "function")
+    .map((i: any) => String(i.name || "").toLowerCase());
+  
+  // SeaDrop NFTs typically have these functions
+  return fnNames.includes("mintseadrop") && fnNames.includes("getseadroplaunchpad");
+}
+
 export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
   const functions: MintFunctionInfo[] = [];
   const items = (abi as AbiFn[]).filter((i) => i.type === "function");
-
+  
   for (const fn of items) {
-    const name = String(fn.name ?? "");
+    const name = String(fn.name || "");
     const lower = name.toLowerCase();
+    
     if (MINT_NAME_BLOCKLIST.some((re) => re.test(name))) continue;
     if (!/(mint|claim|buy|purchase|airdrop|sale)/i.test(lower)) continue;
-
+    
     const mut = fn.stateMutability || "nonpayable";
     const isPaid =
       PAID_MINT_PATTERNS.some((p) => lower.includes(p)) ||
       mut === "payable" ||
       fn.payable === true;
+    
     const inputs: AbiInput[] = Array.isArray(fn.inputs) ? fn.inputs : [];
-
+    
     try {
       const selector = getFunctionSelector({
         name: fn.name,
@@ -300,7 +310,7 @@ export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
         outputs: [],
         stateMutability: fn.stateMutability || "nonpayable",
       } as any);
-
+      
       functions.push({
         name: name,
         selector,
@@ -313,7 +323,7 @@ export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
       // skip non-standard ABI entries
     }
   }
-
+  
   return functions;
 }
 
@@ -325,7 +335,7 @@ export async function scanContract(
   const hexAddress = cleanInput.startsWith("0x")
     ? cleanInput
     : `0x${cleanInput}`;
-
+  
   const emptySecurity = (
     warnings: string[],
     risk = 100
@@ -336,7 +346,7 @@ export async function scanContract(
     riskScore: risk,
     warnings,
   });
-
+  
   if (!isAddress(hexAddress)) {
     return {
       contractAddress: hexAddress,
@@ -350,14 +360,14 @@ export async function scanContract(
       warning: "Invalid Ethereum contract address format.",
     };
   }
-
+  
   const checksumAddress = getAddress(hexAddress);
   const bytecode = await getBytecode(checksumAddress, chain);
   const { abi, isVerified, error: abiError } = await fetchContractAbi(
     checksumAddress,
     chain
   );
-
+  
   if (!bytecode && !abi) {
     return {
       contractAddress: checksumAddress,
@@ -371,7 +381,7 @@ export async function scanContract(
       warning: `No contract found at this address on ${getChainConfig(chain).name}.`,
     };
   }
-
+  
   if (!isVerified || !abi) {
     return {
       contractAddress: checksumAddress,
@@ -390,7 +400,10 @@ export async function scanContract(
         : "Skipped: Contract source code is unverified.",
     };
   }
-
+  
+  // NEW: Check if this is a SeaDrop contract
+  const isSeaDrop = isSeaDropContract(abi);
+  
   if (looksLikeFungibleOrDefi(abi)) {
     return {
       contractAddress: checksumAddress,
@@ -411,8 +424,9 @@ export async function scanContract(
         "Skipped: ERC-20 / lending / vault token — not an NFT free mint.",
     };
   }
-
+  
   const isNft = await verifyIsNftContract(checksumAddress, abi, chain);
+  
   if (!isNft) {
     return {
       contractAddress: checksumAddress,
@@ -432,8 +446,9 @@ export async function scanContract(
       warning: "Skipped: Contract is not an ERC-721/1155 NFT collection.",
     };
   }
-
+  
   const security = await auditContractSecurity(checksumAddress, chain);
+  
   if (!security.isSafe) {
     return {
       contractAddress: checksumAddress,
@@ -447,13 +462,29 @@ export async function scanContract(
       warning: `🚨 UNSAFE CONTRACT: ${security.warnings.join(", ")}`,
     };
   }
-
+  
   const mintFunctions = analyzeAbiForMintFunctions(abi);
   const freeMintFunctions = mintFunctions.filter(
     (f) => f.isFreeMint && !f.requiresPayment
   );
-
+  
   if (freeMintFunctions.length === 0) {
+    // Check if this is a SeaDrop contract with no alternative mint functions
+    if (isSeaDrop) {
+      return {
+        contractAddress: checksumAddress,
+        mintFunctions: [], // Empty because mintSeaDrop is blocked
+        isVerified,
+        isNft: true,
+        abi,
+        bytecode,
+        isContract: true,
+        security,
+        isSeaDrop: true,
+        warning: "SeaDrop contract detected. Use SeaDrop router for minting (mintSeaDrop is not a direct mint function).",
+      };
+    }
+    
     return {
       contractAddress: checksumAddress,
       mintFunctions: mintFunctions.filter((f) => f.requiresPayment),
@@ -469,7 +500,7 @@ export async function scanContract(
           : "Skipped: No valid free-mint function detected.",
     };
   }
-
+  
   return {
     contractAddress: checksumAddress,
     mintFunctions: freeMintFunctions,
@@ -479,7 +510,10 @@ export async function scanContract(
     bytecode,
     isContract: true,
     security,
-    warning: undefined,
+    isSeaDrop,
+    warning: isSeaDrop 
+      ? "SeaDrop contract detected. Free mint functions available (non-SeaDrop)."
+      : undefined,
   };
 }
 
