@@ -1,9 +1,9 @@
 /**
- * Freemint Bot - Professional Detection Engine
- * Equal Access for All Users
+ * Freemint Bot - Professional Edition
  */
 
 import "dotenv/config";
+import { Bot } from "grammy";
 import { createBot } from "./bot/index.js";
 import { startHealthServer } from "./server/health.js";
 import { startAutoMintLoop } from "./core/autoMint.js";
@@ -19,7 +19,7 @@ import { startFloorWatcher } from "./core/floorWatcher.js";
 import { pollTrackedWalletsForUser } from "./core/sniperEngine.js";
 import { getWallets } from "./core/wallet.js";
 import { getAutoMintStatus } from "./core/watchlist.js";
-import { batchMint, checkMintStillOpen } from "./core/mint.js";
+import { batchMint } from "./core/mint.js";
 import { withChainContext } from "./core/chainContext.js";
 import { type ChainId, getChainConfig } from "./core/chains.js";
 import {
@@ -27,63 +27,55 @@ import {
   getUserChainSelection,
 } from "./core/userChain.js";
 import { MempoolMonitor, type MempoolMint } from "./core/mempoolSniper.js";
-import { getRPCPool, getRPCStats, dedupRPCRequest } from "./core/rpcPool.js";
+import { getRPCPool, getRPCStats } from "./core/rpcPool.js";
 import { mintQueue, discoveryQueue } from "./core/queue.js";
+import { fetchCollectionFloor } from "./core/autoLister.js";
 
 const monitors: Map<ChainId, MempoolMonitor> = new Map();
-const listeners: Map<ChainId, DropListener> = new Map();
-
-// Track processed discoveries to prevent duplicates
-const processedDiscoveries = new Map<string, number>();
-const DISCOVERY_DEDUP_TTL = 60000; // 60 seconds
+let bot: Bot;
 
 async function main() {
-  console.log("╔════════════════════════════════════════════════╗");
-  console.log("║     Freemint Bot - Detection Engine v2.0       ║");
-  console.log("║        Equal Access • Maximum Speed              ║");
-  console.log("╚════════════════════════════════════════════════╝");
+  console.log("Starting Freemint Bot Professional Edition");
 
   const required = ["BOT_TOKEN", "ENCRYPTION_KEY", "DATABASE_URL"];
   const missing = required.filter(key => !process.env[key]);
   
   if (missing.length > 0) {
-    console.error(`❌ Missing required: ${missing.join(", ")}`);
+    console.error(`Missing required environment variables: ${missing.join(", ")}`);
     process.exit(1);
   }
 
-  // Validate Alchemy configuration
   const hasBaseAlchemy = !!process.env.ALCHEMY_BASE_API_KEY;
   const hasRobinhoodAlchemy = !!process.env.ALCHEMY_ROBINHOOD_API_KEY;
   
-  console.log("🔑 RPC Configuration:");
-  console.log(`   Base: ${hasBaseAlchemy ? "✅ Alchemy" : "❌ Missing"}`);
-  console.log(`   Robinhood: ${hasRobinhoodAlchemy ? "✅ Alchemy" : "❌ Missing"}`);
+  console.log(`RPC Providers:`);
+  console.log(`  Base: ${hasBaseAlchemy ? "Alchemy OK" : "MISSING"}`);
+  console.log(`  Robinhood: ${hasRobinhoodAlchemy ? "Alchemy OK" : "MISSING"}`);
 
-  if (!hasBaseAlchemy || !hasRobinhoodAlchemy) {
-    console.error("❌ Both ALCHEMY_BASE_API_KEY and ALCHEMY_ROBINHOOD_API_KEY are required!");
+  if (!hasBaseAlchemy) {
+    console.error("ALCHEMY_BASE_API_KEY is required!");
     process.exit(1);
   }
 
   try {
     await prisma.$connect();
-    console.log("✅ Database connected");
+    console.log("Database connected");
   } catch (error) {
-    console.error("❌ Database connection failed:", error);
+    console.error("Database connection failed:", error);
     process.exit(1);
   }
 
-  // Initialize RPC pools
-  console.log("🌐 Initializing RPC pools...");
+  console.log("Initializing RPC pools");
   getRPCPool("base");
-  getRPCPool("robinhood");
+  if (hasRobinhoodAlchemy) getRPCPool("robinhood");
 
-  // Register queue handlers
-  console.log("📋 Registering queue handlers...");
+  console.log("Registering queue handlers");
   
   mintQueue.process(async (job) => {
     const { userId, contractAddress, options } = job.data;
-    console.log(`🔄 Mint job ${job.id} for user ${userId}`);
-    return batchMint(BigInt(userId), contractAddress, options);
+    console.log(`Processing mint job ${job.id} for user ${userId}`);
+    const result = await batchMint(BigInt(userId), contractAddress, options);
+    return result;
   });
 
   discoveryQueue.process(async (job) => {
@@ -91,40 +83,37 @@ async function main() {
     try {
       await processDiscovery(contractAddress, chain, detectedAt, txHash);
     } catch (error) {
-      console.error(`Discovery failed for ${contractAddress}:`, error);
+      console.error(`Discovery processing failed for ${contractAddress}:`, error);
       throw error;
     }
   });
 
-  // Start bot and services
-  const bot = createBot();
+  bot = createBot();
   startHealthServer(bot);
   startAutoMintLoop(bot);
   startFloorWatcher(bot, 300);
 
-  // Start mempool monitors (both chains)
-  console.log("🔍 Starting mempool monitors...");
+  console.log("Starting mempool monitors");
   
   const baseMempool = new MempoolMonitor("base", handleMempoolMint("base"));
   baseMempool.start();
   monitors.set("base", baseMempool);
 
-  const robinhoodMempool = new MempoolMonitor("robinhood", handleMempoolMint("robinhood"));
-  robinhoodMempool.start();
-  monitors.set("robinhood", robinhoodMempool);
+  if (hasRobinhoodAlchemy) {
+    const robinhoodMempool = new MempoolMonitor("robinhood", handleMempoolMint("robinhood"));
+    robinhoodMempool.start();
+    monitors.set("robinhood", robinhoodMempool);
+  }
 
-  // Start block listeners (backup detection)
-  console.log("📡 Starting block listeners...");
-  
-  const baseListener = new DropListener("base", handleDrop("base"));
-  baseListener.start();
-  listeners.set("base", baseListener);
+  const dropListener = new DropListener("base", handleDrop("base"));
+  dropListener.start();
 
-  const robinhoodListener = new DropListener("robinhood", handleDrop("robinhood"));
-  robinhoodListener.start();
-  listeners.set("robinhood", robinhoodListener);
+  let robinhoodListener: DropListener | null = null;
+  if (hasRobinhoodAlchemy) {
+    robinhoodListener = new DropListener("robinhood", handleDrop("robinhood"));
+    robinhoodListener.start();
+  }
 
-  // Copy-trade scheduler
   setInterval(async () => {
     try {
       const configs = await prisma.sniperConfig.findMany({
@@ -135,79 +124,51 @@ async function main() {
         await queueTrackedWalletPoll(cfg.userId);
       }
     } catch (err) {
-      console.error("Copy-trade scheduler error:", err);
+      console.error("Error in copy-trade scheduler:", err);
     }
   }, 15000);
 
-  // RPC stats logging
   setInterval(() => {
-    console.log("📊 RPC Stats:");
-    console.log("   Base:", getRPCStats("base"));
-    console.log("   Robinhood:", getRPCStats("robinhood"));
-  }, 300000);
-
-  // Cleanup old discoveries
-  setInterval(() => {
-    const now = Date.now();
-    let cleaned = 0;
-    for (const [key, timestamp] of processedDiscoveries) {
-      if (now - timestamp > DISCOVERY_DEDUP_TTL * 2) {
-        processedDiscoveries.delete(key);
-        cleaned++;
-      }
-    }
-    if (cleaned > 0) {
-      console.log(`🧹 Cleaned ${cleaned} old discovery entries`);
+    console.log("RPC Pool Stats:");
+    console.log("Base:", getRPCStats("base"));
+    if (hasRobinhoodAlchemy) {
+      console.log("Robinhood:", getRPCStats("robinhood"));
     }
   }, 300000);
 
-  // Graceful shutdown
   const handleShutdown = async (signal: string) => {
-    console.log(`\n🛑 Shutting down (${signal})...`);
+    console.log(`Shutting down (${signal})`);
     
     monitors.forEach(m => m.stop());
-    listeners.forEach(l => l.stop());
+    dropListener.stop();
+    robinhoodListener?.stop();
     
     await mintQueue.close();
     await discoveryQueue.close();
     
     await bot.stop();
     await prisma.$disconnect();
-    
-    console.log("✅ Shutdown complete");
     process.exit(0);
   };
 
   process.on("SIGINT", () => handleShutdown("SIGINT"));
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
 
-  // Start bot
   try {
     await bot.start({
       onStart: (botInfo) => {
-        console.log(`🤖 Bot started: @${botInfo.username}`);
-        console.log("✅ System ready - Detection engine active");
+        console.log(`Bot started: @${botInfo.username}`);
       },
     });
   } catch (error) {
-    console.error("❌ Failed to start bot:", error);
+    console.error("Failed to start bot:", error);
     process.exit(1);
   }
 }
 
-// Mempool detection handler
 function handleMempoolMint(chain: ChainId) {
   return async (mint: MempoolMint) => {
-    const dedupKey = `${chain}:${mint.contractAddress.toLowerCase()}`;
-    
-    // Skip if already processing
-    if (processedDiscoveries.has(dedupKey)) {
-      return;
-    }
-    processedDiscoveries.set(dedupKey, Date.now());
-
     try {
-      // Check if already in database (recent)
       const existing = await prisma.mintHistory.findFirst({
         where: { 
           contractAddress: mint.contractAddress,
@@ -218,19 +179,16 @@ function handleMempoolMint(chain: ChainId) {
       
       if (existing) return;
 
-      console.log(`🎯 [${chain}] Mempool: ${mint.contractAddress}`);
+      console.log(`Mempool mint detected: ${mint.contractAddress} on ${chain}`);
 
-      // Add to discovery queue with high priority
       await discoveryQueue.add({
         contractAddress: mint.contractAddress,
         chain,
         detectedAt: mint.detectedAt,
         txHash: mint.txHash,
-        source: "mempool",
       }, {
-        priority: 1, // Highest priority
-        delay: 0,    // No delay
-        attempts: 3,
+        priority: 1,
+        delay: 100,
       });
 
     } catch (err) {
@@ -239,17 +197,8 @@ function handleMempoolMint(chain: ChainId) {
   };
 }
 
-// Block detection handler (backup)
 function handleDrop(chain: ChainId) {
   return async (drop: { contractAddress: string; selector: string; txHash: string }) => {
-    const dedupKey = `${chain}:${drop.contractAddress.toLowerCase()}`;
-    
-    // Skip if mempool already caught it
-    if (processedDiscoveries.has(dedupKey)) {
-      return;
-    }
-    processedDiscoveries.set(dedupKey, Date.now());
-
     try {
       const existing = await prisma.mintHistory.findFirst({
         where: { 
@@ -259,151 +208,29 @@ function handleDrop(chain: ChainId) {
         }
       });
       
-      if (existing) return;
+      if (existing) {
+        console.log(`Drop already processed: ${drop.contractAddress}`);
+        return;
+      }
 
-      console.log(`📦 [${chain}] Block: ${drop.contractAddress}`);
-
+      console.log(`Block drop detected: ${drop.contractAddress} on ${chain}`);
+      
       await discoveryQueue.add({
         contractAddress: drop.contractAddress,
         chain,
         detectedAt: Date.now(),
         txHash: drop.txHash,
-        source: "block",
       }, {
-        priority: 5, // Lower priority than mempool
-        delay: 0,
-        attempts: 3,
+        priority: 5,
+        delay: 500,
       });
 
     } catch (err) {
-      console.error(`Block handler error (${chain}):`, err);
+      console.error(`Block drop handler error (${chain}):`, err);
     }
   };
 }
 
-// Discovery processor - scans and notifies ALL users
-async function processDiscovery(
-  contractAddress: string,
-  chain: ChainId,
-  detectedAt: number,
-  txHash?: string
-): Promise<void> {
-  const startTime = Date.now();
-  const config = getChainConfig(chain);
-  
-  console.log(`🔬 [${chain}] Scanning: ${contractAddress}`);
-
-  // Scan contract (with deduplication)
-  const scan = await withChainContext(chain, () =>
-    dedupRPCRequest(chain, `scan:${contractAddress}`, () => scanContract(contractAddress))
-  );
-
-  if (!scan.isContract || !scan.isNft) {
-    console.log(`   ❌ Not an NFT contract`);
-    return;
-  }
-  
-  if (!scan.security?.isSafe) {
-    console.log(`   ⚠️ Unsafe contract (score: ${scan.security?.score})`);
-    return;
-  }
-  
-  if (!scan.mintFunctions.length) {
-    console.log(`   ❌ No mint functions found`);
-    return;
-  }
-
-  // Spam filter
-  const spam = await evaluateSpamContract(scan, chain);
-  if (spam.isSpam) {
-    console.log(`   🚫 Spam filtered`);
-    return;
-  }
-
-  // Get best mint function
-  const bestMintFn = getBestMintFunction(scan.mintFunctions) || scan.mintFunctions[0];
-
-  // Simulate mint (probe wallet)
-  const probeWallets = await getWallets(0n).catch(() => [] as any);
-  const probeFrom = probeWallets[0]?.address || "0x0000000000000000000000000000000000000001";
-
-  const sim = await withChainContext(chain, () =>
-    dedupRPCRequest(chain, `simulate:${contractAddress}`, () => 
-      simulateMint(scan.contractAddress, probeFrom, bestMintFn)
-    )
-  );
-  
-  if (!sim.success) {
-    console.log(`   ❌ Simulation failed: ${sim.error}`);
-    return;
-  }
-
-  console.log(`   ✅ Valid free mint detected!`);
-
-  // Get floor data for context
-  const floorData = await fetchCollectionFloor(contractAddress, undefined, chain)
-    .catch(() => ({ floorPriceEth: 0, topBidEth: 0, collectionName: "Unknown" }));
-
-  // Get ALL users with wallets (equal access)
-  const activeUsers = await prisma.user.findMany({
-    where: { 
-      wallets: { some: {} },
-    },
-    include: { 
-      wallets: true,
-      sniperConfig: true,
-    },
-  });
-
-  console.log(`   📢 Notifying ${activeUsers.length} users...`);
-
-  // Send notifications to ALL users simultaneously
-  const notificationPromises = activeUsers.map(async (user) => {
-    try {
-      const selection = await getUserChainSelection(BigInt(user.telegramId));
-      if (!getChainsForSelection(selection).includes(chain)) {
-        return; // User doesn't want this chain
-      }
-
-      // Send alert
-      await sendMintAlert(bot, user, {
-        contractAddress: scan.contractAddress,
-        chain,
-        collectionName: floorData.collectionName,
-        floorPrice: floorData.floorPriceEth,
-        selector: bestMintFn.selector,
-        confidence: scan.security?.score || 0,
-        gasEstimate: sim.gasEstimate,
-        detectionTime: Date.now() - detectedAt,
-      });
-
-      // Auto-mint if enabled
-      if (user.sniperConfig?.autoCopy) {
-        await mintQueue.add({
-          userId: user.telegramId.toString(),
-          contractAddress: scan.contractAddress,
-          chain,
-          function: bestMintFn,
-          options: { gasMultiplier: 1.2 },
-        }, {
-          priority: 1,
-          attempts: 3,
-          backoff: { type: "exponential", delay: 1000 },
-        });
-      }
-    } catch (err) {
-      console.error(`   ❌ Failed to notify ${user.telegramId}:`, err);
-    }
-  });
-
-  // Notify all users in parallel (equal speed)
-  await Promise.all(notificationPromises);
-
-  const totalTime = Date.now() - startTime;
-  console.log(`   ✅ Discovery complete in ${totalTime}ms | ${activeUsers.length} users notified`);
-}
-
-// Copy-trade polling
 async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   try {
     const configs = await prisma.sniperConfig.findMany({
@@ -416,60 +243,97 @@ async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
       try {
         const user = await prisma.user.findUnique({ where: { telegramId: userId } });
         if (!user) return;
-        console.log(`📨 Copy-trade alert to ${userId}: ${msg.slice(0, 50)}`);
+        
+        console.log(`Notification to ${userId}: ${msg.slice(0, 50)}`);
       } catch (e) {
-        console.error("Notification error:", e);
+        console.error("Failed to send notification:", e);
       }
     });
   } catch (err) {
-    console.error(`Copy-trade poll error for ${userId}:`, err);
+    console.error(`Error polling tracked wallets for ${userId}:`, err);
   }
 }
 
-// Notification helper
-async function sendMintAlert(bot: any, user: any, data: {
-  contractAddress: string;
-  chain: ChainId;
-  collectionName: string;
-  floorPrice: number;
-  selector: string;
-  confidence: number;
-  gasEstimate?: bigint;
-  detectionTime: number;
-}) {
-  const config = getChainConfig(data.chain);
-  const gasStr = data.gasEstimate ? `~${(Number(data.gasEstimate) / 1000000).toFixed(1)}M gas` : "Unknown";
+async function processDiscovery(
+  contractAddress: string,
+  chain: ChainId,
+  detectedAt: number,
+  txHash?: string
+): Promise<void> {
+  const config = getChainConfig(chain);
   
-  const message = `
-🎯 **FREE MINT DETECTED**
+  const scan = await withChainContext(chain, () =>
+    scanContract(contractAddress)
+  );
 
-${config.badge} **${config.name}**
-📄 ${data.collectionName || "Unknown Collection"}
-🔗 \`${data.contractAddress}\`
+  if (!scan.isContract || !scan.isNft) {
+    console.log(`Not an NFT: ${contractAddress}`);
+    return;
+  }
+  
+  if (!scan.security?.isSafe) {
+    console.log(`Unsafe contract: ${contractAddress}`);
+    return;
+  }
+  
+  if (!scan.mintFunctions.length) {
+    console.log(`No free mint: ${contractAddress}`);
+    return;
+  }
 
-📊 Stats:
-• Confidence: ${data.confidence}/100
-• Floor: ${data.floorPrice > 0 ? `${data.floorPrice.toFixed(4)} ETH` : "Unknown"}
-• Gas: ${gasStr}
-• Selector: \`${data.selector}\`
-⚡ Detection: ${data.detectionTime}ms
+  const spam = await evaluateSpamContract(scan, chain);
+  if (spam.isSpam) {
+    console.log(`Spam filtered: ${contractAddress}`);
+    return;
+  }
 
-[View on Explorer](${config.explorerBaseUrl}/address/${data.contractAddress})
-`;
+  const fn = getBestMintFunction(scan.mintFunctions) || scan.mintFunctions[0];
 
-  await bot.api.sendMessage(user.telegramId, message, {
-    parse_mode: "Markdown",
-    disable_web_page_preview: true,
-    reply_markup: {
-      inline_keyboard: [[
-        { text: "🚀 Auto-Mint", callback_data: `automint:${data.contractAddress}:${data.chain}` },
-        { text: "📋 Copy Address", callback_data: `copy:${data.contractAddress}` }
-      ]]
-    }
+  const probeWallets = await getWallets(0n).catch(() => [] as any);
+  const probeFrom = probeWallets[0]?.address || "0x0000000000000000000000000000000000000001";
+
+  const sim = await withChainContext(chain, () =>
+    simulateMint(scan.contractAddress, probeFrom, fn)
+  );
+  
+  if (!sim.success) {
+    console.log(`Simulation failed: ${contractAddress}`);
+    return;
+  }
+
+  const activeUsers = await prisma.user.findMany({
+    where: { 
+      wallets: { some: {} },
+    },
+    include: { wallets: true },
   });
+
+  for (const user of activeUsers) {
+    if (!user.wallets?.length) continue;
+
+    const selection = await getUserChainSelection(BigInt(user.telegramId));
+    if (!getChainsForSelection(selection).includes(chain)) continue;
+
+    console.log(`Alert sent to ${user.telegramId} for ${scan.contractAddress}`);
+
+    const autoOn = await getAutoMintStatus(BigInt(user.telegramId));
+    if (autoOn) {
+      console.log(`Auto-minting for ${user.telegramId}`);
+      
+      await mintQueue.add({
+        userId: user.telegramId.toString(),
+        contractAddress: scan.contractAddress,
+        chain,
+        options: {},
+      }, {
+        priority: 2,
+        attempts: 3,
+      });
+    }
+  }
 }
 
 main().catch((error) => {
-  console.error("💥 Fatal error:", error);
+  console.error("Fatal error:", error);
   process.exit(1);
 });
