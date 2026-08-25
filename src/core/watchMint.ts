@@ -180,10 +180,15 @@ async function fireMint(
 ): Promise<WatchResult> {
   const { badge, explorerBaseUrl } = getChainConfig(chain);
   try {
-    const hash = await getWalletClient(hexKey, chain).sendTransaction({
+    const walletClient = getWalletClient(hexKey, chain);
+    
+    // FIX: Added account field for viem 2.x compatibility
+    const hash = await walletClient.sendTransaction({
+      account: walletClient.account!, // Required in viem 2.x
       to: contractAddress as Address,
       data,
     });
+    
     const txUrl = `${explorerBaseUrl}/tx/${hash}`;
     try {
       const receipt = await getPublicClient(chain).waitForTransactionReceipt({
