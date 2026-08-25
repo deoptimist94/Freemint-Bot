@@ -1,6 +1,5 @@
 /**
  * RPC Pool - Enterprise Grade
- * Manages multiple RPC providers with intelligent load balancing
  */
 
 interface RPCProvider {
@@ -20,7 +19,7 @@ type ChainId = "base" | "robinhood";
 class RPCPool {
   private providers: Map<string, RPCProvider> = new Map();
   private chain: ChainId;
-  private healthCheckInterval: NodeJS.Timeout;
+  private healthCheckInterval!: NodeJS.Timeout;
 
   constructor(chain: ChainId) {
     this.chain = chain;
@@ -34,7 +33,6 @@ class RPCPool {
         { name: "QuickNode-Base", url: process.env.QUICKNODE_BASE_RPC || "", weight: 35 },
         { name: "Alchemy-Base", url: process.env.ALCHEMY_API_KEY ? `https://base-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : "", weight: 30 },
         { name: "Infura-Base", url: process.env.INFURA_BASE_RPC || "", weight: 20 },
-        { name: "Ankr-Base", url: "https://rpc.ankr.com/base", weight: 10 },
         { name: "Public-Base", url: "https://mainnet.base.org", weight: 5 },
       ],
       robinhood: [
@@ -116,11 +114,10 @@ class RPCPool {
     
     if (provider.failedRequests > 10) {
       provider.healthy = false;
-      console.warn(`${provider.name} marked unhealthy`);
     }
     
     if (error?.status === 429 || error?.message?.includes("rate")) {
-      console.warn(`${provider.name} rate limited`);
+      console.warn(`${providerName} rate limited`);
     }
   }
 
