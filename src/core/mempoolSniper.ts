@@ -1,19 +1,9 @@
-/**
- * Mempool Sniper - HTTP polling with rate limit protection
- */
-
 import { type ChainId } from "./chains.js";
 import { getRPCPool } from "./rpcPool.js";
 
 const MINT_SELECTORS = new Set([
-  "0x1249c58b",
-  "0xa0712d68",
-  "0x6a627842",
-  "0x40c10f19",
-  "0x4e6ec247",
-  "0x84bb1e42",
-  "0xa6f2ae3a",
-  "0x161ac21f",
+  "0x1249c58b", "0xa0712d68", "0x6a627842", "0x40c10f19",
+  "0x4e6ec247", "0x84bb1e42", "0xa6f2ae3a", "0x161ac21f",
 ]);
 
 export interface MempoolMint {
@@ -32,15 +22,15 @@ export class MempoolMonitor {
   private chain: ChainId;
   private callback: MempoolCallback;
   private isRunning = false;
-  private processedTxs = new Set<string>();
-  private readonly MAX_CACHE = 5000;
+  private processedTxs = new Map<string, number>();
+  private readonly MAX_CACHE = 10000;
+  private readonly CACHE_TTL = 10 * 60 * 1000;
   private pollInterval: NodeJS.Timeout | null = null;
-  
-  // NEW: Exponential backoff state
-  private baseDelay = 5000; // INCREASED from 2000ms to 5000ms
+  private baseDelay = 4000;
   private currentDelay = this.baseDelay;
-  private maxDelay = 30000; // Max 30s between polls
+  private maxDelay = 30000;
   private consecutiveErrors = 0;
+  private lastBlockNumber: bigint | null = null;
 
   constructor(chain: ChainId, callback: MempoolCallback) {
     this.chain = chain;
@@ -50,64 +40,60 @@ export class MempoolMonitor {
   public start(): void {
     if (this.isRunning) return;
     this.isRunning = true;
-    console.log(`Mempool Monitor starting on ${this.chain} (poll interval: ${this.currentDelay}ms)`);
+    console.log(`[${this.chain}] Mempool Monitor starting (interval: ${this.currentDelay}ms)`);
     this.startPolling();
+    this.startCacheCleanup();
   }
 
   private startPolling(): void {
     const poll = async () => {
       if (!this.isRunning) return;
       
-      const startTime = Date.now();
-      
       try {
-        // NEW: Check if circuit breaker is open
         const pool = getRPCPool(this.chain);
         const provider = pool.getProvider();
         if (!provider) {
-          console.warn(`[${this.chain}] Mempool: No healthy providers, backing off...`);
-          this.consecutiveErrors++;
-          this.currentDelay = Math.min(this.currentDelay * 2, this.maxDelay);
+          this.handleError(new Error("No healthy providers"));
           scheduleNext();
           return;
         }
 
         const { getPublicClient } = await import("./chain.js");
-        const client = getPublicClient(this.chain);
-        
-        // Use pending block - single call instead of two
-        const block = await client.getBlock({ 
-          blockTag: "pending",
-          includeTransactions: true 
-        }).catch(() => null);
-        
-        if (block?.transactions) {
+        const client = await pool.dedupRequest(
+          `getPublicClient-${this.chain}`,
+          () => Promise.resolve(getPublicClient(this.chain))
+        );
+
+        const block = await pool.dedupRequest(
+          `pendingBlock-${this.chain}`,
+          () => client.getBlock({ blockTag: "pending", includeTransactions: true })
+        ).catch(() => null);
+
+        if (!block) {
+          scheduleNext();
+          return;
+        }
+
+        if (this.lastBlockNumber && block.number === this.lastBlockNumber) {
+          scheduleNext();
+          return;
+        }
+        this.lastBlockNumber = block.number;
+
+        if (block.transactions) {
           for (const tx of block.transactions) {
             this.processTransaction(tx as any);
           }
         }
         
-        // NEW: Success - reset backoff
         if (this.consecutiveErrors > 0) {
-          console.log(`[${this.chain}] Mempool recovered, resetting poll interval`);
+          console.log(`[${this.chain}] Mempool recovered`);
           this.consecutiveErrors = 0;
           this.currentDelay = this.baseDelay;
         }
         
       } catch (error: any) {
-        this.consecutiveErrors++;
-        
-        // NEW: Exponential backoff on errors
-        const oldDelay = this.currentDelay;
-        this.currentDelay = Math.min(this.currentDelay * 1.5, this.maxDelay);
-        
-        // Check if it's a rate limit
-        const errorStr = JSON.stringify(error).toLowerCase();
-        if (errorStr.includes("rate") || errorStr.includes("limit") || errorStr.includes("-32003")) {
-          console.warn(`[${this.chain}] Mempool rate limited, backing off: ${oldDelay}ms -> ${this.currentDelay}ms`);
-        } else {
-          console.error(`[${this.chain}] Mempool error:`, error.message || error);
-        }
+        this.handleError(error);
       }
       
       scheduleNext();
@@ -122,6 +108,17 @@ export class MempoolMonitor {
     poll();
   }
 
+  private handleError(error: any): void {
+    this.consecutiveErrors++;
+    const oldDelay = this.currentDelay;
+    this.currentDelay = Math.min(this.currentDelay * 1.5, this.maxDelay);
+    
+    const errorStr = JSON.stringify(error).toLowerCase();
+    if (errorStr.includes("rate") || errorStr.includes("limit") || errorStr.includes("-32003") || errorStr.includes("-32007")) {
+      console.warn(`[${this.chain}] Mempool rate limited: ${oldDelay}ms -> ${this.currentDelay}ms`);
+    }
+  }
+
   private processTransaction(tx: any): void {
     if (!tx?.to || !tx?.input || tx.input === "0x") return;
     if (tx.value && BigInt(tx.value) > 0n) return;
@@ -129,13 +126,13 @@ export class MempoolMonitor {
     const selector = tx.input.slice(0, 10).toLowerCase();
     if (!MINT_SELECTORS.has(selector)) return;
 
-    if (this.processedTxs.has(tx.hash)) return;
-    this.processedTxs.add(tx.hash);
-    
-    if (this.processedTxs.size > this.MAX_CACHE) {
-      const toDelete = Array.from(this.processedTxs).slice(0, 1000);
-      toDelete.forEach(h => this.processedTxs.delete(h));
+    const now = Date.now();
+    if (this.processedTxs.has(tx.hash)) {
+      this.processedTxs.set(tx.hash, now);
+      return;
     }
+
+    this.processedTxs.set(tx.hash, now);
 
     const mint: MempoolMint = {
       txHash: tx.hash,
@@ -144,10 +141,38 @@ export class MempoolMonitor {
       from: tx.from?.toLowerCase() || "",
       value: tx.value || "0",
       chain: this.chain,
-      detectedAt: Date.now(),
+      detectedAt: now,
     };
 
     this.callback(mint).catch(console.error);
+  }
+
+  private startCacheCleanup(): void {
+    setInterval(() => {
+      const now = Date.now();
+      let cleaned = 0;
+      
+      for (const [hash, timestamp] of this.processedTxs) {
+        if (now - timestamp > this.CACHE_TTL) {
+          this.processedTxs.delete(hash);
+          cleaned++;
+        }
+      }
+      
+      if (this.processedTxs.size > this.MAX_CACHE) {
+        const sorted = Array.from(this.processedTxs.entries())
+          .sort((a, b) => a[1] - b[1]);
+        const toDelete = sorted.slice(0, sorted.length - this.MAX_CACHE + 1000);
+        for (const [hash] of toDelete) {
+          this.processedTxs.delete(hash);
+          cleaned++;
+        }
+      }
+      
+      if (cleaned > 0) {
+        console.log(`[${this.chain}] Mempool cache cleaned: ${cleaned} entries, ${this.processedTxs.size} remaining`);
+      }
+    }, 60000);
   }
 
   public stop(): void {
