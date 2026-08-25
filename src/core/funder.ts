@@ -35,7 +35,6 @@ export async function fundSubWallets(
   const sendWei = parseEther(amountPerWalletEth.toString());
   const totalNeededWei = sendWei * BigInt(subWallets.length);
 
-  // Reserve gas for every outgoing transfer (EIP-1559 max fee).
   let gasBuffer = 0n;
   try {
     const fees = await publicClient.estimateFeesPerGas();
@@ -58,7 +57,9 @@ export async function fundSubWallets(
 
   for (const target of subWallets) {
     try {
+      // FIX: Added account field
       const txHash = await walletClient.sendTransaction({
+        account: walletClient.account,
         to: getAddress(target.address),
         value: sendWei,
       });
