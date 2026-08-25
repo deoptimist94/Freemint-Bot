@@ -1,8 +1,9 @@
 /**
- * Mempool Sniper - Uses HTTP polling (WebSocket optional)
+ * Mempool Sniper - HTTP polling with rate limit protection
  */
 
 import { type ChainId } from "./chains.js";
+import { getRPCPool } from "./rpcPool.js";
 
 const MINT_SELECTORS = new Set([
   "0x1249c58b",
@@ -34,6 +35,12 @@ export class MempoolMonitor {
   private processedTxs = new Set<string>();
   private readonly MAX_CACHE = 5000;
   private pollInterval: NodeJS.Timeout | null = null;
+  
+  // NEW: Exponential backoff state
+  private baseDelay = 5000; // INCREASED from 2000ms to 5000ms
+  private currentDelay = this.baseDelay;
+  private maxDelay = 30000; // Max 30s between polls
+  private consecutiveErrors = 0;
 
   constructor(chain: ChainId, callback: MempoolCallback) {
     this.chain = chain;
@@ -43,7 +50,7 @@ export class MempoolMonitor {
   public start(): void {
     if (this.isRunning) return;
     this.isRunning = true;
-    console.log(`Mempool Monitor starting on ${this.chain}`);
+    console.log(`Mempool Monitor starting on ${this.chain} (poll interval: ${this.currentDelay}ms)`);
     this.startPolling();
   }
 
@@ -51,16 +58,26 @@ export class MempoolMonitor {
     const poll = async () => {
       if (!this.isRunning) return;
       
+      const startTime = Date.now();
+      
       try {
-        // HTTP mempool polling via pending block
+        // NEW: Check if circuit breaker is open
+        const pool = getRPCPool(this.chain);
+        const provider = pool.getProvider();
+        if (!provider) {
+          console.warn(`[${this.chain}] Mempool: No healthy providers, backing off...`);
+          this.consecutiveErrors++;
+          this.currentDelay = Math.min(this.currentDelay * 2, this.maxDelay);
+          scheduleNext();
+          return;
+        }
+
         const { getPublicClient } = await import("./chain.js");
         const client = getPublicClient(this.chain);
         
-        const blockNumber = await client.getBlockNumber();
-        
-        // Try to get pending transactions
+        // Use pending block - single call instead of two
         const block = await client.getBlock({ 
-          blockNumber: blockNumber + 1n,
+          blockTag: "pending",
           includeTransactions: true 
         }).catch(() => null);
         
@@ -69,12 +86,36 @@ export class MempoolMonitor {
             this.processTransaction(tx as any);
           }
         }
-      } catch (error) {
-        // Silent fail for polling
+        
+        // NEW: Success - reset backoff
+        if (this.consecutiveErrors > 0) {
+          console.log(`[${this.chain}] Mempool recovered, resetting poll interval`);
+          this.consecutiveErrors = 0;
+          this.currentDelay = this.baseDelay;
+        }
+        
+      } catch (error: any) {
+        this.consecutiveErrors++;
+        
+        // NEW: Exponential backoff on errors
+        const oldDelay = this.currentDelay;
+        this.currentDelay = Math.min(this.currentDelay * 1.5, this.maxDelay);
+        
+        // Check if it's a rate limit
+        const errorStr = JSON.stringify(error).toLowerCase();
+        if (errorStr.includes("rate") || errorStr.includes("limit") || errorStr.includes("-32003")) {
+          console.warn(`[${this.chain}] Mempool rate limited, backing off: ${oldDelay}ms -> ${this.currentDelay}ms`);
+        } else {
+          console.error(`[${this.chain}] Mempool error:`, error.message || error);
+        }
       }
       
+      scheduleNext();
+    };
+    
+    const scheduleNext = () => {
       if (this.isRunning) {
-        this.pollInterval = setTimeout(poll, 2000);
+        this.pollInterval = setTimeout(poll, this.currentDelay);
       }
     };
     
