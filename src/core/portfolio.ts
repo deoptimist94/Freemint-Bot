@@ -40,7 +40,7 @@ const PAGE_SIZE = 100;
 const FLOOR_CONCURRENCY = 6;
 const FLOOR_TIME_BUDGET_MS = 25_000;
 
-// FIXED: Use correct environment variable names
+// FIXED: Use consistent environment variable names matching autoLister.ts
 function alchemyKey(chain: ChainId): string {
   if (chain === "robinhood") {
     return (process.env.ALCHEMY_ROBINHOOD_API_KEY || "").trim();
@@ -208,6 +208,7 @@ export async function fetchWalletPortfolio(
 
   const deadline = Date.now() + FLOOR_TIME_BUDGET_MS;
   let next = 0;
+  
   const worker = async (): Promise<void> => {
     while (next < uniqueContracts.length) {
       if (Date.now() > deadline) return;
