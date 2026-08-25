@@ -1,9 +1,3 @@
-
-/**
- * RPC Pool - Enterprise Grade with Request Deduplication
- * Alchemy-Only Configuration for Professional Multi-User Operation
- */
-
 interface RPCProvider {
   name: string;
   url: string;
@@ -15,7 +9,7 @@ interface RPCProvider {
   healthy: boolean;
   lastUsed: number;
   rateLimitedUntil: number;
-  requestCount: number; // Track actual request volume
+  requestCount: number;
 }
 
 type ChainId = "base" | "robinhood";
@@ -28,18 +22,18 @@ const RATE_LIMIT_PATTERNS = [
   "quota",
   "-32003",
   "-32005",
-  "-32007", // Alchemy rate limit
+  "-32007",
   "429",
-  "403", // Auth errors
+  "403",
 ];
 
-// NEW: Request deduplication cache
 interface PendingRequest<T> {
   promise: Promise<T>;
   timestamp: number;
 }
+
 const pendingRequests = new Map<string, PendingRequest<any>>();
-const REQUEST_DEDUP_TTL = 5000; // 5s deduplication window
+const REQUEST_DEDUP_TTL = 5000;
 
 class RPCPool {
   private providers: Map<string, RPCProvider> = new Map();
@@ -47,7 +41,7 @@ class RPCPool {
   private healthCheckInterval!: NodeJS.Timeout;
   private circuitBreakerOpen = false;
   private circuitBreakerResetTime = 0;
-  private requestQueue: Array<() => void> = []; // NEW: Request queue for rate limiting
+  private requestQueue: Array<() => void> = [];
   private processingQueue = false;
 
   constructor(chain: ChainId) {
@@ -58,7 +52,6 @@ class RPCPool {
   }
 
   private initializeProviders(): void {
-    // ALCHEMY-ONLY CONFIGURATION
     const configs: Record<ChainId, Array<{ name: string; url: string; weight: number }>> = {
       base: [
         { 
@@ -115,13 +108,12 @@ class RPCPool {
     }
 
     if (this.providers.size === 0) {
-      throw new Error(`[${this.chain}] No Alchemy providers configured! Set ALCHEMY_${this.chain.toUpperCase()}_API_KEY`);
+      throw new Error(`[${this.chain}] No Alchemy providers configured!`);
     }
 
-    console.log(`[${this.chain}] RPC Pool initialized with ${this.providers.size} Alchemy providers`);
+    console.log(`[${this.chain}] RPC Pool initialized with ${this.providers.size} providers`);
   }
 
-  // NEW: Deduplicate identical requests
   public async dedupRequest<T>(key: string, fn: () => Promise<T>): Promise<T> {
     const existing = pendingRequests.get(key);
     if (existing && Date.now() - existing.timestamp < REQUEST_DEDUP_TTL) {
@@ -131,7 +123,6 @@ class RPCPool {
     const promise = fn();
     pendingRequests.set(key, { promise, timestamp: Date.now() });
 
-    // Cleanup old entries periodically
     if (pendingRequests.size > 1000) {
       const now = Date.now();
       for (const [k, v] of pendingRequests) {
@@ -151,12 +142,11 @@ class RPCPool {
 
   public getProvider(): RPCProvider | null {
     if (this.circuitBreakerOpen && Date.now() < this.circuitBreakerResetTime) {
-      console.warn(`[${this.chain}] Circuit breaker open - backing off for ${Math.ceil((this.circuitBreakerResetTime - Date.now())/1000)}s`);
+      console.warn(`[${this.chain}] Circuit breaker open`);
       return null;
     }
     this.circuitBreakerOpen = false;
 
-    // Sort by health, then by load
     const providers = Array.from(this.providers.values())
       .filter(p => {
         if (!p.healthy) return false;
@@ -164,20 +154,17 @@ class RPCPool {
         return true;
       })
       .sort((a, b) => {
-        // Prefer lower load
         const loadDiff = a.currentLoad - b.currentLoad;
         if (loadDiff !== 0) return loadDiff;
-        // Then prefer lower response time
         return a.avgResponseTime - b.avgResponseTime;
       });
 
     if (providers.length === 0) {
-      console.error(`[${this.chain}] CRITICAL: No healthy Alchemy providers!`);
+      console.error(`[${this.chain}] No healthy providers!`);
       const anyProvider = Array.from(this.providers.values())[0];
       return anyProvider || null;
     }
 
-    // Use weighted random from top 2 providers
     const topProviders = providers.slice(0, 2);
     const totalWeight = topProviders.reduce((sum, p) => sum + p.weight, 0);
     let random = Math.random() * totalWeight;
@@ -195,7 +182,6 @@ class RPCPool {
     return topProviders[0];
   }
 
-  // NEW: Queue requests when rate limited
   public async queueRequest<T>(fn: () => Promise<T>): Promise<T> {
     return new Promise((resolve, reject) => {
       this.requestQueue.push(async () => {
@@ -218,7 +204,6 @@ class RPCPool {
     while (this.requestQueue.length > 0) {
       const provider = this.getProvider();
       if (!provider) {
-        // Rate limited - wait and retry
         await new Promise(r => setTimeout(r, 1000));
         continue;
       }
@@ -226,7 +211,6 @@ class RPCPool {
       const request = this.requestQueue.shift();
       if (request) {
         await request();
-        // Small delay between requests to avoid hammering
         await new Promise(r => setTimeout(r, 50));
       }
     }
@@ -265,9 +249,8 @@ class RPCPool {
     if (isRateLimit) {
       provider.healthy = false;
       provider.rateLimitedUntil = Date.now() + 60000;
-      console.warn(`[${this.chain}] ${providerName} RATE LIMITED - backing off 60s`);
+      console.warn(`[${this.chain}] ${providerName} RATE LIMITED`);
       
-      // Check if we should open circuit breaker
       const healthyProviders = Array.from(this.providers.values()).filter(p => 
         p.healthy && Date.now() >= p.rateLimitedUntil
       );
@@ -275,9 +258,9 @@ class RPCPool {
       if (healthyProviders.length === 0) {
         this.circuitBreakerOpen = true;
         this.circuitBreakerResetTime = Date.now() + 30000;
-        console.error(`[${this.chain}] ALL PROVIDERS RATE LIMITED - circuit breaker active`);
+        console.error(`[${this.chain}] ALL PROVIDERS RATE LIMITED`);
       }
-    } else if (provider.failedRequests > 2) { // Even more aggressive
+    } else if (provider.failedRequests > 2) {
       provider.healthy = false;
     }
   }
@@ -286,7 +269,7 @@ class RPCPool {
     this.healthCheckInterval = setInterval(() => {
       for (const [name, provider] of this.providers) {
         if (!provider.healthy && Date.now() > provider.rateLimitedUntil) {
-          if (Date.now() - provider.lastUsed > 20000) { // 20s cooldown
+          if (Date.now() - provider.lastUsed > 20000) {
             provider.healthy = true;
             provider.failedRequests = Math.floor(provider.failedRequests * 0.3);
             provider.rateLimitedUntil = 0;
@@ -296,33 +279,31 @@ class RPCPool {
         
         provider.currentLoad = Math.max(0, provider.currentLoad - 1);
       }
-    }, 5000); // Check every 5s
+    }, 5000);
   }
 
-  // NEW: Metrics logging for monitoring
   private startMetricsLogging(): void {
     setInterval(() => {
       const stats = this.getStats();
       const totalRequests = stats.reduce((sum, s) => sum + s.requestCount, 0);
       const healthyCount = stats.filter(s => s.healthy && !s.rateLimited).length;
       
-      console.log(`[${this.chain}] RPC Metrics: ${healthyCount}/${stats.length} healthy, ${totalRequests} total requests`);
+      console.log(`[${this.chain}] RPC: ${healthyCount}/${stats.length} healthy, ${totalRequests} req/min`);
       
-      // Reset counters
       for (const provider of this.providers.values()) {
         provider.requestCount = 0;
       }
-    }, 60000); // Every minute
+    }, 60000);
   }
 
-  public getStats(): Array<{ name: string; healthy: boolean; load: number; avgTime: number; rateLimited: boolean; requests: number }> {
+  public getStats(): Array<{ name: string; healthy: boolean; load: number; avgTime: number; rateLimited: boolean; requestCount: number }> {
     return Array.from(this.providers.values()).map(p => ({
       name: p.name,
       healthy: p.healthy,
       load: p.currentLoad,
       avgTime: Math.round(p.avgResponseTime),
       rateLimited: Date.now() < p.rateLimitedUntil,
-      requests: p.requestCount,
+      requestCount: p.requestCount,
     }));
   }
 
@@ -340,11 +321,10 @@ export function getRPCPool(chain: ChainId): RPCPool {
   return pools.get(chain)!;
 }
 
-export function getRPCStats(chain: ChainId) {
+export function getRPCStats(chain: ChainId): Array<{ name: string; healthy: boolean; load: number; avgTime: number; rateLimited: boolean; requestCount: number }> {
   return getRPCPool(chain).getStats();
 }
 
-// NEW: Export deduplication helper
 export function dedupRPCRequest<T>(chain: ChainId, key: string, fn: () => Promise<T>): Promise<T> {
   return getRPCPool(chain).dedupRequest(key, fn);
 }
