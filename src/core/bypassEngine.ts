@@ -724,12 +724,12 @@ async function tryDirectMint(
     try {
       const walletClient = getWalletClient(hexKey);
       
-      // FIX: Added account field for viem 2.x compatibility
       const txHash = await walletClient.sendTransaction({
-        account: walletClient.account!, // Required in viem 2.x
+        account: walletClient.account!,
         to: address as Address,
         data,
         value: 0n,
+        chain: null,
       });
       
       const receiptTimeout = new Promise<never>((_, reject) =>
@@ -943,12 +943,12 @@ async function tryMatrix(
     try {
       const walletClient = getWalletClient(hexKey);
       
-      // FIX: Added account field for viem 2.x compatibility
       const txHash = await walletClient.sendTransaction({
-        account: walletClient.account!, // Required in viem 2.x
+        account: walletClient.account!,
         to: address as Address,
         data: hit.data,
         value: 0n,
+        chain: null,
       });
       
       const receiptTimeout = new Promise<never>((_, reject) =>
