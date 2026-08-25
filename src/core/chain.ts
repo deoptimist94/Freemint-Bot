@@ -1,3 +1,8 @@
+/**
+ * Chain Configuration - Production Version
+ * Features: RPC failover integration, multi-chain support
+ */
+
 import {
   createWalletClient,
   http,
@@ -17,6 +22,7 @@ import {
   type ChainId,
   type ChainSelection,
 } from "./chains.js";
+import { getRpcUrlWithFailover, getRPCManager } from "./rpcManager.js";
 
 export type { Hex, Address };
 export type { ChainId, ChainSelection };
@@ -24,29 +30,44 @@ export { getDefaultChainId, resolveBaseRpcUrl, resolveRobinhoodRpcUrl };
 
 export const BASE_CHAIN_ID = 8453;
 
-// Backward-compatible aliases: existing Base-only callers keep working
-// unchanged. The viem Chain objects live in chains.ts (single source of truth).
 export const baseChain: Chain = baseViemChain;
 export const robinhoodChain: Chain = robinhoodViemChain;
 
-// Per-chain RPC with a clear error when a chain has no RPC configured
-// (Robinhood requires ROBINHOOD_RPC_URL or an Alchemy key with Robinhood
-// enabled — it has no public free RPC).
 export function getRpcUrl(chain: ChainId = "base"): string {
   return getChainConfig(chain).resolveRpcUrl();
 }
 
-// Kept as an alias for existing callers; use getRpcUrl("robinhood") for RH.
 export function getBaseRpcUrl(): string {
   return resolveBaseRpcUrl();
 }
 
+export async function getPublicClientAsync(chain?: ChainId) {
+  const target = chain ?? getDefaultChainId();
+  const rpcUrl = await getRpcUrlWithFailover(target);
+  const config = getChainConfig(target);
+  
+  return createPublicClient({
+    chain: config.viemChain,
+    transport: http(rpcUrl, {
+      timeout: 20000,
+      retryCount: 2,
+      retryDelay: 400,
+    }),
+  });
+}
+
 export function getPublicClient(chain?: ChainId) {
   const target = chain ?? getDefaultChainId();
+  const config = getChainConfig(target);
+  
+  // Try to get from RPC manager first
+  const manager = getRPCManager();
+  const bestUrl = manager.getBestProvider(target);
+  
   return createPublicClient({
-    chain: getChainConfig(target).viemChain,
-    transport: http(getRpcUrl(target), {
-      timeout: 20_000,
+    chain: config.viemChain,
+    transport: http(bestUrl || config.resolveRpcUrl(), {
+      timeout: 20000,
       retryCount: 2,
       retryDelay: 400,
     }),
@@ -56,11 +77,16 @@ export function getPublicClient(chain?: ChainId) {
 export function getWalletClient(privateKey: Hex, chain?: ChainId) {
   const target = chain ?? getDefaultChainId();
   const account = privateKeyToAccount(privateKey);
+  const config = getChainConfig(target);
+  
+  const manager = getRPCManager();
+  const bestUrl = manager.getBestProvider(target);
+  
   return createWalletClient({
     account,
-    chain: getChainConfig(target).viemChain,
-    transport: http(getRpcUrl(target), {
-      timeout: 20_000,
+    chain: config.viemChain,
+    transport: http(bestUrl || config.resolveRpcUrl(), {
+      timeout: 20000,
       retryCount: 2,
       retryDelay: 400,
     }),
