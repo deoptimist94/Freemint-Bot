@@ -95,10 +95,6 @@ const PUBLIC_START_KEYS = [
   "startTime",
 ];
 
-// ---------------------------------------------------------------------------
-// Gate classification
-// ---------------------------------------------------------------------------
-
 export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
   if (!mintFunctions || mintFunctions.length === 0) return "none";
 
@@ -175,10 +171,6 @@ export function classifyRevertReason(reason: string): GateType | undefined {
   }
   return undefined;
 }
-
-// ---------------------------------------------------------------------------
-// State probing
-// ---------------------------------------------------------------------------
 
 function normalizeProbeValue(value: unknown): ProbeRow["value"] {
   if (value === null || value === undefined) return null;
@@ -311,10 +303,6 @@ function formatDuration(ms: number): string {
   return remHrs > 0 ? `${days}d ${remHrs}h` : `${days}d`;
 }
 
-// ---------------------------------------------------------------------------
-// Calldata + simulation
-// ---------------------------------------------------------------------------
-
 function buildArgs(fn: MintFunctionInfo, fromAddress: string): unknown[] {
   const args: string[] = fn.args ?? [];
   return args.map((arg) => {
@@ -356,8 +344,6 @@ function encodeCall(fn: MintFunctionInfo, args: unknown[]): Hex {
   });
 }
 
-// decodeErrorResult returns readonly tuple args — unwrap through unknown to
-// avoid the TS2352 "neither type sufficiently overlaps" build error.
 function asDecodedError(decoded: unknown): {
   errorName: string;
   args: readonly unknown[];
@@ -460,9 +446,6 @@ interface SimResult {
   error?: string;
 }
 
-// RPC transport failures (rate limit, timeout, 5xx) are NOT mint reverts —
-// they get retried, then surfaced as RPC_TRANSPORT so they are never
-// misclassified as a gate.
 function isRpcTransportError(err: unknown): boolean {
   const msg = (
     err instanceof Error
@@ -503,7 +486,6 @@ async function simulateCall(
         await sleep(300 * (attempt + 1));
         continue;
       }
-      // Real on-chain revert — decode it.
       return { ok: false, error: decodeRevertReason(err, abi) };
     }
   }
@@ -513,7 +495,6 @@ async function simulateCall(
   };
 }
 
-// Prisma BypassLog fields: walletAddress + success (NOT fromAddress/ok)
 async function logBypass(
   userId: bigint,
   contractAddress: string,
@@ -539,10 +520,6 @@ async function logBypass(
     // logging must never break the user-facing flow
   }
 }
-
-// ---------------------------------------------------------------------------
-// Post-receipt NFT verification (Fix A)
-// ---------------------------------------------------------------------------
 
 const TRANSFER_TOPIC_721_20 =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -605,10 +582,6 @@ async function verifyNftReceived(
     TRANSFER_TOPIC_1155_BATCH,
   ];
 
-  // Primary check: any Transfer* log in the mined block that credits the
-  // minter wallet. Topic layout: 721/20 -> Transfer(from,to,id) => "to" is
-  // topics[2]; 1155 -> TransferSingle/Batch(operator,from,to,...) => "to" is
-  // topics[3]. A gated no-op mints NOTHING, so no log matches.
   let logsChecked = false;
   try {
     const logs = await client.getLogs({
@@ -640,7 +613,6 @@ async function verifyNftReceived(
     // Log query is best-effort; fall through to the balance-delta check.
   }
 
-  // Fallback: balanceOf() delta for ERC721/ERC20-style contracts.
   if (beforeBalance !== null && abi) {
     try {
       const after = await readNftBalance(
@@ -675,10 +647,6 @@ async function verifyNftReceived(
       : "no Transfer log found and balanceOf is not readable on this contract",
   };
 }
-
-// ---------------------------------------------------------------------------
-// Strategy ladder
-// ---------------------------------------------------------------------------
 
 async function tryDirectMint(
   userId: bigint,
@@ -743,8 +711,6 @@ async function tryDirectMint(
       };
     }
 
-    // Fix A: snapshot the minter's balance before sending, so a mined-but-
-    // no-op tx (whitelist/allowlist silent accept) can be detected.
     const beforeBalance =
       result.abi && hasReadableBalanceOf(result.abi)
         ? await readNftBalance(
@@ -757,11 +723,15 @@ async function tryDirectMint(
 
     try {
       const walletClient = getWalletClient(hexKey);
+      
+      // FIX: Added account field
       const txHash = await walletClient.sendTransaction({
+        account: walletClient.account,
         to: address as Address,
         data,
         value: 0n,
       });
+      
       const receiptTimeout = new Promise<never>((_, reject) =>
         setTimeout(
           () => reject(new Error("Transaction receipt timeout")),
@@ -795,8 +765,6 @@ async function tryDirectMint(
         };
       }
 
-      // Fix A: a mined receipt is NOT proof of a mint. Verify the wallet
-      // actually received an NFT (Transfer log or balanceOf delta).
       const verify = await verifyNftReceived(
         client,
         address as Address,
@@ -962,8 +930,6 @@ async function tryMatrix(
       };
     }
 
-    // Fix A: snapshot the minter's balance before sending (same as
-    // tryDirectMint) so a silent no-op tx is never reported as success.
     const beforeBalance =
       result.abi && hasReadableBalanceOf(result.abi)
         ? await readNftBalance(
@@ -976,11 +942,15 @@ async function tryMatrix(
 
     try {
       const walletClient = getWalletClient(hexKey);
+      
+      // FIX: Added account field
       const txHash = await walletClient.sendTransaction({
+        account: walletClient.account,
         to: address as Address,
         data: hit.data,
         value: 0n,
       });
+      
       const receiptTimeout = new Promise<never>((_, reject) =>
         setTimeout(
           () => reject(new Error("Transaction receipt timeout")),
@@ -1014,7 +984,6 @@ async function tryMatrix(
         };
       }
 
-      // Fix A: verify the wallet actually received an NFT.
       const verify = await verifyNftReceived(
         client,
         address as Address,
@@ -1111,10 +1080,6 @@ function buildFinalError(
         : planReason ?? "No bypass strategy available for this contract";
   }
 }
-
-// ---------------------------------------------------------------------------
-// Orchestrator
-// ---------------------------------------------------------------------------
 
 export async function executeBypass(
   userId: bigint,
@@ -1216,8 +1181,6 @@ export async function executeBypass(
     }
   }
 
-  // Transport failures are NOT gate signals — surface them clearly instead of
-  // misclassifying the contract as mint_open/whitelist from a dead RPC.
   if (simError && simError.startsWith("RPC_TRANSPORT:")) {
     const error =
       `RPC unavailable during simulation (${simError.replace(/^RPC_TRANSPORT:\s*/, "")}). ` +
@@ -1287,7 +1250,6 @@ export async function executeBypass(
     }
   }
 
-  // If the ladder only ever hit RPC errors, say so instead of a fake gate.
   if (base.error && base.error.includes("RPC_TRANSPORT")) {
     const error =
       `RPC unavailable during bypass attempts. ` +
