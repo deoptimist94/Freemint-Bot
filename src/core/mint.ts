@@ -342,6 +342,7 @@ async function executeSeaDropMint(
     
     const balanceBefore = await readNftBalance(nftContract, walletAddress);
     
+    // FIX: Added chain and account parameters for viem 2.x compatibility
     const hash = await walletClient.writeContract({
       address: seaDropContext.routerAddress as Address,
       abi: SEADROP_ROUTER_ABI,
@@ -354,6 +355,8 @@ async function executeSeaDropMint(
       ],
       value: 0n,
       nonce,
+      chain: null, // Use the chain from walletClient
+      account: walletClient.account!, // Required in viem 2.x
     });
     
     const publicClient = getPublicClient(chain);
@@ -459,11 +462,13 @@ async function executeDirectMint(
       };
     }
     
+    // FIX: Added account parameter for viem 2.x compatibility
     const hash = await walletClient.sendTransaction({
       to: getAddress(contractAddress),
       data,
       value: 0n,
       nonce,
+      account: walletClient.account!, // Required in viem 2.x
     });
     
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
