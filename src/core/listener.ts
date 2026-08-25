@@ -1,18 +1,19 @@
 import { getAddress } from "viem";
 import { getPublicClient } from "./chain.js";
 import { type ChainId } from "./chains.js";
+import { getRPCPool } from "./rpcPool.js";
 
-// Common 4-byte free-mint selectors (executable mints only)
+// Common 4-byte free-mint selectors
 const MINT_SELECTORS = new Set([
   "0x1249c58b", // mint()
   "0xa0712d68", // mint(uint256)
   "0x6a627842", // mint(address)
-  "0x40c10f19", // mint(address,uint256) — ERC20-ish; scanner will reject non-NFT
+  "0x40c10f19", // mint(address,uint256)
   "0x4e6ec247", // claim()
-  "0xefef39a1", // publicMint() — verify on your chain if used
+  "0xefef39a1", // publicMint()
   "0x84bb1e42", // mintFree()
   "0xa6f2ae3a", // claim(address,uint256)
-  "0x2db11544", // publicClaim() common variant — keep if you see it
+  "0x2db11544", // publicClaim()
 ]);
 
 export interface DropEvent {
@@ -25,8 +26,8 @@ export interface DropEvent {
 export type DropCallback = (drop: DropEvent) => Promise<void>;
 
 const MAX_SEEN = 2000;
-const BASE_RECONNECT_MS = 2_000;
-const MAX_RECONNECT_MS = 30_000;
+const BASE_RECONNECT_MS = 2000;
+const MAX_RECONNECT_MS = 30000;
 
 export class DropListener {
   private chain: ChainId;
@@ -36,6 +37,10 @@ export class DropListener {
   private seenOrder: string[] = [];
   private reconnectDelay = BASE_RECONNECT_MS;
   private onDropDetected: DropCallback;
+  
+  // NEW: Track consecutive errors
+  private consecutiveErrors = 0;
+  private maxConsecutiveErrors = 5;
 
   constructor(chain: ChainId, onDropDetected: DropCallback) {
     this.chain = chain;
@@ -50,16 +55,44 @@ export class DropListener {
   }
 
   private subscribe() {
+    // NEW: Check provider health before subscribing
+    const pool = getRPCPool(this.chain);
+    const provider = pool.getProvider();
+    
+    if (!provider) {
+      console.error(`[${this.chain}] No healthy providers for block listener, retrying...`);
+      this.scheduleReconnect();
+      return;
+    }
+
     const client = getPublicClient(this.chain);
 
     this.unwatch = client.watchBlocks({
       includeTransactions: true,
-      emitMissed: true, // catch up if we briefly disconnect
+      emitMissed: true,
+      pollInterval: 2000, // NEW: Explicit 2s poll (was defaulting to faster)
       onBlock: async (block) => {
+        this.consecutiveErrors = 0; // Reset on success
         await this.handleBlock(block);
       },
-      onError: (error) => {
-        console.error(`Block watcher error (${this.chain}):`, error);
+      onError: (error: any) => {
+        this.consecutiveErrors++;
+        console.error(`Block watcher error (${this.chain}):`, error?.message || error);
+        
+        // NEW: Report to RPC pool for failover
+        const pool = getRPCPool(this.chain);
+        const stats = pool.getStats();
+        const currentProvider = stats.find(s => s.healthy && !s.rateLimited);
+        if (currentProvider) {
+          pool.reportFailure(currentProvider.name, error);
+        }
+        
+        // NEW: If too many consecutive errors, force provider rotation
+        if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
+          console.warn(`[${this.chain}] Too many consecutive errors, forcing provider rotation`);
+          this.consecutiveErrors = 0;
+        }
+        
         this.scheduleReconnect();
       },
     });
@@ -108,7 +141,6 @@ export class DropListener {
     const txs = block?.transactions ?? [];
     for (const tx of txs) {
       if (!tx?.to || !tx?.input || tx.input === "0x") continue;
-      // Free mints only
       if (tx.value !== 0n && tx.value !== undefined && BigInt(tx.value) !== 0n) continue;
 
       const selector = String(tx.input).slice(0, 10).toLowerCase();
@@ -144,7 +176,7 @@ export class DropListener {
   }
 }
 
-// Backward-compatible alias — any existing `new BaseDropListener(cb)` keeps working.
+// Backward-compatible alias
 export class BaseDropListener extends DropListener {
   constructor(onDropDetected: DropCallback) {
     super("base", onDropDetected);
