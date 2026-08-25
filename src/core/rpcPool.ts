@@ -1,6 +1,6 @@
 /**
  * RPC Pool - Enterprise Grade
- * Manages 10+ RPC providers with intelligent load balancing
+ * Manages multiple RPC providers with intelligent load balancing
  */
 
 interface RPCProvider {
@@ -13,34 +13,34 @@ interface RPCProvider {
   avgResponseTime: number;
   healthy: boolean;
   lastUsed: number;
-  rateLimitRemaining?: number;
 }
+
+type ChainId = "base" | "robinhood";
 
 class RPCPool {
   private providers: Map<string, RPCProvider> = new Map();
-  private chain: string;
+  private chain: ChainId;
   private healthCheckInterval: NodeJS.Timeout;
 
-  constructor(chain: string) {
+  constructor(chain: ChainId) {
     this.chain = chain;
     this.initializeProviders();
     this.startHealthChecks();
   }
 
   private initializeProviders(): void {
-    const configs: Record<string, Array<{ name: string; url: string; weight: number }>> = {
+    const configs: Record<ChainId, Array<{ name: string; url: string; weight: number }>> = {
       base: [
-        { name: "QuickNode-Base", url: process.env.QUICKNODE_BASE_RPC || "", weight: 30 },
-        { name: "Alchemy-Base", url: process.env.ALCHEMY_API_KEY ? `https://base-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : "", weight: 25 },
+        { name: "QuickNode-Base", url: process.env.QUICKNODE_BASE_RPC || "", weight: 35 },
+        { name: "Alchemy-Base", url: process.env.ALCHEMY_API_KEY ? `https://base-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : "", weight: 30 },
         { name: "Infura-Base", url: process.env.INFURA_BASE_RPC || "", weight: 20 },
-        { name: "Ankr-Base", url: "https://rpc.ankr.com/base", weight: 15 },
-        { name: "Chainstack-Base", url: process.env.CHAINSTACK_BASE_RPC || "", weight: 15 },
+        { name: "Ankr-Base", url: "https://rpc.ankr.com/base", weight: 10 },
         { name: "Public-Base", url: "https://mainnet.base.org", weight: 5 },
       ],
       robinhood: [
-        { name: "QuickNode-RH", url: process.env.QUICKNODE_ROBINHOOD_RPC || "", weight: 40 },
-        { name: "Alchemy-RH", url: process.env.ALCHEMY_API_KEY ? `https://robinhood-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : "", weight: 35 },
-        { name: "Public-RH", url: "https://robinhoodchain.blockscout.com", weight: 25 },
+        { name: "QuickNode-RH", url: process.env.QUICKNODE_ROBINHOOD_RPC || "", weight: 60 },
+        { name: "Alchemy-RH", url: process.env.ALCHEMY_API_KEY ? `https://robinhood-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : "", weight: 30 },
+        { name: "Public-RH", url: "https://robinhoodchain.blockscout.com", weight: 10 },
       ],
     };
 
@@ -62,18 +62,17 @@ class RPCPool {
       });
     }
 
-    console.log(`🌐 RPC Pool initialized for ${this.chain} with ${this.providers.size} providers`);
+    console.log(`RPC Pool initialized for ${this.chain} with ${this.providers.size} providers`);
   }
 
   public getProvider(): RPCProvider {
     const healthy = Array.from(this.providers.values()).filter(p => p.healthy);
     
     if (healthy.length === 0) {
-      // Emergency: use any provider
-      return Array.from(this.providers.values())[0];
+      const anyProvider = Array.from(this.providers.values())[0];
+      return anyProvider;
     }
 
-    // Weighted random selection based on performance
     const totalWeight = healthy.reduce((sum, p) => {
       const performanceScore = Math.max(0, 100 - p.avgResponseTime);
       const reliabilityScore = Math.max(0, 100 - p.failedRequests * 10);
@@ -115,29 +114,25 @@ class RPCPool {
     provider.failedRequests++;
     provider.currentLoad = Math.max(0, provider.currentLoad - 1);
     
-    // Mark unhealthy if too many failures
     if (provider.failedRequests > 10) {
       provider.healthy = false;
-      console.warn(`⚠️ ${providerName} marked unhealthy`);
+      console.warn(`${provider.name} marked unhealthy`);
     }
     
-    // Check for rate limit
-    if (error?.status === 429 || error?.message?.includes('rate')) {
-      console.warn(`⏳ ${providerName} rate limited`);
+    if (error?.status === 429 || error?.message?.includes("rate")) {
+      console.warn(`${provider.name} rate limited`);
     }
   }
 
   private startHealthChecks(): void {
     this.healthCheckInterval = setInterval(() => {
       for (const [name, provider] of this.providers) {
-        // Recover providers after 60 seconds
         if (!provider.healthy && Date.now() - provider.lastUsed > 60000) {
           provider.healthy = true;
           provider.failedRequests = Math.floor(provider.failedRequests * 0.5);
-          console.log(`✅ ${name} recovered`);
+          console.log(`${name} recovered`);
         }
         
-        // Reset load counters
         provider.currentLoad = Math.max(0, provider.currentLoad - 1);
       }
     }, 10000);
@@ -157,16 +152,15 @@ class RPCPool {
   }
 }
 
-// Global pools
-const pools: Map<string, RPCPool> = new Map();
+const pools: Map<ChainId, RPCPool> = new Map();
 
-export function getRPCPool(chain: string): RPCPool {
+export function getRPCPool(chain: ChainId): RPCPool {
   if (!pools.has(chain)) {
     pools.set(chain, new RPCPool(chain));
   }
   return pools.get(chain)!;
 }
 
-export function getRPCStats(chain: string): Array<{ name: string; healthy: boolean; load: number; avgTime: number }> {
+export function getRPCStats(chain: ChainId): Array<{ name: string; healthy: boolean; load: number; avgTime: number }> {
   return getRPCPool(chain).getStats();
 }
