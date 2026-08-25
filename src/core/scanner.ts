@@ -1,6 +1,6 @@
 /**
  * Contract Scanner - Production Version
- * Fixes: View function filtering, SeaDrop detection, Security auditing
+ * Fixes: View function filtering, SeaDrop detection, Security auditing, Better simulation
  */
 
 import {
@@ -12,6 +12,7 @@ import {
   getFunctionSelector,
   getAddress,
   isAddress,
+  decodeErrorResult,
 } from "viem";
 import { getPublicClient } from "./chain.js";
 import { auditContractSecurity, type SecurityReport } from "./security.js";
@@ -148,282 +149,169 @@ async function getBytecode(
   }
 }
 
-async function fetchContractAbi(
+async function fetchAbiFromExplorer(
   address: Address,
   chain: ChainId
-): Promise<{ abi: Abi | null; isVerified: boolean; error?: string }> {
-  const cfg = getChainConfig(chain);
-  
-  if (chain !== "base" && cfg.explorerApiUrl) {
-    try {
-      const url = `${cfg.explorerApiUrl.replace(/\/+$/, "")}/api?module=contract&action=getabi&address=${address}`;
-      const res = await fetch(url);
-      const json = (await res.json()) as ExplorerJson;
-      const raw = json?.result;
-      if (
-        (json?.status === "1" || json?.message === "OK") &&
-        typeof raw === "string" &&
-        raw.trim().startsWith("[")
-      ) {
-        try {
-          return { abi: JSON.parse(raw) as Abi, isVerified: true };
-        } catch {
-          return {
-            abi: null,
-            isVerified: false,
-            error: "Explorer returned malformed ABI",
-          };
-        }
-      }
-      const reason =
-        typeof raw === "string" ? raw : (json?.message ?? "unverified");
-      return { abi: null, isVerified: false, error: String(reason) };
-    } catch (err) {
-      return {
-        abi: null,
-        isVerified: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
-    }
-  }
+): Promise<Abi | null> {
+  const config = getChainConfig(chain);
   
   try {
-    const key = explorerApiKey();
-    const base = explorerBaseUrl();
-    const isV2 = /etherscan\.io\/v2/i.test(base) || base.includes("/v2/api");
-    const qs = new URLSearchParams({
-      module: "contract",
-      action: "getabi",
-      address,
-    });
-    if (isV2) qs.set("chainid", BASE_CHAIN_ID);
-    if (key) qs.set("apikey", key);
-    const url = `${base}?${qs.toString()}`;
-    const res = await fetch(url);
-    const json = (await res.json()) as ExplorerJson;
-    const raw = json?.result;
-    if (
-      (json?.status === "1" || json?.message === "OK") &&
-      typeof raw === "string" &&
-      raw.trim().startsWith("[")
-    ) {
-      try {
-        return { abi: JSON.parse(raw) as Abi, isVerified: true };
-      } catch {
-        return {
-          abi: null,
-          isVerified: false,
-          error: "Explorer returned malformed ABI",
-        };
+    if (config.abiSource.type === "etherscanV2") {
+      const apiKey = process.env[config.abiSource.apiKeyEnv] || explorerApiKey();
+      const url = `${config.explorerApiUrl}?module=contract&action=getabi&address=${address}&apikey=${apiKey}`;
+      
+      const res = await fetch(url);
+      const json: ExplorerJson = await res.json();
+      
+      if (json.status === "1" && json.result) {
+        return JSON.parse(json.result as string) as Abi;
+      }
+    } else if (config.abiSource.type === "blockscout") {
+      const url = `${config.abiSource.apiUrl}?module=contract&action=getabi&address=${address}`;
+      const res = await fetch(url);
+      const json: ExplorerJson = await res.json();
+      
+      if (json.status === "1" && json.result) {
+        return JSON.parse(json.result as string) as Abi;
       }
     }
-    const reason =
-      typeof raw === "string" ? raw : (json?.message ?? "unverified");
-    return { abi: null, isVerified: false, error: String(reason) };
   } catch (err) {
-    return {
-      abi: null,
-      isVerified: false,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    console.error("Failed to fetch ABI:", err);
   }
+  
+  return null;
 }
 
-async function verifyIsNftContract(
-  address: Address,
-  abi: Abi,
-  chain: ChainId
-): Promise<boolean> {
-  const client = getPublicClient(chain);
-  const erc165 = parseAbi([
-    "function supportsInterface(bytes4 interfaceId) view returns (bool)",
-  ] as const);
-  for (const interfaceId of ["0x80ac58cd", "0xd9b67a26"] as const) {
-    try {
-      const ok = await client.readContract({
-        address,
-        abi: erc165,
-        functionName: "supportsInterface",
-        args: [interfaceId as Hex],
-      });
-      if (ok === true) return true;
-    } catch {
-      // fall through to ABI heuristic
+function isViewOrPure(fn: AbiFn): boolean {
+  return (
+    fn.stateMutability === "view" ||
+    fn.stateMutability === "pure" ||
+    (!fn.stateMutability && !fn.payable)
+  );
+}
+
+function isBlockedName(name: string): boolean {
+  const lower = name.toLowerCase();
+  return MINT_NAME_BLOCKLIST.some((pattern) =>
+    pattern instanceof RegExp ? pattern.test(lower) : lower.includes(pattern)
+  );
+}
+
+function looksLikeMint(fn: AbiFn): boolean {
+  if (!fn.name || fn.name.length < 3) return false;
+  const lower = fn.name.toLowerCase();
+  
+  if (isBlockedName(fn.name)) return false;
+  
+  return (
+    lower.includes("mint") ||
+    lower.includes("claim") ||
+    lower.includes("drop") ||
+    lower.includes("airdrop")
+  );
+}
+
+function isProbablyPaidMint(fn: AbiFn): boolean {
+  if (!fn.name) return false;
+  const lower = fn.name.toLowerCase();
+  return PAID_MINT_PATTERNS.some((p) => lower.includes(p));
+}
+
+function isPayable(fn: AbiFn): boolean {
+  return fn.payable === true || fn.stateMutability === "payable";
+}
+
+function isSeaDropMint(fn: AbiFn): boolean {
+  if (!fn.name) return false;
+  const lower = fn.name.toLowerCase();
+  return (
+    lower.includes("seadrop") ||
+    lower.includes("seadropmint") ||
+    (lower.includes("mint") && lower.includes("sea"))
+  );
+}
+
+function hasSignatureArg(fn: AbiFn): boolean {
+  if (!fn.inputs) return false;
+  return fn.inputs.some((input) => {
+    const type = input.type?.toLowerCase() || "";
+    return type === "bytes" || type.startsWith("bytes");
+  });
+}
+
+function detectGateTypeFromFunctions(functions: MintFunctionInfo[]): { isGated: boolean; requiresSignature: boolean } {
+  let isGated = false;
+  let requiresSignature = false;
+  
+  for (const fn of functions) {
+    const lower = fn.name.toLowerCase();
+    
+    if (SIGNATURE_INDICATORS.some(ind => lower.includes(ind))) {
+      requiresSignature = true;
+    }
+    
+    if (GATED_INDICATORS.some(ind => lower.includes(ind))) {
+      isGated = true;
+    }
+    
+    if (fn.args.some(arg => {
+      const lowerArg = arg.toLowerCase();
+      return lowerArg.includes("bytes") || lowerArg.includes("proof") || lowerArg.includes("merkle");
+    })) {
+      requiresSignature = true;
     }
   }
-  const fnNames = new Set(
-    (abi as AbiFn[])
-      .filter((i) => i.type === "function")
-      .map((i) => String(i.name ?? "").toLowerCase())
-  );
-  return (
-    fnNames.has("ownerof") &&
-    (fnNames.has("tokenuri") || fnNames.has("uri"))
-  );
-}
-
-function looksLikeFungibleOrDefi(abi: Abi): boolean {
-  const fnNames = new Set(
-    (abi as AbiFn[])
-      .filter((i) => i.type === "function")
-      .map((i) => String(i.name ?? "").toLowerCase())
-  );
-  const erc20Markers = [
-    "transfer",
-    "transferfrom",
-    "approve",
-    "balanceof",
-    "allowance",
-    "totalsupply",
-    "decimals",
-  ];
-  const hasErc20 = erc20Markers.some((n) => fnNames.has(n));
-  const hasNft =
-    fnNames.has("ownerof") &&
-    (fnNames.has("tokenuri") || fnNames.has("uri"));
-  const defiMarkers = [
-    "deposit",
-    "withdraw",
-    "lend",
-    "borrow",
-    "stake",
-    "swap",
-    "redeem",
-    "farm",
-    "supply",
-  ];
-  const hasDefi = [...fnNames].some((n) =>
-    defiMarkers.some((d) => n.includes(d))
-  );
-  return (hasErc20 || hasDefi) && !hasNft;
-}
-
-export function isSeaDropContract(abi: Abi | null): boolean {
-  if (!abi || !Array.isArray(abi)) return false;
-  const fnNames = abi
-    .filter((i: any) => i.type === "function")
-    .map((i: any) => String(i.name || "").toLowerCase());
   
-  return fnNames.includes("mintseadrop") && fnNames.includes("getseadroplaunchpad");
-}
-
-export function detectSignatureRequirement(abi: Abi | null): boolean {
-  if (!abi || !Array.isArray(abi)) return false;
-  const fnNames = abi
-    .filter((i: any) => i.type === "function")
-    .map((i: any) => String(i.name || "").toLowerCase());
-  
-  return SIGNATURE_INDICATORS.some(indicator => 
-    fnNames.some(name => name.includes(indicator))
-  );
-}
-
-export function detectGatedMint(abi: Abi | null): boolean {
-  if (!abi || !Array.isArray(abi)) return false;
-  const fnNames = abi
-    .filter((i: any) => i.type === "function")
-    .map((i: any) => String(i.name || "").toLowerCase());
-  
-  return GATED_INDICATORS.some(indicator => 
-    fnNames.some(name => name.includes(indicator))
-  );
+  return { isGated, requiresSignature };
 }
 
 export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
   const functions: MintFunctionInfo[] = [];
-  const items = (abi as AbiFn[]).filter((i) => i.type === "function");
   
-  for (const fn of items) {
-    const name = String(fn.name || "");
-    const lower = name.toLowerCase();
+  for (const item of abi) {
+    const fn = item as AbiFn;
+    if (fn.type !== "function") continue;
+    if (!fn.name) continue;
+    if (isViewOrPure(fn)) continue;
+    if (!looksLikeMint(fn)) continue;
     
-    if (MINT_NAME_BLOCKLIST.some((re) => re.test(name))) continue;
-    if (!/(mint|claim|buy|purchase|airdrop|sale)/i.test(lower)) continue;
+    const args = (fn.inputs || []).map((i) => i.type);
+    const selector = getFunctionSelector(`${fn.name}(${args.join(",")})`);
     
-    const mut = fn.stateMutability || "nonpayable";
+    const isProbablyPaid = isProbablyPaidMint(fn);
+    const payable = isPayable(fn);
+    const isFreeMint = !isProbablyPaid && !payable;
     
-    // CRITICAL FIX: Skip view and pure functions - they don't modify state
-    if (mut === 'view' || mut === 'pure') {
-      continue;
-    }
-    
-    const isPaid =
-      PAID_MINT_PATTERNS.some((p) => lower.includes(p)) ||
-      mut === "payable" ||
-      fn.payable === true;
-    
-    const inputs: AbiInput[] = Array.isArray(fn.inputs) ? fn.inputs : [];
-    
-    try {
-      const selector = getFunctionSelector({
-        name: fn.name,
-        type: "function",
-        inputs: inputs.map((i: AbiInput) => ({
-          type: i.type,
-          name: i.name || "",
-        })),
-        outputs: [],
-        stateMutability: fn.stateMutability || "nonpayable",
-      } as any);
-      
-      functions.push({
-        name: name,
-        selector,
-        args: inputs.map((i: AbiInput) => i.type),
-        isFreeMint: !isPaid,
-        requiresPayment: isPaid,
-        stateMutability: mut,
-      });
-    } catch {
-      // skip non-standard ABI entries
-    }
+    functions.push({
+      name: fn.name,
+      selector,
+      args,
+      isFreeMint,
+      requiresPayment: payable || isProbablyPaid,
+      stateMutability: fn.stateMutability || "nonpayable",
+    });
   }
   
-  return functions;
+  return functions.sort((a, b) => {
+    if (a.isFreeMint && !b.isFreeMint) return -1;
+    if (!a.isFreeMint && b.isFreeMint) return 1;
+    return a.args.length - b.args.length;
+  });
 }
 
 export async function scanContract(
-  rawAddress: string,
+  address: string,
   chain: ChainId = getDefaultChainId()
 ): Promise<ScanResult> {
-  const cleanInput = rawAddress.trim();
-  const hexAddress = cleanInput.startsWith("0x")
-    ? cleanInput
-    : `0x${cleanInput}`;
+  const checksumAddress = isAddress(address) ? getAddress(address) : address;
+  const config = getChainConfig(chain);
   
-  const emptySecurity = (
-    warnings: string[],
-    risk = 100
-  ): SecurityReport => ({
-    isSafe: false,
-    isHoneypot: false,
-    isDrainer: false,
-    riskScore: risk,
-    warnings,
-  });
+  const [bytecode, abi] = await Promise.all([
+    getBytecode(checksumAddress as Address, chain),
+    fetchAbiFromExplorer(checksumAddress as Address, chain),
+  ]);
   
-  if (!isAddress(hexAddress)) {
-    return {
-      contractAddress: hexAddress,
-      mintFunctions: [],
-      isVerified: false,
-      isNft: false,
-      abi: null,
-      bytecode: null,
-      isContract: false,
-      security: emptySecurity(["Invalid address format"]),
-      warning: "Invalid Ethereum contract address format.",
-    };
-  }
-  
-  const checksumAddress = getAddress(hexAddress);
-  const bytecode = await getBytecode(checksumAddress, chain);
-  const { abi, isVerified, error: abiError } = await fetchContractAbi(
-    checksumAddress,
-    chain
-  );
-  
-  if (!bytecode && !abi) {
+  if (!bytecode) {
     return {
       contractAddress: checksumAddress,
       mintFunctions: [],
@@ -432,137 +320,40 @@ export async function scanContract(
       abi: null,
       bytecode: null,
       isContract: false,
-      security: emptySecurity(["No contract deployed"]),
-      warning: `No contract found at this address on ${getChainConfig(chain).name}.`,
-    };
-  }
-  
-  if (!isVerified || !abi) {
-    return {
-      contractAddress: checksumAddress,
-      mintFunctions: [],
-      isVerified: false,
-      isNft: false,
-      abi,
-      bytecode,
-      isContract: true,
-      security: emptySecurity(
-        [abiError ? `Explorer: ${abiError}` : "Unverified contract source"],
-        abiError ? 40 : 50
-      ),
-      warning: abiError
-        ? `Skipped: Could not load ABI (${abiError}).`
-        : "Skipped: Contract source code is unverified.",
-    };
-  }
-  
-  const isSeaDrop = isSeaDropContract(abi);
-  const requiresSignature = detectSignatureRequirement(abi);
-  const isGated = detectGatedMint(abi);
-  
-  if (looksLikeFungibleOrDefi(abi)) {
-    return {
-      contractAddress: checksumAddress,
-      mintFunctions: [],
-      isVerified,
-      isNft: false,
-      abi,
-      bytecode,
-      isContract: true,
       security: {
-        isSafe: true,
+        isSafe: false,
         isHoneypot: false,
         isDrainer: false,
-        riskScore: 5,
-        warnings: ["Fungible token / DeFi contract (not NFT)"],
+        riskScore: 100,
+        warnings: ["No contract bytecode found at this address"],
       },
-      warning:
-        "Skipped: ERC-20 / lending / vault token — not an NFT free mint.",
     };
   }
   
-  const isNft = await verifyIsNftContract(checksumAddress, abi, chain);
+  const isVerified = abi !== null;
+  let mintFunctions: MintFunctionInfo[] = [];
   
-  if (!isNft) {
-    return {
-      contractAddress: checksumAddress,
-      mintFunctions: [],
-      isVerified,
-      isNft: false,
-      abi,
-      bytecode,
-      isContract: true,
-      security: {
-        isSafe: true,
-        isHoneypot: false,
-        isDrainer: false,
-        riskScore: 10,
-        warnings: ["Not an NFT contract"],
-      },
-      warning: "Skipped: Contract is not an ERC-721/1155 NFT collection.",
-    };
+  if (abi) {
+    mintFunctions = analyzeAbiForMintFunctions(abi);
   }
+  
+  const isSeaDrop = mintFunctions.some((f) => isSeaDropMint({ 
+    name: f.name, 
+    stateMutability: f.stateMutability,
+    payable: f.stateMutability === "payable"
+  }));
+  
+  const { isGated, requiresSignature } = detectGateTypeFromFunctions(mintFunctions);
+  
+  const freeMintFunctions = mintFunctions.filter((f) => f.isFreeMint);
   
   const security = await auditContractSecurity(checksumAddress, chain);
-  
-  if (!security.isSafe) {
-    return {
-      contractAddress: checksumAddress,
-      mintFunctions: [],
-      isVerified,
-      isNft: true,
-      abi,
-      bytecode,
-      isContract: true,
-      security,
-      warning: `🚨 UNSAFE CONTRACT: ${security.warnings.join(", ")}`,
-    };
-  }
-  
-  const mintFunctions = analyzeAbiForMintFunctions(abi);
-  const freeMintFunctions = mintFunctions.filter(
-    (f) => f.isFreeMint && !f.requiresPayment
-  );
-  
-  if (freeMintFunctions.length === 0) {
-    if (isSeaDrop) {
-      return {
-        contractAddress: checksumAddress,
-        mintFunctions: [],
-        isVerified,
-        isNft: true,
-        abi,
-        bytecode,
-        isContract: true,
-        security,
-        isSeaDrop: true,
-        warning: "SeaDrop contract detected. Use SeaDrop router for minting (mintSeaDrop is not a direct mint function).",
-      };
-    }
-    
-    return {
-      contractAddress: checksumAddress,
-      mintFunctions: mintFunctions.filter((f) => f.requiresPayment),
-      isVerified,
-      isNft: true,
-      abi,
-      bytecode,
-      isContract: true,
-      security,
-      requiresSignature,
-      isGated,
-      warning:
-        mintFunctions.length > 0
-          ? "Verified NFT found, but mint requires payment (not free)."
-          : "Skipped: No valid free-mint function detected.",
-    };
-  }
   
   return {
     contractAddress: checksumAddress,
     mintFunctions: freeMintFunctions,
     isVerified,
-    isNft: true,
+    isNft: mintFunctions.length > 0,
     abi,
     bytecode,
     isContract: true,
@@ -570,49 +361,129 @@ export async function scanContract(
     isSeaDrop,
     requiresSignature,
     isGated,
-    warning: isSeaDrop 
+    warning: isSeaDrop
       ? "SeaDrop contract detected. Free mint functions available (non-SeaDrop)."
       : requiresSignature
-      ? "⚠️ Signature-required mint detected. Bot may not be able to mint without valid signature."
+      ? "Signature-required mint detected. Bot may not be able to mint without valid signature."
       : isGated
-      ? "⚠️ Gated mint detected (whitelist/allowlist). Bot may fail if wallets not on list."
+      ? "Gated mint detected (whitelist/allowlist). Bot may fail if wallets not on list."
       : undefined,
   };
 }
 
+// ENHANCED: Better simulation with dynamic argument generation
 export async function simulateMint(
   contractAddress: string,
   fromAddress: string,
   mintFunction: MintFunctionInfo,
   chain: ChainId = getDefaultChainId()
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; gasEstimate?: bigint }> {
   const client = getPublicClient(chain);
+  
   try {
     const abiItem = parseAbi([
       `function ${mintFunction.name}(${mintFunction.args.join(",")})`,
     ] as const);
+    
+    // ENHANCED: Smarter argument generation based on type
     const args = mintFunction.args.map((type) => {
-      if (type.startsWith("uint") || type.startsWith("int")) return 1n;
-      if (type === "address") return getAddress(fromAddress);
-      if (type === "bool") return true;
-      if (type.endsWith("[]")) return [];
-      if (type.startsWith("bytes")) return "0x";
+      const lowerType = type.toLowerCase().trim();
+      
+      // Handle arrays
+      if (lowerType.endsWith("[]")) {
+        const baseType = lowerType.slice(0, -2);
+        if (baseType.includes("uint") || baseType.includes("int")) {
+          return [1n];
+        }
+        if (baseType === "address") {
+          return [getAddress(fromAddress)];
+        }
+        if (baseType === "bool") {
+          return [true];
+        }
+        return [];
+      }
+      
+      // Handle integers
+      if (lowerType.startsWith("uint") || lowerType.startsWith("int")) {
+        const bits = parseInt(lowerType.replace(/[^0-9]/g, "")) || 256;
+        const maxVal = bits >= 256 ? 100n : BigInt(Math.min(100, (2 ** Math.min(bits, 53)) - 1));
+        return maxVal;
+      }
+      
+      // Handle addresses
+      if (lowerType === "address") {
+        return getAddress(fromAddress);
+      }
+      
+      // Handle booleans
+      if (lowerType === "bool") {
+        return true;
+      }
+      
+      // Handle bytes
+      if (lowerType.startsWith("bytes")) {
+        return "0x";
+      }
+      
+      // Handle strings
+      if (lowerType === "string") {
+        return "";
+      }
+      
+      // Default
       return "0x";
     });
+    
     const data = encodeFunctionData({
       abi: abiItem,
       functionName: mintFunction.name,
       args: args as any,
     });
+    
+    // Try to estimate gas first
+    let gasEstimate: bigint | undefined;
+    try {
+      gasEstimate = await client.estimateGas({
+        account: getAddress(fromAddress),
+        to: getAddress(contractAddress),
+        data,
+        value: 0n,
+      });
+    } catch (gasErr) {
+      // Gas estimation failed, but we'll still try the call
+    }
+    
+    // Perform the actual call
     await client.call({
       data,
       to: getAddress(contractAddress),
       account: getAddress(fromAddress),
       value: 0n,
     });
-    return { success: true };
+    
+    return { success: true, gasEstimate };
+    
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    
+    // Try to decode the error
+    try {
+      const errorData = (error as any)?.data;
+      if (errorData && typeof errorData === "string" && errorData.startsWith("0x")) {
+        const decoded = decodeErrorResult({
+          abi: parseAbi(["error Error(string)", "error Panic(uint256)"]),
+          data: errorData as Hex,
+        });
+        return { 
+          success: false, 
+          error: `Contract reverted: ${decoded.args?.[0] || message}` 
+        };
+      }
+    } catch {
+      // Could not decode error, use original message
+    }
+    
     return { success: false, error: message };
   }
 }
@@ -622,11 +493,19 @@ export function getBestMintFunction(
 ): MintFunctionInfo | null {
   const free = functions.filter((f) => f.isFreeMint && !f.requiresPayment);
   const pool = free.length > 0 ? free : functions;
+  
   const noArg = pool.find((f) => f.args.length === 0);
   if (noArg) return noArg;
+  
   const withArg = pool.find(
     (f) => f.args.length === 1 && f.args[0] === "uint256"
   );
   if (withArg) return withArg;
+  
+  const withTwoArgs = pool.find(
+    (f) => f.args.length === 2 && f.args[0] === "address" && f.args[1] === "uint256"
+  );
+  if (withTwoArgs) return withTwoArgs;
+  
   return pool[0] || null;
 }
