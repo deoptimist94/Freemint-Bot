@@ -37,7 +37,6 @@ const REQUEST_TIMEOUT_MS = 12_000;
 const MAX_NFTS_PER_WALLET = 300;
 const MAX_PAGES = 5;
 const PAGE_SIZE = 100;
-// Floors are fetched once per unique contract (not once per token).
 const FLOOR_CONCURRENCY = 6;
 const FLOOR_TIME_BUDGET_MS = 25_000;
 
@@ -181,7 +180,6 @@ export async function fetchWalletPortfolio(
     openseaUrl: `https://opensea.io/assets/${config.openseaChain}/${n.contractAddress}/${n.tokenId}`,
   }));
 
-  // ONE floor lookup per unique contract — Onchain Blocks (100+ tokens) = 1 call.
   const uniqueContracts = [...new Set(nfts.map((n) => n.contractAddress))];
   const tokenByContract = new Map<string, string>();
   for (const n of nfts) {
@@ -229,9 +227,6 @@ export async function fetchWalletPortfolio(
     if (!floor) continue;
     item.floorPriceEth = floor.floorPriceEth;
     item.topBidEth = floor.topBidEth;
-    // autoLister falls back to "<Chain> NFT" (e.g. "Base NFT") when no floor
-    // source knows the collection — never let that generic placeholder clobber
-    // the real collection name that Alchemy wallet metadata already provided.
     if (floor.collectionName && floor.collectionName !== `${config.name} NFT`) {
       item.collectionName = floor.collectionName;
       if (!item.name || item.name.startsWith("Token #")) {
@@ -250,11 +245,10 @@ export async function executeSell(
   tokenId: string,
   chain: ChainId = getDefaultChainId()
 ): Promise<SellResult> {
-  // Reservoir does not support Robinhood Chain yet — no best-bid execution.
   if (chain !== "base") {
     return {
       success: false,
-      error: "🔜 Sell coming soon on Robinhood Chain — marketplace support is not live yet.",
+      error: "Sell coming soon on Robinhood Chain — marketplace support is not live yet.",
     };
   }
 
@@ -312,11 +306,15 @@ export async function executeSell(
       privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`
     ) as Hex;
     const walletClient = getWalletClient(hexKey);
+    
+    // FIX: Added account field
     const txHash = await walletClient.sendTransaction({
+      account: walletClient.account,
       to: txData.to as Address,
       data: (txData.data ?? "0x") as Hex,
       value: BigInt(txData.value ?? "0"),
     });
+    
     await getPublicClient().waitForTransactionReceipt({ hash: txHash });
     const payoutEth = Number(BigInt(txData.value ?? "0")) / 1e18;
     return { success: true, txHash, payoutEth };
