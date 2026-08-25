@@ -307,9 +307,9 @@ export async function executeSell(
     ) as Hex;
     const walletClient = getWalletClient(hexKey);
     
-    // FIX: Added account field
+    // FIX: Added account field for viem 2.x compatibility
     const txHash = await walletClient.sendTransaction({
-      account: walletClient.account,
+      account: walletClient.account!, // Required in viem 2.x
       to: txData.to as Address,
       data: (txData.data ?? "0x") as Hex,
       value: BigInt(txData.value ?? "0"),
