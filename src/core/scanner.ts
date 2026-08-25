@@ -161,7 +161,7 @@ async function fetchAbiFromExplorer(
       const url = `${config.explorerApiUrl}?module=contract&action=getabi&address=${address}&apikey=${apiKey}`;
       
       const res = await fetch(url);
-      const json: ExplorerJson = await res.json();
+      const json = await res.json() as ExplorerJson;
       
       if (json.status === "1" && json.result) {
         return JSON.parse(json.result as string) as Abi;
@@ -169,7 +169,7 @@ async function fetchAbiFromExplorer(
     } else if (config.abiSource.type === "blockscout") {
       const url = `${config.abiSource.apiUrl}?module=contract&action=getabi&address=${address}`;
       const res = await fetch(url);
-      const json: ExplorerJson = await res.json();
+      const json = await res.json() as ExplorerJson;
       
       if (json.status === "1" && json.result) {
         return JSON.parse(json.result as string) as Abi;
@@ -371,7 +371,6 @@ export async function scanContract(
   };
 }
 
-// ENHANCED: Better simulation with dynamic argument generation
 export async function simulateMint(
   contractAddress: string,
   fromAddress: string,
@@ -385,11 +384,9 @@ export async function simulateMint(
       `function ${mintFunction.name}(${mintFunction.args.join(",")})`,
     ] as const);
     
-    // ENHANCED: Smarter argument generation based on type
     const args = mintFunction.args.map((type) => {
       const lowerType = type.toLowerCase().trim();
       
-      // Handle arrays
       if (lowerType.endsWith("[]")) {
         const baseType = lowerType.slice(0, -2);
         if (baseType.includes("uint") || baseType.includes("int")) {
@@ -404,34 +401,26 @@ export async function simulateMint(
         return [];
       }
       
-      // Handle integers
       if (lowerType.startsWith("uint") || lowerType.startsWith("int")) {
-        const bits = parseInt(lowerType.replace(/[^0-9]/g, "")) || 256;
-        const maxVal = bits >= 256 ? 100n : BigInt(Math.min(100, (2 ** Math.min(bits, 53)) - 1));
-        return maxVal;
+        return 1n;
       }
       
-      // Handle addresses
       if (lowerType === "address") {
         return getAddress(fromAddress);
       }
       
-      // Handle booleans
       if (lowerType === "bool") {
         return true;
       }
       
-      // Handle bytes
       if (lowerType.startsWith("bytes")) {
         return "0x";
       }
       
-      // Handle strings
       if (lowerType === "string") {
         return "";
       }
       
-      // Default
       return "0x";
     });
     
@@ -441,7 +430,6 @@ export async function simulateMint(
       args: args as any,
     });
     
-    // Try to estimate gas first
     let gasEstimate: bigint | undefined;
     try {
       gasEstimate = await client.estimateGas({
@@ -454,7 +442,6 @@ export async function simulateMint(
       // Gas estimation failed, but we'll still try the call
     }
     
-    // Perform the actual call
     await client.call({
       data,
       to: getAddress(contractAddress),
@@ -467,7 +454,6 @@ export async function simulateMint(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     
-    // Try to decode the error
     try {
       const errorData = (error as any)?.data;
       if (errorData && typeof errorData === "string" && errorData.startsWith("0x")) {
