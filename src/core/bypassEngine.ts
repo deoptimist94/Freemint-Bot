@@ -724,9 +724,9 @@ async function tryDirectMint(
     try {
       const walletClient = getWalletClient(hexKey);
       
-      // FIX: Added account field
+      // FIX: Added account field for viem 2.x compatibility
       const txHash = await walletClient.sendTransaction({
-        account: walletClient.account,
+        account: walletClient.account!, // Required in viem 2.x
         to: address as Address,
         data,
         value: 0n,
@@ -943,9 +943,9 @@ async function tryMatrix(
     try {
       const walletClient = getWalletClient(hexKey);
       
-      // FIX: Added account field
+      // FIX: Added account field for viem 2.x compatibility
       const txHash = await walletClient.sendTransaction({
-        account: walletClient.account,
+        account: walletClient.account!, // Required in viem 2.x
         to: address as Address,
         data: hit.data,
         value: 0n,
