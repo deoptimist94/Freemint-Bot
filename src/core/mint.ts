@@ -329,9 +329,10 @@ async function executeSingleMint(
       const walletClient = getWalletClient(hexKey, chain);
       const publicClient = getPublicClient(chain);
       
-      // FIXED: assertGasSafe only takes one argument
-      const gasSafe = await assertGasSafe(BigInt(0));
-      if (!gasSafe) {
+      // FIXED: assertGasSafe returns void, so use try/catch
+      try {
+        await assertGasSafe(BigInt(0));
+      } catch (gasError) {
         throw new Error("Gas price exceeds safety limit");
       }
       
@@ -361,7 +362,6 @@ async function executeSingleMint(
         gasLimit = 500000n;
       }
       
-      // FIXED: Added chain property
       const txHash = await walletClient.sendTransaction({
         account: walletClient.account!,
         to: getAddress(nftContract),
