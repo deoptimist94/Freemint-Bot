@@ -1,3 +1,8 @@
+/**
+ * Mint Engine - Production Version
+ * Features: Error classification, RPC failover, SeaDrop support, History tracking
+ */
+
 import {
   type Address,
   type Hex,
@@ -22,7 +27,7 @@ export interface MintResult {
   success: boolean;
   txHash?: string;
   error?: string;
-  basescanUrl?: string;
+  errorCategory?: string;
   iteration?: number;
 }
 
@@ -46,6 +51,23 @@ export interface MintOptions {
   seaDropContext?: SeaDropContext;
 }
 
+export type MintErrorCategory = 
+  | "WHITELIST"
+  | "SIGNATURE"
+  | "SOLD_OUT"
+  | "TIMING"
+  | "GAS"
+  | "RPC"
+  | "INSUFFICIENT_FUNDS"
+  | "UNKNOWN";
+
+export interface ClassifiedError {
+  category: MintErrorCategory;
+  message: string;
+  retryable: boolean;
+  userFriendly: string;
+}
+
 const userMintQuantities = new Map<bigint, number>();
 
 export function getUserMintQuantity(userId: bigint): number {
@@ -60,6 +82,148 @@ export function setUserMintQuantity(userId: bigint, quantity: number): void {
 const SEADROP_ROUTER_ABI = parseAbi([
   "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
 ] as const);
+
+// Standard transfer events for receipt verification
+const STANDARD_TRANSFER_EVENTS = parseAbi([
+  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
+  "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
+  "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
+] as const);
+
+export function classifyMintError(error: string | Error): ClassifiedError {
+  const errorStr = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  
+  // Whitelist/Allowlist errors
+  if (
+    errorStr.includes("not whitelisted") ||
+    errorStr.includes("not on whitelist") ||
+    errorStr.includes("allowlist") ||
+    errorStr.includes("not eligible") ||
+    errorStr.includes("unauthorized") ||
+    errorStr.includes("caller is not") ||
+    errorStr.includes("merkle") ||
+    errorStr.includes("proof") ||
+    errorStr.includes("not in merkle tree")
+  ) {
+    return {
+      category: "WHITELIST",
+      message: errorStr,
+      retryable: false,
+      userFriendly: "❌ WHITELISTED: Your wallet is not on the allowlist for this mint.",
+    };
+  }
+  
+  // Signature errors
+  if (
+    errorStr.includes("signature") ||
+    errorStr.includes("invalid signer") ||
+    errorStr.includes("ecrecover") ||
+    errorStr.includes("0xe12d2314") ||
+    errorStr.includes("invalid signature")
+  ) {
+    return {
+      category: "SIGNATURE",
+      message: errorStr,
+      retryable: false,
+      userFriendly: "❌ SIGNATURE REQUIRED: This mint requires a valid signature from the project.",
+    };
+  }
+  
+  // Sold out / Supply errors
+  if (
+    errorStr.includes("sold out") ||
+    errorStr.includes("exceeds supply") ||
+    errorStr.includes("max supply") ||
+    errorStr.includes("no tokens left") ||
+    errorStr.includes("minting closed") ||
+    errorStr.includes("sale closed") ||
+    errorStr.includes("all tokens have been minted") ||
+    errorStr.includes("exceeds max") ||
+    errorStr.includes("cap reached")
+  ) {
+    return {
+      category: "SOLD_OUT",
+      message: errorStr,
+      retryable: false,
+      userFriendly: "❌ SOLD OUT: All NFTs in this collection have been minted.",
+    };
+  }
+  
+  // Timing errors
+  if (
+    errorStr.includes("not started") ||
+    errorStr.includes("sale not active") ||
+    errorStr.includes("mint not active") ||
+    errorStr.includes("too early") ||
+    errorStr.includes("before start") ||
+    errorStr.includes("has not started") ||
+    errorStr.includes("not yet active")
+  ) {
+    return {
+      category: "TIMING",
+      message: errorStr,
+      retryable: true,
+      userFriendly: "⏰ NOT YET ACTIVE: This mint hasn't started yet.",
+    };
+  }
+  
+  // Gas errors
+  if (
+    errorStr.includes("gas") ||
+    errorStr.includes("estimate") ||
+    errorStr.includes("execution reverted") ||
+    errorStr.includes("intrinsic gas")
+  ) {
+    return {
+      category: "GAS",
+      message: errorStr,
+      retryable: true,
+      userFriendly: "⛽ GAS ERROR: Transaction simulation failed.",
+    };
+  }
+  
+  // RPC errors
+  if (
+    errorStr.includes("rpc") ||
+    errorStr.includes("network") ||
+    errorStr.includes("timeout") ||
+    errorStr.includes("connection") ||
+    errorStr.includes("rate limit") ||
+    errorStr.includes("compute units") ||
+    errorStr.includes("request failed") ||
+    errorStr.includes("503") ||
+    errorStr.includes("429")
+  ) {
+    return {
+      category: "RPC",
+      message: errorStr,
+      retryable: true,
+      userFriendly: "🌐 NETWORK ERROR: RPC provider issue.",
+    };
+  }
+  
+  // Insufficient funds
+  if (
+    errorStr.includes("insufficient funds") ||
+    errorStr.includes("not enough eth") ||
+    errorStr.includes("balance too low")
+  ) {
+    return {
+      category: "INSUFFICIENT_FUNDS",
+      message: errorStr,
+      retryable: false,
+      userFriendly: "💰 LOW BALANCE: Wallet doesn't have enough ETH for gas.",
+    };
+  }
+  
+  // Default
+  return {
+    category: "UNKNOWN",
+    message: errorStr,
+    retryable: false,
+    userFriendly: `❌ FAILED: ${errorStr.slice(0, 100)}${errorStr.length > 100 ? '...' : ''}`,
+  };
+}
 
 function buildMintArgs(
   mintFunction: MintFunctionInfo,
@@ -112,13 +276,6 @@ async function simulateMintWithArgs(
   }
 }
 
-// NFT receipt verification
-const STANDARD_TRANSFER_EVENTS = parseAbi([
-  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
-  "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
-  "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
-] as const);
-
 function mintEventsInReceipt(
   receipt: { logs: readonly unknown[] },
   walletAddress: string
@@ -161,7 +318,6 @@ async function readNftBalance(
   }
 }
 
-// SeaDrop Router Minting
 async function executeSeaDropMint(
   walletId: string,
   walletAddress: string,
@@ -210,7 +366,7 @@ async function executeSeaDropMint(
         success: false,
         txHash: hash,
         error: "Transaction reverted on-chain",
-        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
+        errorCategory: "GAS",
         iteration,
       };
     }
@@ -220,14 +376,15 @@ async function executeSeaDropMint(
     const balanceIncreased = balanceAfter !== null && balanceBefore !== null && balanceAfter > balanceBefore;
     
     if (!hasTransferEvent && !balanceIncreased) {
+      const classified = classifyMintError("TX mined but no NFT received");
       return {
         walletId,
         walletAddress,
         label: walletLabel,
         success: false,
         txHash: hash,
-        error: "TX mined but no NFT received (no Transfer log). The mint may be gated (whitelist/allowlist) or sold out.",
-        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
+        error: classified.userFriendly,
+        errorCategory: classified.category,
         iteration,
       };
     }
@@ -238,24 +395,23 @@ async function executeSeaDropMint(
       label: walletLabel,
       success: true,
       txHash: hash,
-      basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
       iteration,
     };
     
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const classified = classifyMintError(error);
     return {
       walletId,
       walletAddress,
       label: walletLabel,
       success: false,
-      error: message,
+      error: classified.userFriendly,
+      errorCategory: classified.category,
       iteration,
     };
   }
 }
 
-// Direct Contract Minting
 async function executeDirectMint(
   walletId: string,
   walletAddress: string,
@@ -287,12 +443,14 @@ async function executeDirectMint(
     
     const simResult = await simulateMintWithArgs(contractAddress, walletAddress, mintFunction, args);
     if (!simResult.success) {
+      const classified = classifyMintError(simResult.error || "Simulation failed");
       return {
         walletId,
         walletAddress,
         label: walletLabel,
         success: false,
-        error: `Simulation failed: ${simResult.error}`,
+        error: classified.userFriendly,
+        errorCategory: classified.category,
         iteration,
       };
     }
@@ -314,7 +472,7 @@ async function executeDirectMint(
         success: false,
         txHash: hash,
         error: "Transaction reverted on-chain",
-        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
+        errorCategory: "GAS",
         iteration,
       };
     }
@@ -324,14 +482,15 @@ async function executeDirectMint(
     const balanceIncreased = balanceAfter !== null && balanceBefore !== null && balanceAfter > balanceBefore;
     
     if (!hasTransferEvent && !balanceIncreased) {
+      const classified = classifyMintError("TX mined but no NFT received");
       return {
         walletId,
         walletAddress,
         label: walletLabel,
         success: false,
         txHash: hash,
-        error: "TX mined but no NFT received (no Transfer log). The mint may be gated (whitelist/allowlist) or sold out.",
-        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
+        error: classified.userFriendly,
+        errorCategory: classified.category,
         iteration,
       };
     }
@@ -342,24 +501,23 @@ async function executeDirectMint(
       label: walletLabel,
       success: true,
       txHash: hash,
-      basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
       iteration,
     };
     
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const classified = classifyMintError(error);
     return {
       walletId,
       walletAddress,
       label: walletLabel,
       success: false,
-      error: message,
+      error: classified.userFriendly,
+      errorCategory: classified.category,
       iteration,
     };
   }
 }
 
-// Main Batch Mint Function
 export async function batchMint(
   userId: bigint,
   contractAddress: string,
@@ -369,7 +527,7 @@ export async function batchMint(
   
   const targetContract = options?.contractAddress || contractAddress;
   
-  // Check gas safety - handle void return
+  // Check gas safety
   try {
     await assertGasSafe(userId);
   } catch (gasError: any) {
@@ -429,7 +587,11 @@ export async function batchMint(
       results: [],
       totalSuccess: 0,
       totalFailed: 0,
-      abortReason: "No free mint functions detected",
+      abortReason: scan.requiresSignature 
+        ? "Signature-required mint. Bot cannot generate valid signatures."
+        : scan.isGated 
+        ? "Gated/whitelist mint. Wallets may not be on allowlist."
+        : "No free mint functions detected",
     };
   }
   
@@ -462,7 +624,9 @@ export async function batchMint(
       if (res.success) {
         currentNonce++;
       } else {
-        break;
+        // Don't retry on non-retryable errors
+        const classified = classifyMintError(res.error || "");
+        if (!classified.retryable) break;
       }
       
       if (round < rounds) {
@@ -475,13 +639,12 @@ export async function batchMint(
   const totalFailed = allResults.filter((r) => !r.success).length;
   
   for (const r of allResults) {
-    await recordMintHistory(userId, targetContract, r.txHash || null, r.success ? "success" : "failed", chain);
+    await recordMintHistory(userId, targetContract, r.txHash || null, r.success ? "success" : "failed", chain, r.errorCategory);
   }
   
   return { contractAddress: targetContract, results: allResults, totalSuccess, totalFailed };
 }
 
-// SeaDrop Batch Mint
 async function executeSeaDropBatchMint(
   userId: bigint,
   nftContract: string,
@@ -516,7 +679,8 @@ async function executeSeaDropBatchMint(
       if (res.success) {
         currentNonce++;
       } else {
-        break;
+        const classified = classifyMintError(res.error || "");
+        if (!classified.retryable) break;
       }
       
       if (round < rounds) {
@@ -529,7 +693,7 @@ async function executeSeaDropBatchMint(
   const totalFailed = allResults.filter((r) => !r.success).length;
   
   for (const r of allResults) {
-    await recordMintHistory(userId, nftContract, r.txHash || null, r.success ? "success" : "failed", chain);
+    await recordMintHistory(userId, nftContract, r.txHash || null, r.success ? "success" : "failed", chain, r.errorCategory);
   }
   
   return { contractAddress: nftContract, results: allResults, totalSuccess, totalFailed };
@@ -548,11 +712,19 @@ async function recordMintHistory(
   contractAddress: string,
   txHash: string | null,
   status: string,
-  chain: ChainId
+  chain: ChainId,
+  errorCategory?: string
 ): Promise<void> {
   try {
     await prisma.mintHistory.create({
-      data: { userId, contractAddress, txHash, status, chain },
+      data: { 
+        userId, 
+        contractAddress, 
+        txHash, 
+        status, 
+        chain,
+        errorCategory: errorCategory || null,
+      },
     });
   } catch (err) {
     console.error("Failed to record mint history:", err);
@@ -567,7 +739,6 @@ export async function getMintHistory(userId: bigint, limit = 10) {
   });
 }
 
-// Backward compatibility
 export async function checkMintStillOpen(contractAddress: string): Promise<boolean> {
   return true;
 }
