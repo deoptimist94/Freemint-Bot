@@ -342,7 +342,6 @@ async function executeSeaDropMint(
     
     const balanceBefore = await readNftBalance(nftContract, walletAddress);
     
-    // FIX: Added chain and account parameters for viem 2.x compatibility
     const hash = await walletClient.writeContract({
       address: seaDropContext.routerAddress as Address,
       abi: SEADROP_ROUTER_ABI,
@@ -355,8 +354,8 @@ async function executeSeaDropMint(
       ],
       value: 0n,
       nonce,
-      chain: null, // Use the chain from walletClient
-      account: walletClient.account!, // Required in viem 2.x
+      chain: null,
+      account: walletClient.account!,
     });
     
     const publicClient = getPublicClient(chain);
@@ -462,13 +461,13 @@ async function executeDirectMint(
       };
     }
     
-    // FIX: Added account parameter for viem 2.x compatibility
     const hash = await walletClient.sendTransaction({
       to: getAddress(contractAddress),
       data,
       value: 0n,
       nonce,
-      account: walletClient.account!, // Required in viem 2.x
+      account: walletClient.account!,
+      chain: null,
     });
     
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
@@ -539,7 +538,6 @@ export async function batchMint(
   
   const targetContract = options?.contractAddress || contractAddress;
   
-  // Check gas safety
   try {
     await assertGasSafe(userId);
   } catch (gasError: any) {
@@ -563,12 +561,10 @@ export async function batchMint(
     };
   }
   
-  // If SeaDrop context is provided, route through SeaDrop router
   if (options?.seaDropContext?.isViaRouter) {
     return executeSeaDropBatchMint(userId, targetContract, options.seaDropContext, activeWallets);
   }
   
-  // Otherwise, scan and mint directly
   const scan = await scanContract(targetContract, chain);
   
   if (!scan.isContract || !scan.isNft) {
@@ -636,7 +632,6 @@ export async function batchMint(
       if (res.success) {
         currentNonce++;
       } else {
-        // Don't retry on non-retryable errors
         const classified = classifyMintError(res.error || "");
         if (!classified.retryable) break;
       }
