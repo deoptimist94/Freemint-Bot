@@ -1,10 +1,4 @@
-// Multi-chain registry — the single source of truth for Base + Robinhood Chain.
-//
-// Every chain-specific fact (RPC resolution, explorer, ABI source, NFT API,
-// floor ladder, badge) lives here so that scanner / autoLister / portfolio /
-// watch / UI only ever branch on a ChainId and read the rest from
-// getChainConfig(). The /chain toggle and 🌐 button use
-// ChainSelection + parseChainSelection on top of this.
+// Multi-chain registry - Alchemy-Only Configuration
 
 import { type Chain } from "viem";
 import { base } from "viem/chains";
@@ -15,40 +9,30 @@ export type ChainSelection = ChainId | "both";
 
 export const CHAIN_IDS: readonly ChainId[] = ["base", "robinhood"] as const;
 
-function alchemyApiKey(): string {
-  return (process.env.ALCHEMY_API_KEY || "").trim();
+// ALCHEMY-ONLY: Separate keys for each chain
+function alchemyBaseKey(): string {
+  return (process.env.ALCHEMY_BASE_API_KEY || "").trim();
 }
 
-// --- RPC resolution ---------------------------------------------------------
+function alchemyRobinhoodKey(): string {
+  return (process.env.ALCHEMY_ROBINHOOD_API_KEY || "").trim();
+}
 
-// Prefer explicit BASE_RPC_URL, then Alchemy (same key as the NFT API), then
-// public Base. Public mainnet.base.org rate-limits eth_call hard — that was
-// the "RPC Request failed" issue.
 export function resolveBaseRpcUrl(): string {
-  const explicit = (process.env.BASE_RPC_URL || "").trim();
-  if (explicit) return explicit;
-  const alchemy = alchemyApiKey();
-  if (alchemy) return `https://base-mainnet.g.alchemy.com/v2/${alchemy}`;
-  return "https://mainnet.base.org";
+  const key = alchemyBaseKey();
+  if (!key) {
+    throw new Error("ALCHEMY_BASE_API_KEY is required! Get one at dashboard.alchemy.com");
+  }
+  return `https://base-mainnet.g.alchemy.com/v2/${key}`;
 }
 
-// Robinhood Chain has NO public free RPC — an Alchemy key with the Robinhood
-// network enabled (or an explicit ROBINHOOD_RPC_URL) is required. Throwing a
-// clear error here (instead of silently falling back to Base) keeps misconfig
-// obvious at the first Robinhood call rather than mid-mint.
 export function resolveRobinhoodRpcUrl(): string {
-  const explicit = (process.env.ROBINHOOD_RPC_URL || "").trim();
-  if (explicit) return explicit;
-  const alchemy =
-    (process.env.ROBINHOOD_ALCHEMY_API_KEY || "").trim() || alchemyApiKey();
-  if (alchemy) return `https://robinhood-mainnet.g.alchemy.com/v2/${alchemy}`;
-  throw new Error(
-    "Robinhood Chain RPC is not configured. Set ROBINHOOD_RPC_URL, or enable the Robinhood network in your Alchemy app and set ROBINHOOD_ALCHEMY_API_KEY (or reuse ALCHEMY_API_KEY)."
-  );
+  const key = alchemyRobinhoodKey();
+  if (!key) {
+    throw new Error("ALCHEMY_ROBINHOOD_API_KEY is required! Get one at dashboard.alchemy.com");
+  }
+  return `https://robinhood-mainnet.g.alchemy.com/v2/${key}`;
 }
-
-// --- Default chain resolution ----------------------------------------------
-// Priority: per-request user context (Batch 4 middleware) → CHAIN env → base.
 
 export function getDefaultChainId(): ChainId {
   const ctx = getContextChain();
@@ -69,52 +53,30 @@ export function selectionToChains(selection: ChainSelection): ChainId[] {
   return selection === "both" ? [...CHAIN_IDS] : [selection];
 }
 
-// --- viem chain objects ------------------------------------------------------
-
-// Same shape the repo already used for Base (spread of viem's `base` with the
-// RPC URLs overridden) so nothing downstream changes.
 export const baseViemChain: Chain = {
   ...base,
   rpcUrls: {
-    default: {
-      http: [resolveBaseRpcUrl()],
-    },
+    default: { http: [resolveBaseRpcUrl()] },
+    public: { http: ["https://mainnet.base.org"] }, // Emergency fallback
   },
 };
 
-// Robinhood Chain (chainId 46630, native ETH). No public free RPC exists, so
-// rpcUrls carries only metadata; the real transport is built per call from
-// resolveRobinhoodRpcUrl() in chain.ts's getPublicClient/getWalletClient.
 export const robinhoodViemChain: Chain = {
   id: 46630,
   name: "Robinhood Chain",
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
   rpcUrls: {
-    default: {
-      http: ["https://robinhoodchain.blockscout.com"],
-    },
+    default: { http: [resolveRobinhoodRpcUrl()] },
+    public: { http: ["https://robinhoodchain.blockscout.com"] }, // Emergency fallback
   },
   blockExplorers: {
-    default: {
-      name: "Blockscout",
-      url: "https://robinhoodchain.blockscout.com",
-    },
+    default: { name: "Blockscout", url: "https://robinhoodchain.blockscout.com" },
   },
 };
 
-// --- Chain registry ----------------------------------------------------------
-
 export type AbiSource =
-  | {
-      type: "etherscanV2";
-      apiUrl: string;
-      chainParam: number;
-      apiKeyEnv: string;
-    }
-  | {
-      type: "blockscout";
-      apiUrl: string;
-    };
+  | { type: "etherscanV2"; apiUrl: string; chainParam: number; apiKeyEnv: string }
+  | { type: "blockscout"; apiUrl: string };
 
 export interface ChainConfig {
   id: ChainId;
