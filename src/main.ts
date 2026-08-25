@@ -63,6 +63,26 @@ async function main() {
   getRPCPool("base");
   getRPCPool("robinhood");
 
+  // Register queue handlers HERE only (not in queue.ts)
+  console.log("Registering queue handlers");
+  
+  mintQueue.process(async (job) => {
+    const { userId, contractAddress, options } = job.data;
+    console.log(`🔄 Processing mint job ${job.id} for user ${userId}`);
+    const result = await batchMint(BigInt(userId), contractAddress, options);
+    return result;
+  });
+
+  discoveryQueue.process(async (job) => {
+    const { contractAddress, chain, detectedAt, txHash } = job.data;
+    try {
+      await processDiscovery(contractAddress, chain, detectedAt, txHash);
+    } catch (error) {
+      console.error(`Discovery processing failed for ${contractAddress}:`, error);
+      throw error;
+    }
+  });
+
   const bot = createBot();
   startHealthServer(bot);
   startAutoMintLoop(bot);
@@ -229,17 +249,6 @@ async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
     console.error(`Error polling tracked wallets for ${userId}:`, err);
   }
 }
-
-discoveryQueue.process(async (job) => {
-  const { contractAddress, chain, detectedAt, txHash } = job.data;
-  
-  try {
-    await processDiscovery(contractAddress, chain, detectedAt, txHash);
-  } catch (error) {
-    console.error(`Discovery processing failed for ${contractAddress}:`, error);
-    throw error;
-  }
-});
 
 async function processDiscovery(
   contractAddress: string,
