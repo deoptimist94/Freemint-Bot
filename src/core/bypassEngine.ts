@@ -23,6 +23,8 @@ import {
   type ScanResult,
 } from "./scanner.js";
 import { prisma } from "../db/client.js";
+import { getChainConfig, getDefaultChainId, type ChainId } from "./chains.js";
+import { getContextChain } from "./chainContext.js";
 
 export type GateType =
   | "mint_open"
@@ -99,7 +101,6 @@ const PUBLIC_START_KEYS = [
   "startTime",
 ];
 
-// ENHANCED: Better gate detection with more patterns
 export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
   if (!mintFunctions || mintFunctions.length === 0) return "none";
   
@@ -110,10 +111,8 @@ export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
     .map((f) => `${f.name}(${f.args.join(",")})`)
     .join(" ");
   
-  // Check for whitelist indicators
   if (/whitelist|allowlist|presale|og\b|early|merkle/i.test(joined)) return "whitelist";
   
-  // Check for signature requirements
   const hasSigArg = mintFunctions.some(
     (f) =>
       f.args.some((a) => a.trim().toLowerCase().startsWith("bytes")) ||
@@ -121,10 +120,8 @@ export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
   );
   if (hasSigArg) return "signature";
   
-  // Check for time-based gates
   if (/start.*time|end.*time|phase|stage|timestamp/i.test(joined)) return "timed";
   
-  // Check for pause functionality
   if (/paused|pause|frozen|unpause/i.test(joined)) return "paused";
   
   return "mint_open";
@@ -182,19 +179,17 @@ export function classifyRevertReason(reason: string): GateType | undefined {
     return "payment";
   }
   if (lower.includes("sold out") || lower.includes("max supply") || lower.includes("exceeds")) {
-    return "none"; // Not a gate, just sold out
+    return "none";
   }
   
   return undefined;
 }
 
-// ENHANCED: Try to find public mint path even in gated contracts
 function publicPathFunctions(result: ScanResult): MintFunctionInfo[] {
   if (!result.abi) return [];
   
   const allFns = analyzeAbiForMintFunctions(result.abi);
   
-  // Look for functions that might be public mints
   return allFns.filter(fn => {
     const lower = fn.name.toLowerCase();
     return (
@@ -213,11 +208,9 @@ function publicPathFunctions(result: ScanResult): MintFunctionInfo[] {
   });
 }
 
-// ENHANCED: Generate different argument variations for testing
 function generateArgVariations(fn: MintFunctionInfo, walletAddress: string): unknown[][] {
   const variations: unknown[][] = [];
   
-  // Try with zero/default values
   const defaultArgs = fn.args.map(type => {
     const lower = type.toLowerCase().trim();
     if (lower.includes("uint") || lower.includes("int")) return 0n;
@@ -229,7 +222,6 @@ function generateArgVariations(fn: MintFunctionInfo, walletAddress: string): unk
   });
   variations.push(defaultArgs);
   
-  // Try with quantity 1
   const oneArgs = fn.args.map(type => {
     const lower = type.toLowerCase().trim();
     if (lower.includes("uint") || lower.includes("int")) return 1n;
@@ -241,7 +233,6 @@ function generateArgVariations(fn: MintFunctionInfo, walletAddress: string): unk
   });
   variations.push(oneArgs);
   
-  // Try with quantity 2 (for multiple mints)
   const twoArgs = fn.args.map(type => {
     const lower = type.toLowerCase().trim();
     if (lower.includes("uint") || lower.includes("int")) return 2n;
@@ -253,7 +244,6 @@ function generateArgVariations(fn: MintFunctionInfo, walletAddress: string): unk
   });
   variations.push(twoArgs);
   
-  // If merkle proof is expected, try empty proof
   if (fn.args.some(a => {
     const lower = a.toLowerCase();
     return lower.includes("bytes") && fn.name.toLowerCase().includes("merkle");
@@ -272,7 +262,6 @@ function generateArgVariations(fn: MintFunctionInfo, walletAddress: string): unk
   return variations;
 }
 
-// ENHANCED: Try matrix of different parameter combinations
 async function tryMatrix(
   userId: bigint,
   address: string,
@@ -282,7 +271,8 @@ async function tryMatrix(
   options: BypassOptions,
   base: any,
   functions: MintFunctionInfo[],
-  strategy: string
+  strategy: string,
+  chain: ChainId
 ): Promise<BypassResult | null> {
   
   for (const fn of functions) {
@@ -291,7 +281,7 @@ async function tryMatrix(
     for (const args of argVariations) {
       try {
         const data = encodeFunctionData({
-          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`] as const),
+          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`]),
           functionName: fn.name,
           args: args as any,
         });
@@ -303,7 +293,6 @@ async function tryMatrix(
           value: 0n,
         });
         
-        // If simulation succeeds, try actual mint
         if (!options.dryRun && !options.probeOnly) {
           for (const walletAddr of attempts.slice(0, MAX_WALLET_ATTEMPTS)) {
             const wallets = await getWallets(userId);
@@ -312,9 +301,9 @@ async function tryMatrix(
             if (wallet) {
               try {
                 const privateKey = await getWalletPrivateKey(wallet.id);
-                const walletClient = getWalletClient(privateKey as Hex);
+                const walletClient = getWalletClient(privateKey as Hex, chain);
+                const config = getChainConfig(chain);
                 
-                // Get gas estimate
                 const gasEstimate = await client.estimateGas({
                   account: walletClient.account!,
                   to: getAddress(address),
@@ -327,10 +316,10 @@ async function tryMatrix(
                   to: getAddress(address),
                   data,
                   value: 0n,
-                  gas: (gasEstimate * 120n) / 100n, // 20% buffer
+                  gas: (gasEstimate * 120n) / 100n,
+                  chain: config.viemChain,
                 });
                 
-                // Wait for receipt
                 const receipt = await Promise.race([
                   client.waitForTransactionReceipt({ hash: txHash }),
                   new Promise<never>((_, reject) => 
@@ -367,7 +356,6 @@ async function tryMatrix(
       } catch (err) {
         const errorStr = String(err).toLowerCase();
         
-        // If it's a whitelist/signature error, don't try more variations
         if (errorStr.includes("whitelist") || 
             errorStr.includes("allowlist") || 
             errorStr.includes("signature") ||
@@ -375,7 +363,6 @@ async function tryMatrix(
           break;
         }
         
-        // Continue to next variation
         continue;
       }
     }
@@ -384,7 +371,6 @@ async function tryMatrix(
   return null;
 }
 
-// ENHANCED: Try direct mint with multiple wallets
 async function tryDirectMint(
   userId: bigint,
   address: string,
@@ -393,7 +379,8 @@ async function tryDirectMint(
   client: any,
   attempts: string[],
   options: BypassOptions,
-  base: any
+  base: any,
+  chain: ChainId
 ): Promise<BypassResult | null> {
   if (!plan.targetFn) return null;
   
@@ -405,7 +392,7 @@ async function tryDirectMint(
     for (const args of argVariations) {
       try {
         const data = encodeFunctionData({
-          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`] as const),
+          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`]),
           functionName: fn.name,
           args: args as any,
         });
@@ -424,7 +411,8 @@ async function tryDirectMint(
           if (wallet) {
             try {
               const privateKey = await getWalletPrivateKey(wallet.id);
-              const walletClient = getWalletClient(privateKey as Hex);
+              const walletClient = getWalletClient(privateKey as Hex, chain);
+              const config = getChainConfig(chain);
               
               const gasEstimate = await client.estimateGas({
                 account: walletClient.account!,
@@ -439,6 +427,7 @@ async function tryDirectMint(
                 data,
                 value: 0n,
                 gas: (gasEstimate * 120n) / 100n,
+                chain: config.viemChain,
               });
               
               const receipt = await Promise.race([
@@ -462,10 +451,9 @@ async function tryDirectMint(
             } catch (txErr) {
               console.warn(`Direct mint transaction failed for ${from}:`, txErr);
               
-              // Classify error
               const errorStr = String(txErr).toLowerCase();
               if (errorStr.includes("whitelist") || errorStr.includes("allowlist")) {
-                break; // Try next wallet
+                break;
               }
               if (errorStr.includes("signature")) {
                 break;
@@ -501,7 +489,6 @@ async function tryDirectMint(
   return null;
 }
 
-// ENHANCED: Try signature-based mint
 async function trySignatureMint(
   userId: bigint,
   address: string,
@@ -510,15 +497,14 @@ async function trySignatureMint(
   client: any,
   attempts: string[],
   options: BypassOptions,
-  base: any
+  base: any,
+  chain: ChainId
 ): Promise<BypassResult | null> {
-  // Find signature mint functions
   const sigFns = result.mintFunctions.filter(f => 
     f.name.toLowerCase().includes("signature") ||
     f.args.some(a => a.toLowerCase().includes("bytes"))
   );
   
-  // Also check all functions in ABI
   if (result.abi) {
     const allFns = analyzeAbiForMintFunctions(result.abi);
     const additionalSigFns = allFns.filter(f => 
@@ -532,17 +518,13 @@ async function trySignatureMint(
   for (const fn of sigFns) {
     for (const from of attempts.slice(0, MAX_WALLET_ATTEMPTS)) {
       try {
-        // Generate base args
-        const baseArgs = generateArgVariations(fn, from)[1]; // Use the "one" variation
+        const baseArgs = generateArgVariations(fn, from)[1];
         
-        // Inject signature into bytes arguments
         const finalArgs = baseArgs.map((arg, idx) => {
           const argType = fn.args[idx]?.toLowerCase() || "";
           
-          // If this is a bytes argument and we have a signature, use it
           if (argType.includes("bytes") && signature) {
             if (argType.includes("[]")) {
-              // Array of bytes - signature might need to be wrapped
               return [signature];
             }
             return signature;
@@ -552,7 +534,7 @@ async function trySignatureMint(
         });
         
         const data = encodeFunctionData({
-          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`] as const),
+          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`]),
           functionName: fn.name,
           args: finalArgs as any,
         });
@@ -571,7 +553,8 @@ async function trySignatureMint(
           if (wallet) {
             try {
               const privateKey = await getWalletPrivateKey(wallet.id);
-              const walletClient = getWalletClient(privateKey as Hex);
+              const walletClient = getWalletClient(privateKey as Hex, chain);
+              const config = getChainConfig(chain);
               
               const gasEstimate = await client.estimateGas({
                 account: walletClient.account!,
@@ -586,6 +569,7 @@ async function trySignatureMint(
                 data,
                 value: 0n,
                 gas: (gasEstimate * 120n) / 100n,
+                chain: config.viemChain,
               });
               
               const receipt = await Promise.race([
@@ -630,7 +614,6 @@ async function trySignatureMint(
   return null;
 }
 
-// ENHANCED: Try merkle proof mint
 async function tryMerkleMint(
   userId: bigint,
   address: string,
@@ -639,9 +622,9 @@ async function tryMerkleMint(
   client: any,
   attempts: string[],
   options: BypassOptions,
-  base: any
+  base: any,
+  chain: ChainId
 ): Promise<BypassResult | null> {
-  // Find merkle/whitelist functions
   const merkleFns = result.mintFunctions.filter(f => 
     f.name.toLowerCase().includes("merkle") ||
     f.name.toLowerCase().includes("whitelist") ||
@@ -649,7 +632,6 @@ async function tryMerkleMint(
     f.args.some(a => a.toLowerCase().includes("proof"))
   );
   
-  // Also check all functions in ABI
   if (result.abi) {
     const allFns = analyzeAbiForMintFunctions(result.abi);
     const additionalFns = allFns.filter(f => 
@@ -665,10 +647,8 @@ async function tryMerkleMint(
   for (const fn of merkleFns) {
     for (const from of attempts.slice(0, MAX_WALLET_ATTEMPTS)) {
       try {
-        // Generate base args
         const baseArgs = generateArgVariations(fn, from)[1];
         
-        // Inject merkle proof
         const finalArgs = baseArgs.map((arg, idx) => {
           const argType = fn.args[idx]?.toLowerCase() || "";
           
@@ -680,7 +660,7 @@ async function tryMerkleMint(
         });
         
         const data = encodeFunctionData({
-          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`] as const),
+          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`]),
           functionName: fn.name,
           args: finalArgs as any,
         });
@@ -699,7 +679,8 @@ async function tryMerkleMint(
           if (wallet) {
             try {
               const privateKey = await getWalletPrivateKey(wallet.id);
-              const walletClient = getWalletClient(privateKey as Hex);
+              const walletClient = getWalletClient(privateKey as Hex, chain);
+              const config = getChainConfig(chain);
               
               const gasEstimate = await client.estimateGas({
                 account: walletClient.account!,
@@ -714,6 +695,7 @@ async function tryMerkleMint(
                 data,
                 value: 0n,
                 gas: (gasEstimate * 120n) / 100n,
+                chain: config.viemChain,
               });
               
               const receipt = await Promise.race([
@@ -758,23 +740,23 @@ async function tryMerkleMint(
   return null;
 }
 
-// ENHANCED: Probe contract for public sale timing
 async function probePublicSaleTiming(
   address: string,
   abi: Abi | null,
-  client: any
+  client: any,
+  chain: ChainId
 ): Promise<{ atMs: number; label: string } | null> {
   if (!abi) return null;
   
   const probeFns = abi.filter((item: any) => 
     item.type === "function" &&
     PUBLIC_START_KEYS.some(key => item.name?.toLowerCase().includes(key.toLowerCase()))
-  );
+  ) as any[];
   
   for (const fn of probeFns.slice(0, MAX_PROBE_READS)) {
     try {
       const data = encodeFunctionData({
-        abi: parseAbi([`function ${fn.name}()`] as const),
+        abi: [fn],
         functionName: fn.name,
         args: [],
       });
@@ -786,7 +768,7 @@ async function probePublicSaleTiming(
       
       if (result.data) {
         const decoded = BigInt(result.data);
-        const timestamp = Number(decoded) * 1000; // Convert to milliseconds
+        const timestamp = Number(decoded) * 1000;
         
         if (timestamp > Date.now()) {
           return {
@@ -803,20 +785,18 @@ async function probePublicSaleTiming(
   return null;
 }
 
-// ENHANCED: Build comprehensive probe results
 async function buildProbeResults(
   address: string,
   result: ScanResult,
-  client: any
+  client: any,
+  chain: ChainId
 ): Promise<ProbeRow[]> {
   const rows: ProbeRow[] = [];
   
-  // Add gate analysis
   const { gateType, freeFns } = analyzeGates(result);
   rows.push({ name: "Detected Gate", value: gateType });
   rows.push({ name: "Free Functions", value: freeFns.length });
   
-  // Add mint functions
   for (const fn of result.mintFunctions.slice(0, 10)) {
     rows.push({
       name: `Function: ${fn.name}`,
@@ -824,8 +804,7 @@ async function buildProbeResults(
     });
   }
   
-  // Try to probe public sale timing
-  const publicTiming = await probePublicSaleTiming(address, result.abi, client);
+  const publicTiming = await probePublicSaleTiming(address, result.abi, client, chain);
   if (publicTiming) {
     rows.push({
       name: "Public Sale Opens",
@@ -836,7 +815,6 @@ async function buildProbeResults(
   return rows;
 }
 
-// ENHANCED: Main bypass execution with all strategies
 export async function executeBypass(
   userId: bigint,
   address: string,
@@ -856,7 +834,6 @@ export async function executeBypass(
   const chain = getContextChain() || "base";
   const client = getPublicClient(chain);
   
-  // Scan contract first
   const result = await scanContract(normalizedAddr, chain);
   const plan = getBypassPlan(result);
   
@@ -867,7 +844,6 @@ export async function executeBypass(
     strategyId: "analysis",
   };
   
-  // Get wallets to attempt from
   const wallets = await getWallets(userId).catch(() => [] as WalletInfo[]);
   const attempts = wallets.map(w => w.address);
   
@@ -875,9 +851,8 @@ export async function executeBypass(
     attempts.push("0x0000000000000000000000000000000000000001");
   }
   
-  // Build probe results if requested
   if (options.probeOnly) {
-    const probe = await buildProbeResults(normalizedAddr, result, client);
+    const probe = await buildProbeResults(normalizedAddr, result, client, chain);
     return {
       ...base,
       probe,
@@ -885,7 +860,6 @@ export async function executeBypass(
     };
   }
   
-  // Strategy 1: Direct free mint (if available)
   if (plan.executable && plan.targetFn) {
     const direct = await tryDirectMint(
       userId,
@@ -895,12 +869,12 @@ export async function executeBypass(
       client,
       attempts,
       options,
-      base
+      base,
+      chain
     );
     if (direct) return direct;
   }
   
-  // Strategy 2: Try public mint path even in gated contracts
   if (plan.gateType === "whitelist" || plan.gateType === "timed" || plan.gateType === "paused") {
     const pubFns = publicPathFunctions(result);
     if (pubFns.length > 0) {
@@ -913,13 +887,13 @@ export async function executeBypass(
         options,
         base,
         pubFns,
-        "public_path"
+        "public_path",
+        chain
       );
       if (pub) return pub;
     }
   }
   
-  // Strategy 3: Try all mint functions with different parameters
   if (plan.gateType !== "payment" && plan.gateType !== "paused") {
     const allFns = result.abi ? analyzeAbiForMintFunctions(result.abi) : [];
     if (allFns.length > 0) {
@@ -932,13 +906,13 @@ export async function executeBypass(
         options,
         base,
         allFns,
-        "probe_matrix"
+        "probe_matrix",
+        chain
       );
       if (matrix) return matrix;
     }
   }
   
-  // Strategy 4: For signature-required, check if we have a signature
   if (plan.gateType === "signature" && options.signature) {
     const sigResult = await trySignatureMint(
       userId,
@@ -948,12 +922,12 @@ export async function executeBypass(
       client,
       attempts,
       options,
-      base
+      base,
+      chain
     );
     if (sigResult) return sigResult;
   }
   
-  // Strategy 5: For merkle/whitelist, try with proof if provided
   if ((plan.gateType === "whitelist" || plan.gateType === "signature") && options.merkleProof && options.merkleProof.length > 0) {
     const merkleResult = await tryMerkleMint(
       userId,
@@ -963,15 +937,14 @@ export async function executeBypass(
       client,
       attempts,
       options,
-      base
+      base,
+      chain
     );
     if (merkleResult) return merkleResult;
   }
   
-  // Strategy 6: Check for public sale timing
-  const publicTiming = await probePublicSaleTiming(normalizedAddr, result.abi, client);
+  const publicTiming = await probePublicSaleTiming(normalizedAddr, result.abi, client, chain);
   
-  // All strategies failed
   const error = buildFinalError(plan.gateType, plan.reason);
   
   await logBypass(userId, normalizedAddr, base.strategyId, "", false, undefined, error);
