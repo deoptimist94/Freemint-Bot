@@ -40,15 +40,12 @@ const PAGE_SIZE = 100;
 const FLOOR_CONCURRENCY = 6;
 const FLOOR_TIME_BUDGET_MS = 25_000;
 
+// FIXED: Use correct environment variable names
 function alchemyKey(chain: ChainId): string {
   if (chain === "robinhood") {
-    return (
-      process.env.ROBINHOOD_ALCHEMY_API_KEY ||
-      process.env.ALCHEMY_API_KEY ||
-      ""
-    ).trim();
+    return (process.env.ALCHEMY_ROBINHOOD_API_KEY || "").trim();
   }
-  return (process.env.ALCHEMY_API_KEY || "").trim();
+  return (process.env.ALCHEMY_BASE_API_KEY || "").trim();
 }
 
 function alchemyNftBase(chain: ChainId): string {
@@ -94,7 +91,14 @@ async function fetchNftsAlchemy(
   chain: ChainId
 ): Promise<{ nfts: OwnedNft[]; error?: string }> {
   const key = alchemyKey(chain);
-  if (!key) return { nfts: [], error: "missing_key" };
+  if (!key) {
+    return { 
+      nfts: [], 
+      error: chain === "robinhood" 
+        ? "Set ALCHEMY_ROBINHOOD_API_KEY in Railway dashboard"
+        : "Set ALCHEMY_BASE_API_KEY in Railway dashboard"
+    };
+  }
 
   const nfts: OwnedNft[] = [];
   let error: string | undefined;
@@ -109,19 +113,21 @@ async function fetchNftsAlchemy(
       });
       if (pageKey) params.set("pageKey", pageKey);
 
-      const data = await fetchJson(
-        `${alchemyNftBase(chain)}/${key}/getNFTsForOwner?${params.toString()}`
-      );
+      const url = `${alchemyNftBase(chain)}/${key}/getNFTsForOwner?${params.toString()}`;
+      console.log(`[${chain}] Fetching NFTs for ${walletAddress.slice(0, 10)}... page ${page + 1}`);
+      
+      const data = await fetchJson(url);
+      
       if (!data) {
-        error =
-          error ||
-          "Alchemy request failed (check ALCHEMY_API_KEY / rate limit)";
+        error = error || "Alchemy API request failed (check API key / rate limit)";
         break;
       }
 
       const owned = Array.isArray(data.ownedNfts) ? data.ownedNfts : [];
+      console.log(`[${chain}] Found ${owned.length} NFTs on page ${page + 1}`);
+      
       for (const n of owned) {
-        const contract = String(n.contract?.address || "").toLowerCase();
+        const contract = String(n.contract?.address || n.contractAddress || "").toLowerCase();
         if (!contract) continue;
         const tid = normalizeTokenId(n.tokenId);
         nfts.push({
@@ -131,9 +137,13 @@ async function fetchNftsAlchemy(
             n.name ||
             n.metadata?.name ||
             n.contractMetadata?.name ||
+            n.title ||
             `Token #${tid}`,
           collectionName:
-            n.contractMetadata?.name || n.collection?.name || "",
+            n.contractMetadata?.name || 
+            n.collection?.name || 
+            n.contract?.name ||
+            "",
         });
       }
 
@@ -144,6 +154,7 @@ async function fetchNftsAlchemy(
     error = err instanceof Error ? err.message : String(err);
   }
 
+  console.log(`[${chain}] Total NFTs fetched: ${nfts.length}`);
   return { nfts, error };
 }
 
@@ -152,6 +163,9 @@ export async function fetchWalletPortfolio(
   chain: ChainId = getDefaultChainId()
 ): Promise<WalletPortfolio> {
   const config = getChainConfig(chain);
+  
+  console.log(`[${chain}] Fetching portfolio for ${walletAddress}`);
+  
   const { nfts, error } = await fetchNftsAlchemy(walletAddress, chain);
 
   if (nfts.length === 0) {
@@ -159,15 +173,14 @@ export async function fetchWalletPortfolio(
       return {
         items: [],
         totalFloorValueEth: 0,
-        error:
-          error === "missing_key"
-            ? chain === "robinhood"
-              ? "Set ALCHEMY_API_KEY with the Robinhood network enabled (or ROBINHOOD_ALCHEMY_API_KEY) — free at dashboard.alchemy.com."
-              : "Set ALCHEMY_API_KEY (free at dashboard.alchemy.com) — Etherscan/Reservoir free tiers cannot list Base NFTs."
-            : error,
+        error: error,
       };
     }
-    return { items: [], totalFloorValueEth: 0 };
+    return { 
+      items: [], 
+      totalFloorValueEth: 0,
+      error: "No NFTs found in this wallet"
+    };
   }
 
   const items: PortfolioItem[] = nfts.map((n) => ({
@@ -187,6 +200,7 @@ export async function fetchWalletPortfolio(
       tokenByContract.set(n.contractAddress, n.tokenId);
     }
   }
+  
   const floorByContract = new Map<
     string,
     { floorPriceEth: number; topBidEth: number; collectionName: string }
@@ -215,6 +229,7 @@ export async function fetchWalletPortfolio(
       }
     }
   };
+  
   await Promise.all(
     Array.from(
       { length: Math.min(FLOOR_CONCURRENCY, uniqueContracts.length) },
@@ -236,6 +251,9 @@ export async function fetchWalletPortfolio(
   }
 
   const totalFloorValueEth = items.reduce((sum, i) => sum + i.floorPriceEth, 0);
+  
+  console.log(`[${chain}] Portfolio complete: ${items.length} items, ${totalFloorValueEth.toFixed(4)} ETH floor value`);
+  
   return { items, totalFloorValueEth };
 }
 
