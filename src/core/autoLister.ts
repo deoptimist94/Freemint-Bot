@@ -24,15 +24,12 @@ const LOG_THROTTLE_MS = 15 * 60_000;
 const floorCache = new Map<string, { data: FloorData; expiresAt: number }>();
 const logThrottle = new Map<string, number>();
 
+// FIXED: Use consistent environment variable names
 function alchemyKey(chain: ChainId): string {
   if (chain === "robinhood") {
-    return (
-      process.env.ROBINHOOD_ALCHEMY_API_KEY ||
-      process.env.ALCHEMY_API_KEY ||
-      ""
-    ).trim();
+    return (process.env.ALCHEMY_ROBINHOOD_API_KEY || "").trim();
   }
-  return (process.env.ALCHEMY_API_KEY || "").trim();
+  return (process.env.ALCHEMY_BASE_API_KEY || "").trim();
 }
 
 function reservoirKey(): string {
@@ -74,7 +71,6 @@ async function fetchJson(url: string, init?: RequestInit): Promise<any | null> {
   }
 }
 
-// Normalizes wei (1e18-scale) to ETH; native (already-ETH) values pass through.
 function asEth(raw: unknown): number {
   if (raw === null || raw === undefined) return 0;
   const n = Number(raw);
@@ -82,27 +78,29 @@ function asEth(raw: unknown): number {
   return n > 1e12 ? n / 1e18 : n;
 }
 
-// Alchemy getFloorPrice returns marketplace-keyed data
-// ({openSea:{floorPrice,...}, looksRare:{...}}) — parse whichever exists.
 async function fetchAlchemyFloor(
   contractAddress: string,
   chain: ChainId
 ): Promise<FloorData> {
   const key = alchemyKey(chain);
   if (!key) return { floorPriceEth: 0, topBidEth: 0, collectionName: "" };
+
   const url = `${alchemyNftBase(chain)}/${key}/getFloorPrice?contractAddress=${contractAddress}`;
   const json = await fetchJson(url);
   if (!json) return { floorPriceEth: 0, topBidEth: 0, collectionName: "" };
+
   const raw =
     json.floorPrice ??
     json.openSea?.floorPrice ??
     json.looksRare?.floorPrice;
+  
   const collectionName =
     typeof json.collectionName === "string"
       ? json.collectionName
       : typeof json.collection?.name === "string"
-        ? json.collection.name
-        : "";
+      ? json.collection.name
+      : "";
+
   return { floorPriceEth: asEth(raw), topBidEth: 0, collectionName };
 }
 
@@ -113,13 +111,16 @@ async function fetchReservoirFloor(
   const json = await fetchJson(url, {
     headers: { "x-api-key": reservoirKey() },
   });
+
   const col = json?.collections?.[0];
   if (!col) return { floorPriceEth: 0, topBidEth: 0, collectionName: "" };
+
   const floorRaw = col?.floorAsk?.price?.amount?.raw;
   const floorNative = col?.floorAsk?.price?.amount?.native;
   const topBidRaw = col?.topBid?.price?.amount?.raw;
   const topBidNative = col?.topBid?.price?.amount?.native;
   const topBidWei = asEth(topBidRaw);
+
   return {
     floorPriceEth: asEth(floorRaw) || asEth(floorNative),
     topBidEth: topBidNative > 0 ? topBidNative : topBidWei,
@@ -127,8 +128,6 @@ async function fetchReservoirFloor(
   };
 }
 
-// Keyless last-resort: OpenSea asset/collection pages embed JSON with
-// "floor_price" in ETH. First positive match wins.
 async function fetchOpenSeaHtmlFloor(
   contractAddress: string,
   tokenId?: string,
@@ -138,6 +137,7 @@ async function fetchOpenSeaHtmlFloor(
   const url = tokenId
     ? `${base}/${contractAddress}/${tokenId}`
     : `${base}/${contractAddress}`;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -149,6 +149,7 @@ async function fetchOpenSeaHtmlFloor(
       },
       signal: controller.signal,
     });
+
     if (!res.ok) return 0;
     const html = await res.text();
     const re = /"floor_price"\s*:\s*([0-9]*\.?[0-9]+)/g;
@@ -165,10 +166,6 @@ async function fetchOpenSeaHtmlFloor(
   }
 }
 
-// Live floor + top bid + collection name. Ladder: Reservoir -> Alchemy -> OpenSea HTML.
-// Robinhood: Reservoir is skipped (no RH support yet) — Alchemy -> OpenSea HTML.
-// Diagnostics log per-source values so a failed source is identifiable in Railway logs.
-// Zero results are cached only 60s so a transient API failure can't poison the floor.
 export async function fetchCollectionFloor(
   contractAddress: string,
   tokenId?: string,
@@ -176,6 +173,7 @@ export async function fetchCollectionFloor(
 ): Promise<FloorData> {
   const config = getChainConfig(chain);
   const key = `${chain}::${contractAddress.toLowerCase()}`;
+  
   const cached = floorCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.data;
 
@@ -191,8 +189,8 @@ export async function fetchCollectionFloor(
     reservoir.floorPriceEth && reservoir.floorPriceEth > 0
       ? reservoir.floorPriceEth
       : alchemy.floorPriceEth && alchemy.floorPriceEth > 0
-        ? alchemy.floorPriceEth
-        : 0;
+      ? alchemy.floorPriceEth
+      : 0;
 
   let openSeaHtmlFloor = 0;
   if (floorPriceEth === 0) {
@@ -213,26 +211,27 @@ export async function fetchCollectionFloor(
   if (floorPriceEth === 0) {
     throttledLog(
       `floor:${key}`,
-      `Floor empty for ${contractAddress} (${config.name}) — alchemy:${alchemy.floorPriceEth ?? "n/a"} reservoir:${reservoir.floorPriceEth ?? "n/a"} openSeaHtml:${openSeaHtmlFloor} (check ALCHEMY_API_KEY / RESERVOIR_API_KEY on Railway)`
+      `Floor empty for ${contractAddress} (${config.name}) — alchemy:${alchemy.floorPriceEth ?? "n/a"} reservoir:${reservoir.floorPriceEth ?? "n/a"} openSeaHtml:${openSeaHtmlFloor} (check ALCHEMY_API_KEY / RESERVOIR_API_KEY)`
     );
   }
 
   const topBidEth =
     reservoir.topBidEth && reservoir.topBidEth > 0 ? reservoir.topBidEth : 0;
-
+  
   const collectionName =
     (reservoir.collectionName && reservoir.collectionName.trim()) ||
     (alchemy.collectionName && alchemy.collectionName.trim()) ||
     `${config.name} NFT`;
 
   const data: FloorData = { floorPriceEth, topBidEth, collectionName };
-
+  
   floorCache.set(key, {
     data,
     expiresAt:
       Date.now() +
       (floorPriceEth > 0 ? FLOOR_CACHE_TTL_MS : FLOOR_ZERO_CACHE_TTL_MS),
   });
+
   return data;
 }
 
@@ -247,9 +246,6 @@ function safeTxValue(raw: unknown): bigint {
   return 0n;
 }
 
-// Listings stay Base-only for now: Reservoir does not support Robinhood Chain
-// (checked 2026-08-14 chain list). When they add RH, this just needs the
-// chainId swap.
 export async function executeAutoListing(
   privateKey: Hex,
   contractAddress: string,
@@ -260,9 +256,10 @@ export async function executeAutoListing(
   if (chain !== "base") {
     return {
       success: false,
-      error: "🔜 Robinhood Chain listings coming soon — marketplace support is not live yet.",
+      error: "Robinhood Chain listings coming soon — marketplace support is not live yet.",
     };
   }
+
   try {
     const account = privateKeyToAccount(privateKey);
     const client = createWalletClient({
@@ -272,7 +269,6 @@ export async function executeAutoListing(
     });
 
     const weiPrice = BigInt(Math.floor(listPriceEth * 1e18)).toString();
-
     const data = await fetchJson(
       "https://api.reservoir.tools/execute/list/v5?chainId=8453",
       {
