@@ -1,3 +1,8 @@
+/**
+ * Contract Scanner - Production Version
+ * Fixes: View function filtering, SeaDrop detection, Security auditing
+ */
+
 import {
   type Address,
   type Hex,
@@ -35,7 +40,9 @@ export interface ScanResult {
   isContract: boolean;
   security: SecurityReport;
   warning?: string;
-  isSeaDrop?: boolean; // NEW: Flag for SeaDrop contracts
+  isSeaDrop?: boolean;
+  requiresSignature?: boolean;
+  isGated?: boolean;
 }
 
 type AbiInput = { type: string; name?: string };
@@ -82,7 +89,31 @@ const MINT_NAME_BLOCKLIST = [
   /adminmint/,
   /teamMint/i,
   /^mintTo$/i,
-  /^mintSeaDrop$/i, // NEW: Block mintSeaDrop for direct minting
+  /^mintSeaDrop$/i,
+  /getseadrop/i,
+  /getmint/i,
+  /mintmode/i,
+  /mintstats/i,
+  /signedmint/i,
+  /updatemint/i,
+];
+
+const SIGNATURE_INDICATORS = [
+  "signedmint",
+  "signaturemint",
+  "mintwithsignature",
+  "verifysignature",
+  "updatesignedmint",
+  "signature",
+];
+
+const GATED_INDICATORS = [
+  "whitelist",
+  "allowlist",
+  "merkle",
+  "proof",
+  "presale",
+  "onlywhitelisted",
 ];
 
 const ETHERSCAN_V2 = "https://api.etherscan.io/v2/api";
@@ -123,7 +154,6 @@ async function fetchContractAbi(
 ): Promise<{ abi: Abi | null; isVerified: boolean; error?: string }> {
   const cfg = getChainConfig(chain);
   
-  // Robinhood / non-Base: Blockscout-style explorer when configured
   if (chain !== "base" && cfg.explorerApiUrl) {
     try {
       const url = `${cfg.explorerApiUrl.replace(/\/+$/, "")}/api?module=contract&action=getabi&address=${address}`;
@@ -157,7 +187,6 @@ async function fetchContractAbi(
     }
   }
   
-  // Base: Etherscan V2 (or BASESCAN_API_URL override)
   try {
     const key = explorerApiKey();
     const base = explorerBaseUrl();
@@ -269,15 +298,35 @@ function looksLikeFungibleOrDefi(abi: Abi): boolean {
   return (hasErc20 || hasDefi) && !hasNft;
 }
 
-// NEW: Detect SeaDrop contracts
 export function isSeaDropContract(abi: Abi | null): boolean {
   if (!abi || !Array.isArray(abi)) return false;
   const fnNames = abi
     .filter((i: any) => i.type === "function")
     .map((i: any) => String(i.name || "").toLowerCase());
   
-  // SeaDrop NFTs typically have these functions
   return fnNames.includes("mintseadrop") && fnNames.includes("getseadroplaunchpad");
+}
+
+export function detectSignatureRequirement(abi: Abi | null): boolean {
+  if (!abi || !Array.isArray(abi)) return false;
+  const fnNames = abi
+    .filter((i: any) => i.type === "function")
+    .map((i: any) => String(i.name || "").toLowerCase());
+  
+  return SIGNATURE_INDICATORS.some(indicator => 
+    fnNames.some(name => name.includes(indicator))
+  );
+}
+
+export function detectGatedMint(abi: Abi | null): boolean {
+  if (!abi || !Array.isArray(abi)) return false;
+  const fnNames = abi
+    .filter((i: any) => i.type === "function")
+    .map((i: any) => String(i.name || "").toLowerCase());
+  
+  return GATED_INDICATORS.some(indicator => 
+    fnNames.some(name => name.includes(indicator))
+  );
 }
 
 export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
@@ -292,6 +341,12 @@ export function analyzeAbiForMintFunctions(abi: Abi): MintFunctionInfo[] {
     if (!/(mint|claim|buy|purchase|airdrop|sale)/i.test(lower)) continue;
     
     const mut = fn.stateMutability || "nonpayable";
+    
+    // CRITICAL FIX: Skip view and pure functions - they don't modify state
+    if (mut === 'view' || mut === 'pure') {
+      continue;
+    }
+    
     const isPaid =
       PAID_MINT_PATTERNS.some((p) => lower.includes(p)) ||
       mut === "payable" ||
@@ -401,8 +456,9 @@ export async function scanContract(
     };
   }
   
-  // NEW: Check if this is a SeaDrop contract
   const isSeaDrop = isSeaDropContract(abi);
+  const requiresSignature = detectSignatureRequirement(abi);
+  const isGated = detectGatedMint(abi);
   
   if (looksLikeFungibleOrDefi(abi)) {
     return {
@@ -469,11 +525,10 @@ export async function scanContract(
   );
   
   if (freeMintFunctions.length === 0) {
-    // Check if this is a SeaDrop contract with no alternative mint functions
     if (isSeaDrop) {
       return {
         contractAddress: checksumAddress,
-        mintFunctions: [], // Empty because mintSeaDrop is blocked
+        mintFunctions: [],
         isVerified,
         isNft: true,
         abi,
@@ -494,6 +549,8 @@ export async function scanContract(
       bytecode,
       isContract: true,
       security,
+      requiresSignature,
+      isGated,
       warning:
         mintFunctions.length > 0
           ? "Verified NFT found, but mint requires payment (not free)."
@@ -511,8 +568,14 @@ export async function scanContract(
     isContract: true,
     security,
     isSeaDrop,
+    requiresSignature,
+    isGated,
     warning: isSeaDrop 
       ? "SeaDrop contract detected. Free mint functions available (non-SeaDrop)."
+      : requiresSignature
+      ? "⚠️ Signature-required mint detected. Bot may not be able to mint without valid signature."
+      : isGated
+      ? "⚠️ Gated mint detected (whitelist/allowlist). Bot may fail if wallets not on list."
       : undefined,
   };
 }
