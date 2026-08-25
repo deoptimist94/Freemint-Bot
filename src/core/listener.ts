@@ -3,17 +3,16 @@ import { getPublicClient } from "./chain.js";
 import { type ChainId } from "./chains.js";
 import { getRPCPool } from "./rpcPool.js";
 
-// Common 4-byte free-mint selectors
 const MINT_SELECTORS = new Set([
-  "0x1249c58b", // mint()
-  "0xa0712d68", // mint(uint256)
-  "0x6a627842", // mint(address)
-  "0x40c10f19", // mint(address,uint256)
-  "0x4e6ec247", // claim()
-  "0xefef39a1", // publicMint()
-  "0x84bb1e42", // mintFree()
-  "0xa6f2ae3a", // claim(address,uint256)
-  "0x2db11544", // publicClaim()
+  "0x1249c58b",
+  "0xa0712d68",
+  "0x6a627842",
+  "0x40c10f19",
+  "0x4e6ec247",
+  "0xefef39a1",
+  "0x84bb1e42",
+  "0xa6f2ae3a",
+  "0x2db11544",
 ]);
 
 export interface DropEvent {
@@ -37,8 +36,6 @@ export class DropListener {
   private seenOrder: string[] = [];
   private reconnectDelay = BASE_RECONNECT_MS;
   private onDropDetected: DropCallback;
-  
-  // NEW: Track consecutive errors
   private consecutiveErrors = 0;
   private maxConsecutiveErrors = 5;
 
@@ -55,7 +52,6 @@ export class DropListener {
   }
 
   private subscribe() {
-    // NEW: Check provider health before subscribing
     const pool = getRPCPool(this.chain);
     const provider = pool.getProvider();
     
@@ -70,16 +66,15 @@ export class DropListener {
     this.unwatch = client.watchBlocks({
       includeTransactions: true,
       emitMissed: true,
-      pollInterval: 2000, // NEW: Explicit 2s poll (was defaulting to faster)
+      pollingInterval: 2000,
       onBlock: async (block) => {
-        this.consecutiveErrors = 0; // Reset on success
+        this.consecutiveErrors = 0;
         await this.handleBlock(block);
       },
       onError: (error: any) => {
         this.consecutiveErrors++;
         console.error(`Block watcher error (${this.chain}):`, error?.message || error);
         
-        // NEW: Report to RPC pool for failover
         const pool = getRPCPool(this.chain);
         const stats = pool.getStats();
         const currentProvider = stats.find(s => s.healthy && !s.rateLimited);
@@ -87,7 +82,6 @@ export class DropListener {
           pool.reportFailure(currentProvider.name, error);
         }
         
-        // NEW: If too many consecutive errors, force provider rotation
         if (this.consecutiveErrors >= this.maxConsecutiveErrors) {
           console.warn(`[${this.chain}] Too many consecutive errors, forcing provider rotation`);
           this.consecutiveErrors = 0;
@@ -176,7 +170,6 @@ export class DropListener {
   }
 }
 
-// Backward-compatible alias
 export class BaseDropListener extends DropListener {
   constructor(onDropDetected: DropCallback) {
     super("base", onDropDetected);
