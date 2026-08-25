@@ -84,23 +84,19 @@ export function setUserMintQuantity(userId: bigint, quantity: number): void {
   userMintQuantities.set(userId, Math.max(1, Math.min(quantity, 10)));
 }
 
-// SeaDrop Router ABI for mintPublic
 const SEADROP_ROUTER_ABI = parseAbi([
   "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
 ] as const);
 
-// Standard transfer events for receipt verification
 const STANDARD_TRANSFER_EVENTS = parseAbi([
   "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
   "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
   "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
 ] as const);
 
-// ENHANCED: More comprehensive error classification
 export function classifyMintError(error: unknown): ClassifiedError {
   const errorStr = (error instanceof Error ? error.message : String(error)).toLowerCase();
   
-  // Whitelist/Allowlist errors
   if (
     errorStr.includes("not whitelisted") ||
     errorStr.includes("not on whitelist") ||
@@ -126,7 +122,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     };
   }
   
-  // Signature errors
   if (
     errorStr.includes("signature") ||
     errorStr.includes("invalid signer") ||
@@ -144,7 +139,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     };
   }
   
-  // Sold out / Supply errors
   if (
     errorStr.includes("sold out") ||
     errorStr.includes("exceeds supply") ||
@@ -168,7 +162,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     };
   }
   
-  // Gas errors
   if (
     errorStr.includes("gas") ||
     errorStr.includes("fee") ||
@@ -187,7 +180,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     };
   }
   
-  // Insufficient funds
   if (
     errorStr.includes("insufficient funds") ||
     errorStr.includes("not enough funds") ||
@@ -203,7 +195,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     };
   }
   
-  // RPC errors
   if (
     errorStr.includes("rpc") ||
     errorStr.includes("connection") ||
@@ -223,7 +214,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     };
   }
   
-  // Timing errors
   if (
     errorStr.includes("too soon") ||
     errorStr.includes("not yet") ||
@@ -243,7 +233,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     };
   }
   
-  // Simulation failed
   if (
     errorStr.includes("simulation") ||
     errorStr.includes("execution reverted") ||
@@ -267,7 +256,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
   };
 }
 
-// ENHANCED: Better argument generation with support for complex types
 function generateMintArgs(
   mintFunction: MintFunctionInfo,
   walletAddress: string,
@@ -276,7 +264,6 @@ function generateMintArgs(
   return mintFunction.args.map((type) => {
     const lowerType = type.toLowerCase().trim();
     
-    // Handle arrays
     if (lowerType.endsWith("[]")) {
       const baseType = lowerType.slice(0, -2).trim();
       if (baseType.includes("uint") || baseType.includes("int")) {
@@ -294,41 +281,33 @@ function generateMintArgs(
       return [];
     }
     
-    // Handle specific uint types
     if (lowerType.startsWith("uint")) {
-      // Check if it's a quantity parameter (usually named something like quantity, amount, count)
       if (mintFunction.name.toLowerCase().includes("mint")) {
         return BigInt(quantity);
       }
       return 1n;
     }
     
-    // Handle addresses
     if (lowerType === "address") {
       return getAddress(walletAddress);
     }
     
-    // Handle booleans
     if (lowerType === "bool") {
       return true;
     }
     
-    // Handle bytes
     if (lowerType.startsWith("bytes")) {
       return "0x";
     }
     
-    // Handle strings
     if (lowerType === "string") {
       return "";
     }
     
-    // Default fallback
     return "0x";
   });
 }
 
-// ENHANCED: Single mint with retry logic
 async function executeSingleMint(
   wallet: { id: string; address: string; label: string },
   privateKey: string,
@@ -350,13 +329,12 @@ async function executeSingleMint(
       const walletClient = getWalletClient(hexKey, chain);
       const publicClient = getPublicClient(chain);
       
-      // Check gas safety before each attempt
-      const gasSafe = await assertGasSafe(BigInt(0), chain);
+      // FIXED: assertGasSafe only takes one argument
+      const gasSafe = await assertGasSafe(BigInt(0));
       if (!gasSafe) {
         throw new Error("Gas price exceeds safety limit");
       }
       
-      // Generate appropriate arguments
       const args = generateMintArgs(mintFunction, wallet.address, getUserMintQuantity(BigInt(0)));
       
       const abiItem = parseAbi([
@@ -369,7 +347,6 @@ async function executeSingleMint(
         args: args as any,
       });
       
-      // Get gas estimate with buffer
       let gasLimit: bigint;
       try {
         const estimate = await publicClient.estimateGas({
@@ -378,22 +355,22 @@ async function executeSingleMint(
           data,
           value: 0n,
         });
-        gasLimit = (estimate * 120n) / 100n; // Add 20% buffer
+        gasLimit = (estimate * 120n) / 100n;
       } catch (gasErr) {
         console.warn(`Gas estimation failed for ${wallet.label}, using default`);
-        gasLimit = 500000n; // Safe default
+        gasLimit = 500000n;
       }
       
-      // Send transaction with proper gas settings
+      // FIXED: Added chain property
       const txHash = await walletClient.sendTransaction({
         account: walletClient.account!,
         to: getAddress(nftContract),
         data,
         value: 0n,
         gas: gasLimit,
+        chain: config.viemChain,
       });
       
-      // Wait for receipt with timeout
       const receipt = await Promise.race([
         publicClient.waitForTransactionReceipt({ hash: txHash }),
         new Promise<never>((_, reject) => 
@@ -401,7 +378,6 @@ async function executeSingleMint(
         ),
       ]);
       
-      // Verify success
       if (receipt.status === "success") {
         return {
           walletId: wallet.id,
@@ -427,7 +403,6 @@ async function executeSingleMint(
         break;
       }
       
-      // Wait before retry with exponential backoff
       await new Promise(resolve => setTimeout(resolve, retryDelayMs * (attempt + 1)));
     }
   }
@@ -443,7 +418,6 @@ async function executeSingleMint(
   };
 }
 
-// ENHANCED: Batch mint with better concurrency control
 export async function batchMint(
   userId: bigint,
   contractAddress: string,
@@ -452,7 +426,6 @@ export async function batchMint(
   const chain = getContextChain() || getDefaultChainId();
   const config = getChainConfig(chain);
   
-  // Pre-scan the contract to get mint function
   const scan = await scanContract(contractAddress, chain);
   
   if (!scan.isContract) {
@@ -486,7 +459,6 @@ export async function batchMint(
     };
   }
   
-  // Check if gated and warn
   if (scan.isGated || scan.requiresSignature) {
     console.warn(`Attempting gated/signature mint on ${contractAddress}`);
   }
@@ -506,19 +478,16 @@ export async function batchMint(
   const rounds = quantity;
   const allResults: MintResult[] = [];
   
-  // Process wallets with concurrency limit
   const CONCURRENCY = 3;
   const queue = [...wallets];
   
   while (queue.length > 0) {
     const batch = queue.splice(0, CONCURRENCY);
     
-    const batchResults = await Promise.all(
+    await Promise.all(
       batch.map(async (wallet) => {
         try {
           const privateKey = await getWalletPrivateKey(wallet.id);
-          
-          let currentNonce = 0; // This should be fetched from chain in production
           
           for (let round = 1; round <= rounds; round++) {
             const res = await executeSingleMint(
@@ -534,7 +503,7 @@ export async function batchMint(
             allResults.push(res);
             
             if (res.success) {
-              currentNonce++;
+              // Success, continue to next round
             } else {
               const classified = classifyMintError(res.error || "");
               if (!classified.retryable) break;
@@ -544,11 +513,8 @@ export async function batchMint(
               await new Promise((resolve) => setTimeout(resolve, 200));
             }
           }
-          
-          return true;
         } catch (err) {
           console.error(`Failed to process wallet ${wallet.label}:`, err);
-          return false;
         }
       })
     );
@@ -558,7 +524,6 @@ export async function batchMint(
   const totalFailed = allResults.filter((r) => !r.success).length;
   const totalGasUsed = allResults.reduce((sum, r) => sum + (r.gasUsed || 0n), 0n);
   
-  // Record history
   for (const r of allResults) {
     await recordMintHistory(userId, contractAddress, r.txHash || null, r.success ? "success" : "failed", chain);
   }
@@ -611,6 +576,5 @@ export async function getMintHistory(userId: bigint, limit = 10) {
 }
 
 export async function checkMintStillOpen(contractAddress: string): Promise<boolean> {
-  // This could check contract state like totalSupply vs maxSupply
   return true;
 }
