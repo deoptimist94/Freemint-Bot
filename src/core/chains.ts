@@ -1,5 +1,3 @@
-// Multi-chain registry - Alchemy-Only Configuration
-
 import { type Chain } from "viem";
 import { base } from "viem/chains";
 import { getContextChain } from "./chainContext.js";
@@ -9,7 +7,6 @@ export type ChainSelection = ChainId | "both";
 
 export const CHAIN_IDS: readonly ChainId[] = ["base", "robinhood"] as const;
 
-// ALCHEMY-ONLY: Separate keys for each chain
 function alchemyBaseKey(): string {
   return (process.env.ALCHEMY_BASE_API_KEY || "").trim();
 }
@@ -21,7 +18,7 @@ function alchemyRobinhoodKey(): string {
 export function resolveBaseRpcUrl(): string {
   const key = alchemyBaseKey();
   if (!key) {
-    throw new Error("ALCHEMY_BASE_API_KEY is required! Get one at dashboard.alchemy.com");
+    throw new Error("ALCHEMY_BASE_API_KEY is required!");
   }
   return `https://base-mainnet.g.alchemy.com/v2/${key}`;
 }
@@ -29,7 +26,7 @@ export function resolveBaseRpcUrl(): string {
 export function resolveRobinhoodRpcUrl(): string {
   const key = alchemyRobinhoodKey();
   if (!key) {
-    throw new Error("ALCHEMY_ROBINHOOD_API_KEY is required! Get one at dashboard.alchemy.com");
+    throw new Error("ALCHEMY_ROBINHOOD_API_KEY is required!");
   }
   return `https://robinhood-mainnet.g.alchemy.com/v2/${key}`;
 }
@@ -57,7 +54,7 @@ export const baseViemChain: Chain = {
   ...base,
   rpcUrls: {
     default: { http: [resolveBaseRpcUrl()] },
-    public: { http: ["https://mainnet.base.org"] }, // Emergency fallback
+    public: { http: ["https://mainnet.base.org"] },
   },
 };
 
@@ -67,7 +64,7 @@ export const robinhoodViemChain: Chain = {
   nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
   rpcUrls: {
     default: { http: [resolveRobinhoodRpcUrl()] },
-    public: { http: ["https://robinhoodchain.blockscout.com"] }, // Emergency fallback
+    public: { http: ["https://robinhoodchain.blockscout.com"] },
   },
   blockExplorers: {
     default: { name: "Blockscout", url: "https://robinhoodchain.blockscout.com" },
