@@ -57,9 +57,9 @@ export async function fundSubWallets(
 
   for (const target of subWallets) {
     try {
-      // FIX: Added account field
+      // FIX: Added account field for viem 2.x compatibility
       const txHash = await walletClient.sendTransaction({
-        account: walletClient.account,
+        account: walletClient.account!, // Required in viem 2.x
         to: getAddress(target.address),
         value: sendWei,
       });
