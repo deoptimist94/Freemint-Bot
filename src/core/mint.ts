@@ -28,6 +28,7 @@ export interface MintResult {
   txHash?: string;
   error?: string;
   errorCategory?: string;
+  basescanUrl?: string;
   iteration?: number;
 }
 
@@ -90,7 +91,7 @@ const STANDARD_TRANSFER_EVENTS = parseAbi([
   "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
 ] as const);
 
-export function classifyMintError(error: string | Error): ClassifiedError {
+export function classifyMintError(error: unknown): ClassifiedError {
   const errorStr = (error instanceof Error ? error.message : String(error)).toLowerCase();
   
   // Whitelist/Allowlist errors
@@ -365,6 +366,7 @@ async function executeSeaDropMint(
         label: walletLabel,
         success: false,
         txHash: hash,
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
         error: "Transaction reverted on-chain",
         errorCategory: "GAS",
         iteration,
@@ -383,6 +385,7 @@ async function executeSeaDropMint(
         label: walletLabel,
         success: false,
         txHash: hash,
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
         error: classified.userFriendly,
         errorCategory: classified.category,
         iteration,
@@ -395,6 +398,7 @@ async function executeSeaDropMint(
       label: walletLabel,
       success: true,
       txHash: hash,
+      basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
       iteration,
     };
     
@@ -471,6 +475,7 @@ async function executeDirectMint(
         label: walletLabel,
         success: false,
         txHash: hash,
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
         error: "Transaction reverted on-chain",
         errorCategory: "GAS",
         iteration,
@@ -489,6 +494,7 @@ async function executeDirectMint(
         label: walletLabel,
         success: false,
         txHash: hash,
+        basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
         error: classified.userFriendly,
         errorCategory: classified.category,
         iteration,
@@ -501,6 +507,7 @@ async function executeDirectMint(
       label: walletLabel,
       success: true,
       txHash: hash,
+      basescanUrl: `${explorerBaseUrl}/tx/${hash}`,
       iteration,
     };
     
@@ -639,7 +646,7 @@ export async function batchMint(
   const totalFailed = allResults.filter((r) => !r.success).length;
   
   for (const r of allResults) {
-    await recordMintHistory(userId, targetContract, r.txHash || null, r.success ? "success" : "failed", chain, r.errorCategory);
+    await recordMintHistory(userId, targetContract, r.txHash || null, r.success ? "success" : "failed", chain);
   }
   
   return { contractAddress: targetContract, results: allResults, totalSuccess, totalFailed };
@@ -693,7 +700,7 @@ async function executeSeaDropBatchMint(
   const totalFailed = allResults.filter((r) => !r.success).length;
   
   for (const r of allResults) {
-    await recordMintHistory(userId, nftContract, r.txHash || null, r.success ? "success" : "failed", chain, r.errorCategory);
+    await recordMintHistory(userId, nftContract, r.txHash || null, r.success ? "success" : "failed", chain);
   }
   
   return { contractAddress: nftContract, results: allResults, totalSuccess, totalFailed };
@@ -712,8 +719,7 @@ async function recordMintHistory(
   contractAddress: string,
   txHash: string | null,
   status: string,
-  chain: ChainId,
-  errorCategory?: string
+  chain: ChainId
 ): Promise<void> {
   try {
     await prisma.mintHistory.create({
@@ -723,7 +729,6 @@ async function recordMintHistory(
         txHash, 
         status, 
         chain,
-        errorCategory: errorCategory || null,
       },
     });
   } catch (err) {
