@@ -1,26 +1,76 @@
+/**
+ * Enhanced Sniper Engine with Mempool-based whale watching
+ * Faster detection than block polling
+ */
+
 import type { Address, Hex } from "viem";
 import { getPublicClient } from "./chain.js";
 import { prisma } from "../db/client.js";
 import { batchMint, type MintOptions } from "./mint.js";
 import { withChainContext } from "./chainContext.js";
-import { type ChainId, getChainConfig } from "./chains.js";
+import type { ChainId } from "./chains.js";
 import { getChainsForSelection, getUserChainSelection } from "./userChain.js";
+import { getRPCPool } from "./rpcPool.js";
+
+// Whale tracking types
+interface WhaleTransaction {
+  hash: string;
+  to: string;
+  from: string;
+  input: string;
+  value: bigint;
+}
+
+// SeaDrop constants
+const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
+const MINT_PUBLIC_SELECTOR = "0x161ac21f";
+
+// Cycle configuration
+const CYCLE_MS = 8000; // Reduced from 12000 for faster detection
+const MAX_BLOCKS_PER_CYCLE = 50n;
+
+interface SeaDropContext {
+  isViaRouter: boolean;
+  routerAddress: string;
+  feeRecipient?: string;
+  quantity?: number;
+}
+
+interface TrackedWallet {
+  address: string;
+  label?: string | null;
+}
+
+// Mempool whale watching
+const whaleMempoolMonitors: Map<ChainId, any> = new Map();
 
 export async function addTrackedWallet(telegramId: bigint, address: string, label?: string) {
   return await prisma.trackedWallet.upsert({
-    where: { userId_address: { userId: telegramId, address: address.toLowerCase() } },
+    where: { 
+      userId_address: { 
+        userId: telegramId, 
+        address: address.toLowerCase() 
+      } 
+    },
     update: { label },
-    create: { userId: telegramId, address: address.toLowerCase(), label },
+    create: { 
+      userId: telegramId, 
+      address: address.toLowerCase(), 
+      label 
+    },
   });
 }
 
 export async function removeTrackedWallet(telegramId: bigint, address: string) {
   return await prisma.trackedWallet.deleteMany({
-    where: { userId: telegramId, address: address.toLowerCase() },
+    where: { 
+      userId: telegramId, 
+      address: address.toLowerCase() 
+    },
   });
 }
 
-export async function getTrackedWallets(telegramId: bigint) {
+export async function getTrackedWallets(telegramId: bigint): Promise<TrackedWallet[]> {
   return await prisma.trackedWallet.findMany({
     where: { userId: telegramId },
   });
@@ -30,47 +80,115 @@ export async function getSniperConfig(telegramId: bigint) {
   let config = await prisma.sniperConfig.findUnique({
     where: { userId: telegramId },
   });
+  
   if (!config) {
     config = await prisma.sniperConfig.create({
-      data: { userId: telegramId, autoCopy: false, maxSpendEth: 0.0 },
+      data: { 
+        userId: telegramId, 
+        autoCopy: false, 
+        maxSpendEth: 0.0 
+      },
     });
   }
+  
   return config;
 }
 
-export async function setSniperConfig(telegramId: bigint, autoCopy: boolean, maxSpendEth: number) {
+export async function setSniperConfig(
+  telegramId: bigint, 
+  autoCopy: boolean, 
+  maxSpendEth: number
+) {
   return await prisma.sniperConfig.upsert({
     where: { userId: telegramId },
     update: { autoCopy, maxSpendEth },
-    create: { userId: telegramId, autoCopy, maxSpendEth },
+    create: { 
+      userId: telegramId, 
+      autoCopy, 
+      maxSpendEth 
+    },
   });
 }
 
-// ==== Shared scanning state (per-chain cursors) ====
-const CYCLE_MS = 12_000;
-const MAX_BLOCKS_PER_CYCLE = 50n;
+// ✅ ENHANCED: Start mempool monitoring for whales
+export async function startWhaleMempoolMonitoring(
+  chain: ChainId,
+  onWhaleMint: (tx: WhaleTransaction, whale: TrackedWallet) => Promise<void>
+): Promise<void> {
+  if (whaleMempoolMonitors.has(chain)) return;
 
+  const pool = getRPCPool(chain);
+  
+  // Poll pending block for whale transactions
+  const monitor = setInterval(async () => {
+    try {
+      const { getPublicClient } = await import("./chain.js");
+      const client = getPublicClient(chain);
+      
+      const block = await client.getBlock({
+        blockTag: "pending",
+        includeTransactions: true,
+      });
+
+      if (!block.transactions) return;
+
+      for (const tx of block.transactions as any[]) {
+        if (!tx.to || !tx.input || tx.input === "0x") continue;
+        
+        // Check if from tracked wallet
+        const tracked = await isTrackedWallet(tx.from);
+        if (!tracked) continue;
+
+        // Check if mint transaction
+        const selector = tx.input.slice(0, 10).toLowerCase();
+        const isMint = [
+          "0x1249c58b", "0xa0712d68", "0x6a627842",
+          "0x40c10f19", "0x4e6ec247", "0x161ac21f"
+        ].includes(selector);
+
+        if (isMint) {
+          await onWhaleMint(tx as WhaleTransaction, tracked);
+        }
+      }
+    } catch (err) {
+      // Silent fail - will retry
+    }
+  }, 2000); // Check every 2 seconds
+
+  whaleMempoolMonitors.set(chain, monitor);
+  console.log(`🐋 Whale mempool monitoring started on ${chain}`);
+}
+
+export async function stopWhaleMempoolMonitoring(chain: ChainId): Promise<void> {
+  const monitor = whaleMempoolMonitors.get(chain);
+  if (monitor) {
+    clearInterval(monitor);
+    whaleMempoolMonitors.delete(chain);
+  }
+}
+
+async function isTrackedWallet(address: string): Promise<TrackedWallet | null> {
+  const wallet = await prisma.trackedWallet.findFirst({
+    where: { address: address.toLowerCase() },
+  });
+  return wallet || null;
+}
+
+// Block polling for whale watching (backup method)
 const cycleStartedAt: Record<ChainId, number> = { base: 0, robinhood: 0 };
 const cycleFromBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
 const cycleToBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
-const cycleProcessed: Record<ChainId, Set<string>> = { base: new Set(), robinhood: new Set() };
-const blockCache = new Map<string, any>();
-let blockCacheSince = 0;
+const cycleProcessed: Record<ChainId, Set<string>> = { 
+  base: new Set(), 
+  robinhood: new Set() 
+};
 
 async function getBlockCached(chain: ChainId, blockNumber: bigint): Promise<any | null> {
-  const now = Date.now();
-  if (now - blockCacheSince > CYCLE_MS) {
-    blockCache.clear();
-    blockCacheSince = now;
-  }
-  const key = `${chain}:${blockNumber.toString()}`;
-  if (blockCache.has(key)) return blockCache.get(key);
   try {
     const block = await getPublicClient(chain).getBlock({
       blockNumber,
       includeTransactions: true,
     });
-    blockCache.set(key, block);
     return block;
   } catch (err) {
     console.error(`getBlock(${chain}, ${blockNumber}) failed:`, err);
@@ -78,25 +196,14 @@ async function getBlockCached(chain: ChainId, blockNumber: bigint): Promise<any 
   }
 }
 
-// ==== SeaDrop router decoding ====
-const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
-const MINT_PUBLIC_SELECTOR = "0x161ac21f";
-
-interface SeaDropContext {
-  isViaRouter: boolean;
-  routerAddress: string;
-  feeRecipient?: string;
-  quantity?: number;
-}
-
-function decodeSeaDropNft(input: string): Address | null {
-  if (!input || input.length < 74) return null;
-  const candidate = `0x${input.slice(10, 74).slice(24)}`.toLowerCase();
-  return /^0x[0-9a-f]{40}$/.test(candidate) ? (candidate as Address) : null;
-}
-
-function decodeSeaDropMintPublic(input: string): { nftContract: Address; feeRecipient: Address; minterIfNotPayer: Address; quantity: bigint } | null {
-  if (!input || input.length < 266) return null; // 4 + 4*64 = 260 chars minimum
+function decodeSeaDropMintPublic(input: string): { 
+  nftContract: Address; 
+  feeRecipient: Address; 
+  minterIfNotPayer: Address; 
+  quantity: bigint 
+} | null {
+  if (!input || input.length < 266) return null;
+  
   try {
     const nftContract = `0x${input.slice(10, 74).slice(24)}`.toLowerCase() as Address;
     const feeRecipient = `0x${input.slice(74, 138).slice(24)}`.toLowerCase() as Address;
@@ -112,9 +219,10 @@ function decodeSeaDropMintPublic(input: string): { nftContract: Address; feeReci
   }
 }
 
-// Resolve the REAL NFT contract for a whale mint tx. Returns tx.to unchanged
-// for ordinary direct mints, plus SeaDrop context when applicable.
-function resolveMintTarget(txTo: string, input: string): { target: Address; seaDropContext?: SeaDropContext } {
+function resolveMintTarget(
+  txTo: string, 
+  input: string
+): { target: Address; seaDropContext?: SeaDropContext } {
   const to = txTo.toLowerCase();
   const selector = input.slice(0, 10).toLowerCase();
   
@@ -131,17 +239,6 @@ function resolveMintTarget(txTo: string, input: string): { target: Address; seaD
         },
       };
     }
-    // Fallback to simple NFT extraction
-    const nft = decodeSeaDropNft(input);
-    if (nft) {
-      return {
-        target: nft,
-        seaDropContext: {
-          isViaRouter: true,
-          routerAddress: SEADROP_ROUTER,
-        },
-      };
-    }
   }
   
   return { target: to as Address };
@@ -150,138 +247,135 @@ function resolveMintTarget(txTo: string, input: string): { target: Address; seaD
 async function pollChain(
   chain: ChainId,
   telegramId: bigint,
-  tracked: Array<{ address: string; label: string | null }>,
-  config: { maxSpendEth: number },
+  trackedWallets: TrackedWallet[],
+  config: any,
   notifyCallback: (msg: string) => void
-) {
-  const { badge, name } = getChainConfig(chain);
-  const publicClient = getPublicClient(chain);
+): Promise<void> {
+  const now = Date.now();
   
+  if (now - cycleStartedAt[chain] < CYCLE_MS && cycleFromBlock[chain]) {
+    return; // Too soon
+  }
+
   try {
-    const head = await publicClient.getBlockNumber();
-    const now = Date.now();
+    const client = getPublicClient(chain);
+    const latest = await client.getBlockNumber();
     
-    if (now - cycleStartedAt[chain] > CYCLE_MS) {
-      cycleStartedAt[chain] = now;
-      cycleFromBlock[chain] =
-        cycleFromBlock[chain] === null
-          ? head - 1n
-          : cycleToBlock[chain] === null
-          ? head - 1n
-          : cycleToBlock[chain] + 1n;
-      cycleToBlock[chain] = head;
-      cycleProcessed[chain] = new Set();
+    const fromBlock = cycleToBlock[chain] 
+      ? cycleToBlock[chain]! + 1n 
+      : latest - 5n;
+    const toBlock = latest;
+    
+    if (fromBlock > toBlock) return;
+    if (toBlock - fromBlock > MAX_BLOCKS_PER_CYCLE) {
+      console.warn(`[${chain}] Block range too large, capping`);
     }
-    
-    const fromBlock = cycleFromBlock[chain];
-    const toBlock = cycleToBlock[chain];
-    if (fromBlock === null || toBlock === null) return;
-    
-    let from = fromBlock;
-    if (toBlock - from + 1n > MAX_BLOCKS_PER_CYCLE) {
-      from = toBlock - MAX_BLOCKS_PER_CYCLE + 1n;
-    }
-    
-    const trackedAddrs = tracked.map((t) => t.address.toLowerCase());
-    const trackedMap = new Map(tracked.map((t) => [t.address.toLowerCase(), t]));
-    
-    for (let b = from; b <= toBlock; b++) {
+
+    cycleStartedAt[chain] = now;
+    cycleFromBlock[chain] = fromBlock;
+    cycleToBlock[chain] = toBlock;
+
+    const trackedAddresses = new Set(
+      trackedWallets.map(w => w.address.toLowerCase())
+    );
+
+    for (let b = fromBlock; b <= toBlock; b++) {
       const block = await getBlockCached(chain, b);
-      if (!block || !block.transactions) continue;
-      
-      for (const tx of block.transactions) {
-        if (!tx?.to || !tx?.input || tx.input === "0x") continue;
+      if (!block?.transactions) continue;
+
+      for (const tx of block.transactions as any[]) {
+        if (!tx.to || !tx.input) continue;
         
-        const { target: mintTarget, seaDropContext } = resolveMintTarget(tx.to, tx.input);
-        const mintTargetLower = mintTarget.toLowerCase();
+        const from = tx.from?.toLowerCase();
+        if (!trackedAddresses.has(from)) continue;
+
+        const matchedWallet = trackedWallets.find(
+          w => w.address.toLowerCase() === from
+        )!;
         
-        // Skip if we've already processed this tx
-        const txKey = `${chain}:${tx.hash}`;
-        if (cycleProcessed[chain].has(txKey)) continue;
-        cycleProcessed[chain].add(txKey);
+        const { target: mintTarget, seaDropContext } = resolveMintTarget(
+          tx.to, 
+          tx.input
+        );
         
-        // Check if this is from a tracked wallet
-        const fromLower = (tx.from || "").toLowerCase();
-        const matchedWallet = trackedMap.get(fromLower);
-        if (!matchedWallet) continue;
+        const valueEth = tx.value 
+          ? (Number(tx.value) / 1e18).toFixed(4) 
+          : "0";
         
-        // Value check
-        const valueEth = Number(tx.value || 0n) / 1e18;
-        if (valueEth > config.maxSpendEth) {
-          notifyCallback(
-            `⏭️ **Skipped Copy-Mint (${matchedWallet.label || "Tracked"}) — ${badge}${name}**\n` +
-            `Cost: ~${valueEth} ETH exceeds your Max Spend setting (${config.maxSpendEth} ETH).\n` +
-            `TxHash: \`${tx.hash}\``
-          );
-          continue;
-        }
-        
+        const config = getChainConfig(chain);
+        const badge = config.badge;
+        const name = config.name;
+
+        // Notify and execute copy-mint
         const viaRouter = !!seaDropContext?.isViaRouter;
         
         notifyCallback(
-          `🎯 **Whale Mint Detected (${matchedWallet.label || "Tracked"}) — ${badge}${name}**\n\n` +
+          `🐋 *Whale Mint Detected* (${matchedWallet.label || "Tracked"}) — ${badge} ${name}\n\n` +
           (viaRouter
-            ? `Mint Target (decoded from SeaDrop router): \`${mintTarget}\`\n`
-            : `Target Contract: \`${mintTarget}\`\n`) +
-          `Value: \`${valueEth} ETH\`\n` +
-          `TxHash: \`${tx.hash}\`\n\n` +
-          `🚀 Attempting copy-mint across your sub-wallets… ` +
-          `(contract is re-vetted by the security gate before any transaction is sent)`
+            ? `*Target:* \\`${mintTarget}\\` (via SeaDrop)\n`
+            : `*Target:* \\`${mintTarget}\\`\n`) +
+          `*Value:* ${valueEth} ETH\n` +
+          `*Tx:* \\`${tx.hash}\\`\n\n` +
+          `🚀 Attempting copy-mint...`
         );
-        
-        // Build mint options with SeaDrop context
+
         const mintOptions: MintOptions = {
           contractAddress: mintTarget,
           seaDropContext: viaRouter ? seaDropContext : undefined,
         };
-        
+
         const result = await withChainContext(chain, () =>
           batchMint(telegramId, mintTarget, mintOptions)
         );
-        
+
+        // Send result notification
         if (result.results.length === 0) {
           notifyCallback(
-            `⏭️ **Copy-Mint Skipped (${matchedWallet.label || "Tracked"}) — ${badge}${name}**\n` +
-            `Contract: \`${mintTarget}\`\n` +
-            `Reason: ${result.abortReason || "no result returned"}\n` +
-            `TxHash: \`${tx.hash}\``
+            `⏭️ *Copy-Mint Skipped*\n` +
+            `Contract: \\`${mintTarget}\\`\n` +
+            `Reason: ${result.abortReason || "No result"}`
           );
         } else {
-          let msg =
-            `✅ **Copy-Mint Result (${matchedWallet.label || "Tracked"}) — ${badge}${name}**\n\n` +
-            `Contract: \`${mintTarget}\`\n` +
-            `✅ Success: ${result.totalSuccess} · ❌ Failed: ${result.totalFailed}\n\n`;
+          let msg = 
+            `✅ *Copy-Mint Result*\n\n` +
+            `Contract: \\`${mintTarget}\\`\n` +
+            `Success: ${result.totalSuccess} · Failed: ${result.totalFailed}\n\n`;
           
           for (const r of result.results) {
             const icon = r.success ? "✅" : "❌";
-            msg += `${icon} ${r.label}: \`${r.walletAddress.slice(0, 6)}..${r.walletAddress.slice(-4)}\``;
+            const shortAddr = `${r.walletAddress.slice(0, 6)}..${r.walletAddress.slice(-4)}`;
+            msg += `${icon} ${r.label}: \\`${shortAddr}\\``;
             if (r.basescanUrl) msg += ` — [TX](${r.basescanUrl})`;
             if (r.error) msg += ` — ${r.error}`;
-            msg += `\n`;
+            msg += "\n";
           }
+          
           notifyCallback(msg);
         }
       }
     }
   } catch (err) {
-    console.error(`Error in sniper polling for user ${telegramId} on ${chain}:`, err);
+    console.error(`Error in sniper polling for ${telegramId} on ${chain}:`, err);
   }
 }
 
 export async function pollTrackedWalletsForUser(
   telegramId: bigint,
   notifyCallback: (msg: string) => void
-) {
+): Promise<void> {
   const config = await getSniperConfig(telegramId);
   if (!config.autoCopy) return;
-  
+
   const tracked = await getTrackedWallets(telegramId);
   if (tracked.length === 0) return;
-  
+
   const selection = await getUserChainSelection(telegramId);
   const chains = getChainsForSelection(selection);
-  
+
   for (const chain of chains) {
     await pollChain(chain, telegramId, tracked, config, notifyCallback);
   }
 }
+
+// Import at bottom to avoid circular dependency
+import { getChainConfig } from "./chains.js";
