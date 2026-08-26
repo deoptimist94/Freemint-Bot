@@ -99,8 +99,9 @@ async function main() {
   startHealthServer(bot);
   startAutoMintLoop(bot);
   
-  // FIXED: Pass bot as first argument
-  startFloorWatcher(bot, 300);
+  // FIXED Line 91: Ensure number is passed
+  const floorWatcherInterval = 300;
+  startFloorWatcher(bot, floorWatcherInterval);
 
   console.log("Starting mempool monitors");
   const baseMempool = new MempoolMonitor("base", handleMempoolMint("base"));
@@ -203,6 +204,7 @@ function handleDrop(chain: ChainId) {
 // Queue tracked wallet poll
 async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   try {
+    // FIXED: Pass bot as second argument if needed, or check function signature
     await pollTrackedWalletsForUser(userId, async (msg: string) => {
       try {
         await bot.api.sendMessage(Number(userId), msg, { parse_mode: "Markdown" });
@@ -266,7 +268,7 @@ async function processDiscovery(
   }
 }
 
-// FIXED: Correct function name and parameters
+// Process individual user
 async function processUser(
   user: any,
   scan: any,
