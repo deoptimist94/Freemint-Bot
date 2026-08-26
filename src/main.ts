@@ -28,7 +28,8 @@ import {
 } from "./core/userChain.js";
 import { MempoolMonitor, type MempoolMint } from "./core/mempoolSniper.js";
 import { getRPCPool, getRPCStats } from "./core/rpcPool.js";
-import { mintQueue, discoveryQueue } from "./core/queue.js";
+import { mintQueue, discoveryQueue, closeQueues } from "./core/queue.js";
+import { loadSubscribers } from "./core/broadcaster.js";
 import { fetchCollectionFloor } from "./core/autoLister.js";
 
 const monitors: Map<ChainId, MempoolMonitor> = new Map();
@@ -60,6 +61,10 @@ async function main() {
   try {
     await prisma.$connect();
     console.log("Database connected");
+    
+    // Load subscribers for broadcasting
+    await loadSubscribers();
+    console.log("Subscribers loaded");
   } catch (error) {
     console.error("Database connection failed:", error);
     process.exit(1);
@@ -143,8 +148,7 @@ async function main() {
     dropListener.stop();
     robinhoodListener?.stop();
     
-    await mintQueue.close();
-    await discoveryQueue.close();
+    await closeQueues();
     
     await bot.stop();
     await prisma.$disconnect();
@@ -272,7 +276,7 @@ async function processDiscovery(
   }
   
   if (!scan.security?.isSafe) {
-    console.log(`Unsafe contract: ${contractAddress}`);
+    console.log(`Unsafe contract: ${contractAddress} - ${scan.security.warnings.join(', ')}`);
     return;
   }
   
@@ -283,7 +287,7 @@ async function processDiscovery(
 
   const spam = await evaluateSpamContract(scan, chain);
   if (spam.isSpam) {
-    console.log(`Spam filtered: ${contractAddress}`);
+    console.log(`Spam filtered: ${contractAddress} - ${spam.reason}`);
     return;
   }
 
@@ -297,10 +301,11 @@ async function processDiscovery(
   );
   
   if (!sim.success) {
-    console.log(`Simulation failed: ${contractAddress}`);
+    console.log(`Simulation failed: ${contractAddress} - ${sim.error}`);
     return;
   }
 
+  // Get all active users in ONE query
   const activeUsers = await prisma.user.findMany({
     where: { 
       wallets: { some: {} },
@@ -308,29 +313,70 @@ async function processDiscovery(
     include: { wallets: true },
   });
 
-  for (const user of activeUsers) {
-    if (!user.wallets?.length) continue;
+  console.log(`🎯 Free-mint alert: ${scan.contractAddress} on ${chain} - broadcasting to ${activeUsers.length} users`);
 
-    const selection = await getUserChainSelection(BigInt(user.telegramId));
-    if (!getChainsForSelection(selection).includes(chain)) continue;
+  // PARALLEL processing for all users
+  const userPromises = activeUsers.map(async (user) => {
+    try {
+      if (!user.wallets?.length) return;
 
-    console.log(`Alert sent to ${user.telegramId} for ${scan.contractAddress}`);
+      const selection = await getUserChainSelection(BigInt(user.telegramId));
+      if (!getChainsForSelection(selection).includes(chain)) return;
 
-    const autoOn = await getAutoMintStatus(BigInt(user.telegramId));
-    if (autoOn) {
-      console.log(`Auto-minting for ${user.telegramId}`);
-      
-      await mintQueue.add({
-        userId: user.telegramId.toString(),
-        contractAddress: scan.contractAddress,
-        chain,
-        options: {},
-      }, {
-        priority: 2,
-        attempts: 3,
-      });
+      // Queue mint job for this user if auto-mint enabled
+      if (user.autoMintEnabled) {
+        await mintQueue.add({
+          userId: user.telegramId.toString(),
+          contractAddress: scan.contractAddress,
+          chain,
+          options: {
+            detectedAt,
+            txHash,
+            securityScore: scan.security.riskScore,
+          },
+        }, {
+          priority: scan.security.riskScore < 20 ? 1 : 2,
+          attempts: 5,
+        });
+
+        console.log(`✅ Queued mint for user ${user.telegramId} on ${scan.contractAddress}`);
+      }
+
+      // Send notification
+      try {
+        const badge = chain === 'base' ? '⛽' : '🏹';
+        const gatedWarning = (scan.isGated || scan.requiresSignature) ? '\n⚠️ This mint may be gated/signature-required' : '';
+        
+        await bot.api.sendMessage(Number(user.telegramId), 
+          `🚨 *FREE MINT DETECTED* ${badge}\n\n` +
+          `Contract: \\`${scan.contractAddress}\\`\n` +
+          `Chain: ${chain.toUpperCase()}\n` +
+          `Security Score: ${scan.security.riskScore}/100${gatedWarning}\n\n` +
+          `${user.autoMintEnabled ? 'Auto-mint has been queued.' : 'Use /bypass to attempt mint manually.'}`,
+          { parse_mode: 'Markdown', link_preview_options: { is_disabled: true } }
+        );
+      } catch (notifyErr: any) {
+        if (notifyErr?.error_code === 403) {
+          console.log(`User ${user.telegramId} blocked the bot`);
+        } else {
+          console.error(`Failed to notify ${user.telegramId}:`, notifyErr.message);
+        }
+      }
+
+    } catch (err) {
+      console.error(`Failed to process user ${user.telegramId}:`, err);
     }
-  }
+  });
+
+  // Execute all in parallel with timeout
+  await Promise.race([
+    Promise.all(userPromises),
+    new Promise((_, reject) => 
+      setTimeout(() => reject(new Error('User processing timeout')), 30000)
+    ),
+  ]).catch(err => {
+    console.error('Parallel user processing error:', err);
+  });
 }
 
 main().catch((error) => {
