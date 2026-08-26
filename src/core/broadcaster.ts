@@ -1,8 +1,8 @@
 /**
- * Event Broadcaster - Simultaneous multi-user notifications
+ * Enhanced Event Broadcaster - True parallel multi-user notifications
  */
 
-import { type Bot } from "grammy";
+import type { Bot } from "grammy";
 import { prisma } from "../db/client.js";
 import { getChainsForSelection, getUserChainSelection } from "./userChain.js";
 import type { ChainId } from "./chains.js";
@@ -15,6 +15,7 @@ interface FreeMintEvent {
   txHash?: string;
   securityScore: number;
   isGated: boolean;
+  requiresSignature?: boolean;
 }
 
 interface WhaleMintEvent {
@@ -28,14 +29,19 @@ interface WhaleMintEvent {
 
 type BotEvent = FreeMintEvent | WhaleMintEvent;
 
-const subscribers = new Map<bigint, {
+interface Subscriber {
   telegramId: bigint;
   chainSelection: ChainId[];
   autoMintEnabled: boolean;
-}>();
+}
 
+const subscribers = new Map<bigint, Subscriber>();
 const recentEvents = new Map<string, number>();
-const EVENT_DEDUP_TTL = 60 * 1000;
+const EVENT_DEDUP_TTL = 60 * 1000; // 1 minute
+
+// ✅ ENHANCED: Chunk size for parallel processing
+const BROADCAST_CHUNK_SIZE = 50;
+const BROADCAST_TIMEOUT = 60000; // 60 seconds
 
 export async function loadSubscribers(): Promise<void> {
   try {
@@ -43,7 +49,7 @@ export async function loadSubscribers(): Promise<void> {
       where: { wallets: { some: {} } },
       include: { wallets: true },
     });
-    
+
     for (const user of users) {
       const selection = await getUserChainSelection(user.telegramId);
       subscribers.set(user.telegramId, {
@@ -52,10 +58,10 @@ export async function loadSubscribers(): Promise<void> {
         autoMintEnabled: user.autoMintEnabled,
       });
     }
-    
-    console.log(`Loaded ${subscribers.size} subscribers`);
+
+    console.log(`✅ Loaded ${subscribers.size} subscribers`);
   } catch (err) {
-    console.error('Failed to load subscribers:', err);
+    console.error('❌ Failed to load subscribers:', err);
   }
 }
 
@@ -65,12 +71,12 @@ export async function refreshSubscriber(telegramId: bigint): Promise<void> {
       where: { telegramId },
       include: { wallets: true },
     });
-    
+
     if (!user || user.wallets.length === 0) {
       subscribers.delete(telegramId);
       return;
     }
-    
+
     const selection = await getUserChainSelection(telegramId);
     subscribers.set(telegramId, {
       telegramId,
@@ -78,83 +84,107 @@ export async function refreshSubscriber(telegramId: bigint): Promise<void> {
       autoMintEnabled: user.autoMintEnabled,
     });
   } catch (err) {
-    console.error('Failed to refresh subscriber:', err);
+    console.error('❌ Failed to refresh subscriber:', err);
   }
 }
 
+// ✅ ENHANCED: True parallel chunked broadcasting
 export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
   const eventKey = `${event.type}:${event.contractAddress}:${event.chain}`;
   const now = Date.now();
-  
+
+  // Deduplication check
   if (recentEvents.has(eventKey)) {
     const lastTime = recentEvents.get(eventKey)!;
     if (now - lastTime < EVENT_DEDUP_TTL) {
-      console.log(`Event ${eventKey} already broadcast recently`);
+      console.log(`⏭️ Event ${eventKey} already broadcast recently`);
       return;
     }
   }
+
   recentEvents.set(eventKey, now);
   
+  // Cleanup old events
   for (const [key, time] of recentEvents) {
     if (now - time > EVENT_DEDUP_TTL * 2) {
       recentEvents.delete(key);
     }
   }
-  
+
+  // Build message
   let message: string;
   if (event.type === 'free_mint') {
-    const badge = event.chain === 'base' ? 'BASE' : 'ROBINHOOD';
-    const gatedWarning = event.isGated ? '\nGated mint detected - may require whitelist' : '';
-    message = 
-      `FREE MINT DETECTED ${badge}\n\n` +
-      `Contract: ${event.contractAddress}\n` +
-      `Chain: ${event.chain.toUpperCase()}\n` +
-      `Security Score: ${event.securityScore}/100${gatedWarning}\n\n` +
+    const badge = event.chain === 'base' ? '🔵 BASE' : '🟣 ROBINHOOD';
+    const gatedWarning = event.isGated ? '\n⚠️ Gated mint detected' : '';
+    const sigWarning = event.requiresSignature ? '\n📝 Signature required' : '';
+    
+    message =
+      `🎯 *FREE MINT DETECTED* ${badge}\n\n` +
+      `*Contract:* \\`${event.contractAddress}\\`\n` +
+      `*Chain:* ${event.chain.toUpperCase()}\n` +
+      `*Security Score:* ${event.securityScore}/100${gatedWarning}${sigWarning}\n\n` +
       `Auto-mint will attempt if enabled.`;
   } else {
-    const badge = event.chain === 'base' ? 'BASE' : 'ROBINHOOD';
-    const label = event.whaleLabel ? `(${event.whaleLabel})` : '';
-    message = 
-      `WHALE MINT DETECTED ${badge}\n\n` +
-      `Whale: ${event.whaleAddress} ${label}\n` +
-      `Contract: ${event.contractAddress}\n` +
-      `Chain: ${event.chain.toUpperCase()}\n\n` +
+    const badge = event.chain === 'base' ? '🔵 BASE' : '🟣 ROBINHOOD';
+    const label = event.whaleLabel ? ` (${event.whaleLabel})` : '';
+    
+    message =
+      `🐋 *WHALE MINT DETECTED* ${badge}\n\n` +
+      `*Whale:* \\`${event.whaleAddress}\\`${label}\n` +
+      `*Contract:* \\`${event.contractAddress}\\`\n` +
+      `*Chain:* ${event.chain.toUpperCase()}\n\n` +
       `Copy-mint will attempt if enabled.`;
   }
-  
-  const promises: Array<Promise<void>> = [];
-  
-  for (const sub of subscribers.values()) {
-    if (!sub.chainSelection.includes(event.chain)) continue;
-    
-    const promise = (async () => {
-      try {
-        await bot.api.sendMessage(Number(sub.telegramId), message, {
-          parse_mode: 'Markdown',
-          link_preview_options: { is_disabled: true },
-        });
-      } catch (err: any) {
-        if (err?.error_code === 403) {
-          subscribers.delete(sub.telegramId);
-        } else {
-          console.error(`Failed to notify ${sub.telegramId}:`, err.message);
-        }
-      }
-    })();
-    
-    promises.push(promise);
+
+  // Filter subscribers by chain
+  const eligibleSubscribers = Array.from(subscribers.values())
+    .filter(sub => sub.chainSelection.includes(event.chain));
+
+  console.log(`📢 Broadcasting ${event.type} to ${eligibleSubscribers.length} users`);
+
+  // ✅ ENHANCED: Chunked parallel processing
+  const chunks: Subscriber[][] = [];
+  for (let i = 0; i < eligibleSubscribers.length; i += BROADCAST_CHUNK_SIZE) {
+    chunks.push(eligibleSubscribers.slice(i, i + BROADCAST_CHUNK_SIZE));
   }
-  
-  await Promise.race([
-    Promise.all(promises),
-    new Promise((unused, reject) => 
-      setTimeout(() => reject(new Error('Broadcast timeout')), 30000)
-    ),
-  ]).catch(err => {
-    console.error('Broadcast error:', err);
-  });
-  
-  console.log(`Broadcast ${event.type} to ${promises.length} users`);
+
+  let successCount = 0;
+  let failCount = 0;
+
+  for (const chunk of chunks) {
+    const results = await Promise.allSettled(
+      chunk.map(async (sub) => {
+        try {
+          await bot.api.sendMessage(Number(sub.telegramId), message, {
+            parse_mode: 'Markdown',
+            link_preview_options: { is_disabled: true },
+          });
+          return { success: true, userId: sub.telegramId };
+        } catch (err: any) {
+          if (err?.error_code === 403) {
+            subscribers.delete(sub.telegramId);
+            console.log(`🚫 Removed blocked user ${sub.telegramId}`);
+          }
+          return { success: false, userId: sub.telegramId, error: err.message };
+        }
+      })
+    );
+
+    results.forEach(result => {
+      if (result.status === 'fulfilled' && result.value.success) {
+        successCount++;
+      } else {
+        failCount++;
+      }
+    });
+
+    // Small delay between chunks to avoid rate limits
+    if (chunks.length > 1) {
+      await new Promise(r => setTimeout(r, 100));
+    }
+  }
+
+  console.log(`✅ Broadcast complete: ${successCount} success, ${failCount} failed`);
 }
 
 export function getSubscriberStats(): { total: number; autoMint: number } {
