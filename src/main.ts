@@ -1,6 +1,6 @@
 /**
  * Freemint Bot - Professional Edition
- * Fixed TypeScript errors
+ * Fixed TypeScript errors + runtime dedup cache + bot.start()
  */
 
 import "dotenv/config";
@@ -27,6 +27,28 @@ import { loadSubscribers } from "./core/broadcaster.js";
 
 const monitors: Map<ChainId, MempoolMonitor> = new Map();
 let bot: Bot;
+
+// --- Skip cache: avoid re-scanning known non-mintable addresses ---
+const skipCache = new Map<string, number>();
+const SKIP_CACHE_TTL_MS = 30 * 60 * 1000;
+
+function isSkipped(chain: ChainId, address: string): boolean {
+  const key = `${chain}:${address.toLowerCase()}`;
+  const until = skipCache.get(key);
+  if (!until) return false;
+  if (Date.now() < until) return true;
+  skipCache.delete(key);
+  return false;
+}
+
+function markSkipped(chain: ChainId, address: string): void {
+  const key = `${chain}:${address.toLowerCase()}`;
+  skipCache.set(key, Date.now() + SKIP_CACHE_TTL_MS);
+  if (skipCache.size > 10_000) {
+    const firstKey = skipCache.keys().next().value;
+    if (firstKey) skipCache.delete(firstKey);
+  }
+}
 
 async function main() {
   console.log("Starting Freemint Bot Professional Edition");
@@ -162,6 +184,11 @@ async function main() {
   process.on("SIGTERM", () => handleShutdown("SIGTERM"));
 
   console.log("Bot initialization complete");
+
+  // ★★★ THIS IS THE MISSING LINE ★★★
+  // Start long-polling so the bot actually receives /start, /whois, etc.
+  bot.start();
+  console.log("Bot polling started — awaiting commands");
 }
 
 // Mempool mint handler
@@ -196,7 +223,7 @@ function handleDrop(chain: ChainId) {
   };
 }
 
-// Queue tracked wallet poll — now passes both required arguments
+// Queue tracked wallet poll
 async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   try {
     const notifyCallback: (msg: string) => Promise<void> = async (msg: string) => {
@@ -213,30 +240,37 @@ async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   }
 }
 
-// Process discovery — scan first, then evaluate spam with the ScanResult
+// Process discovery — with skip cache
 async function processDiscovery(
   contractAddress: string,
   chain: ChainId,
   detectedAt: number,
   txHash?: string
 ): Promise<void> {
+  if (isSkipped(chain, contractAddress)) {
+    return;
+  }
+
   console.log(`Processing discovery: ${contractAddress} on ${chain}`);
 
   const scan = await scanContract(contractAddress, chain);
   if (!scan.isNft || scan.mintFunctions.length === 0) {
-    console.log(`No mint functions found for: ${contractAddress}`);
+    console.log(`No mint functions found for: ${contractAddress} — caching skip`);
+    markSkipped(chain, contractAddress);
     return;
   }
 
   const spamCheck = await evaluateSpamContract(scan, chain);
   if (spamCheck.isSpam) {
     console.log(`Skipping spam contract: ${contractAddress} — ${spamCheck.reason}`);
+    markSkipped(chain, contractAddress);
     return;
   }
 
   const bestMint = getBestMintFunction(scan.mintFunctions);
   if (!bestMint || !bestMint.isFreeMint) {
-    console.log(`Not a free mint: ${contractAddress}`);
+    console.log(`Not a free mint: ${contractAddress} — caching skip`);
+    markSkipped(chain, contractAddress);
     return;
   }
 
