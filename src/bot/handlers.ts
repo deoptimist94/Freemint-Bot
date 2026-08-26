@@ -348,9 +348,7 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
         lines.push(`**${networkBadge(chain)}**`);
       }
 
-      // Sell targets are Base-only: executeSell is Base-only (Reservoir has no
-      // Robinhood support), and registering Robinhood items here could collide
-      // on shared tokenIds in the sell cache.
+      // Sell targets are Base-only
       if (chain === "base") {
         for (const item of portfolio.items) {
           setSellTarget(telegramId, wallet.id, item.tokenId, {
