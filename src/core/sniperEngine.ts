@@ -31,11 +31,11 @@ interface SeaDropContext {
   quantity?: number;
 }
 
-// FIXED: Added 'id' property to match Prisma model
+// FIXED: label is now required (not optional)
 interface TrackedWallet {
   id: string;
   address: string;
-  label?: string | null;
+  label: string | null;
 }
 
 const whaleMempoolMonitors: Map<ChainId, any> = new Map();
@@ -73,15 +73,15 @@ export async function removeTrackedWallet(telegramId: bigint, address: string) {
   });
 }
 
+// FIXED: Ensure label is never undefined
 export async function getTrackedWallets(telegramId: bigint): Promise<TrackedWallet[]> {
   const wallets = await prisma.trackedWallet.findMany({
     where: { userId: telegramId },
   });
-  // Map to ensure id is included
   return wallets.map(w => ({
     id: w.id,
     address: w.address,
-    label: w.label
+    label: w.label || null  // Convert undefined to null
   }));
 }
 
@@ -170,6 +170,7 @@ export async function stopWhaleMempoolMonitoring(chain: ChainId): Promise<void> 
   }
 }
 
+// FIXED: Ensure label is never undefined
 async function isTrackedWallet(address: string): Promise<TrackedWallet | null> {
   const wallet = await prisma.trackedWallet.findFirst({
     where: { address: address.toLowerCase() },
@@ -178,7 +179,7 @@ async function isTrackedWallet(address: string): Promise<TrackedWallet | null> {
   return {
     id: wallet.id,
     address: wallet.address,
-    label: wallet.label
+    label: wallet.label || null  // Convert undefined to null
   };
 }
 
