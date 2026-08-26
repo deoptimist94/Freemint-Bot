@@ -13,7 +13,7 @@ interface FreeMintEvent {
   chain: ChainId;
   detectedAt: number;
   txHash?: string;
-  securityScore: number;
+  securityScore: number;  // FIXED: Changed from 'security' object to direct number
   isGated: boolean;
   requiresSignature?: boolean;
 }
@@ -113,11 +113,12 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
     const gatedWarning = event.isGated ? '\nGated mint detected' : '';
     const sigWarning = event.requiresSignature ? '\nSignature required' : '';
     
+    // FIXED: Use event.securityScore directly
     message =
       `FREE MINT DETECTED ${badge}\n\n` +
       `Contract: ${event.contractAddress}\n` +
       `Chain: ${event.chain.toUpperCase()}\n` +
-      `Security Score: ${event.security.riskScore}/100${gatedWarning}${sigWarning}\n\n` +
+      `Security Score: ${event.securityScore}/100${gatedWarning}${sigWarning}\n\n` +
       `Auto-mint will attempt if enabled.`;
   } else {
     const badge = event.chain === 'base' ? 'BASE' : 'ROBINHOOD';
