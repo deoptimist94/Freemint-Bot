@@ -33,7 +33,7 @@ async function main() {
 
   const required = ["BOT_TOKEN", "ENCRYPTION_KEY", "DATABASE_URL"];
   const missing = required.filter(key => !process.env[key]);
-  
+
   if (missing.length > 0) {
     console.error(`Missing required environment variables: ${missing.join(", ")}`);
     process.exit(1);
@@ -68,14 +68,11 @@ async function main() {
   // Register queue handlers
   mintQueue.process(async (job) => {
     const { userId, contractAddress, options } = job.data;
-    
     if (!userId) {
       console.error(`Job ${job.id} missing userId`);
       throw new Error("Missing userId in job data");
     }
-    
     console.log(`Processing mint job ${job.id} for user ${userId}`);
-    
     try {
       const result = await batchMint(BigInt(userId), contractAddress, options);
       return result;
@@ -85,8 +82,12 @@ async function main() {
     }
   });
 
+  // ============================================================
+  // FIX #1: Guard `detectedAt` against `undefined` from JobData
+  // ============================================================
   discoveryQueue.process(async (job) => {
-    const { contractAddress, chain, detectedAt, txHash } = job.data;
+    const { contractAddress, chain, detectedAt: rawDetectedAt, txHash } = job.data;
+    const detectedAt = rawDetectedAt ?? Date.now();  // <-- guarantees `number`
     try {
       await processDiscovery(contractAddress, chain as ChainId, detectedAt, txHash);
     } catch (error) {
@@ -98,9 +99,7 @@ async function main() {
   bot = createBot();
   startHealthServer(bot);
   startAutoMintLoop(bot);
-  
-  // FIXED Line 91: Use type assertion to force number type
-  startFloorWatcher(bot, 300 as number);
+  startFloorWatcher(bot, 300);
 
   console.log("Starting mempool monitors");
   const baseMempool = new MempoolMonitor("base", handleMempoolMint("base"));
@@ -149,15 +148,15 @@ async function main() {
   // Graceful shutdown
   const handleShutdown = async (signal: string) => {
     console.log(`\nShutting down (${signal})`);
-    
+
     monitors.forEach(m => m.stop());
     dropListener.stop();
     robinhoodListener?.stop();
-    
+
     await closeQueues();
     await bot.stop();
     await prisma.$disconnect();
-    
+
     console.log("Goodbye");
     process.exit(0);
   };
@@ -200,21 +199,20 @@ function handleDrop(chain: ChainId) {
   };
 }
 
-// Queue tracked wallet poll
-// FIXED Line 232: Ensure both arguments are passed with proper typing
+// ============================================================
+// FIX #2: Pass the notification callback as 2nd argument
+// ============================================================
 async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   try {
-    // Define the notify callback with explicit type
-    const notifyCallback: (msg: string) => Promise<void> = async (msg: string): Promise<void> => {
+    const notifyCallback: (msg: string) => Promise<void> = async (msg: string) => {
       try {
         await bot.api.sendMessage(Number(userId), msg, { parse_mode: "Markdown" });
       } catch (e) {
         console.error(`Failed to notify user ${userId}:`, e);
       }
     };
-    
-    // Call with both arguments explicitly
-    await pollTrackedWalletsForUser(userId, notifyCallback);
+
+    await pollTrackedWalletsForUser(userId, notifyCallback);  // <-- both args now provided
   } catch (err) {
     console.error(`Error polling tracked wallets for ${userId}:`, err);
   }
@@ -259,7 +257,7 @@ async function processDiscovery(
   // Chunked broadcasting
   const CHUNK_SIZE = 50;
   const chunks: typeof activeUsers[] = [];
-  
+
   for (let i = 0; i < activeUsers.length; i += CHUNK_SIZE) {
     chunks.push(activeUsers.slice(i, i + CHUNK_SIZE));
   }
@@ -287,7 +285,7 @@ async function processUser(
 
     if (user.autoMintEnabled) {
       const priorityValue = scan.security?.riskScore < 20 ? 1 : 2;
-      
+
       await mintQueue.add({
         userId: user.telegramId.toString(),
         contractAddress: scan.contractAddress,
@@ -301,13 +299,13 @@ async function processUser(
         priority: priorityValue,
         attempts: 5,
       });
-      
+
       console.log(`Queued mint for user ${user.telegramId}`);
     }
 
     const badge = chain === 'base' ? 'BASE' : 'ROBINHOOD';
-    const gatedWarning = (scan.isGated || scan.requiresSignature) 
-      ? '\nThis mint may be gated/signature-required' 
+    const gatedWarning = (scan.isGated || scan.requiresSignature)
+      ? '\nThis mint may be gated/signature-required'
       : '';
 
     await bot.api.sendMessage(
@@ -317,7 +315,7 @@ async function processUser(
       `Chain: ${chain.toUpperCase()}\n` +
       `Security Score: ${scan.security?.riskScore || 'N/A'}/100${gatedWarning}\n\n` +
       `${user.autoMintEnabled ? 'Auto-mint has been queued.' : 'Use /bypass to attempt mint manually.'}`,
-      { 
+      {
         parse_mode: 'Markdown',
         link_preview_options: { is_disabled: true }
       }
