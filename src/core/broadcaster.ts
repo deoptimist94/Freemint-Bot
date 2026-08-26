@@ -122,7 +122,7 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
       `Copy-mint will attempt if enabled.`;
   }
   
-  const promises: Promise<void>[] = [];
+  const promises: Array<Promise<void>> = [];
   
   for (const sub of subscribers.values()) {
     if (!sub.chainSelection.includes(event.chain)) continue;
@@ -147,7 +147,7 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
   
   await Promise.race([
     Promise.all(promises),
-    new Promise((_, reject) => 
+    new Promise((_resolve, reject) => 
       setTimeout(() => reject(new Error('Broadcast timeout')), 30000)
     ),
   ]).catch(err => {
