@@ -1,11 +1,12 @@
 /**
  * Job Queue - In-Memory with Postgres persistence
+ * Enhanced with proper typing and BullMQ-like interface
  */
 
 import { prisma } from "../db/client.js";
-import { type ChainId } from "./chains.js";
+import type { ChainId } from "./chains.js";
 
-interface JobData {
+export interface JobData {
   userId?: string;
   contractAddress: string;
   chain: ChainId;
@@ -14,16 +15,29 @@ interface JobData {
   txHash?: string;
 }
 
-interface QueuedJob {
+export interface QueuedJob {
   id: string;
   data: JobData;
   attempts: number;
+  attemptsMade: number;  // Added for Bull compatibility
   priority: number;
   createdAt: number;
   delayUntil?: number;
+  opts: { attempts: number; priority?: number };  // Added for Bull compatibility
 }
 
 type JobProcessor = (job: QueuedJob) => Promise<any>;
+
+interface JobLogData {
+  queueName: string;
+  jobId: string;
+  userId: bigint;
+  contractAddress: string;
+  chain: string;
+  status: string;
+  result?: string | null;
+  error?: string | null;
+}
 
 class MemoryQueue {
   private name: string;
@@ -32,6 +46,7 @@ class MemoryQueue {
   private processor?: JobProcessor;
   private intervalMs: number;
   private intervalId?: NodeJS.Timeout;
+  private eventHandlers: Map<string, Function[]> = new Map();
 
   constructor(name: string, intervalMs: number = 1000) {
     this.name = name;
@@ -52,11 +67,12 @@ class MemoryQueue {
       
       this.processing = true;
       
+      // Sort by priority (lower = higher priority), then by creation time
       this.jobs.sort((a, b) => {
         if (a.priority !== b.priority) return a.priority - b.priority;
         return a.createdAt - b.createdAt;
       });
-      
+
       const now = Date.now();
       const readyIndex = this.jobs.findIndex(j => !j.delayUntil || j.delayUntil <= now);
       
@@ -64,38 +80,42 @@ class MemoryQueue {
         this.processing = false;
         return;
       }
-      
+
       const job = this.jobs.splice(readyIndex, 1)[0];
       
       try {
-        console.log(`[${this.name}] Processing job ${job.id} (attempt ${job.attempts + 1})`);
+        console.log(`[${this.name}] Processing job ${job.id} (attempt ${job.attemptsMade + 1})`);
         const result = await this.processor(job);
-        
         await this.logJob(job, 'completed', result);
+        this.emit('completed', job, result);
         console.log(`[${this.name}] Job ${job.id} completed`);
-        
       } catch (error: any) {
         console.error(`[${this.name}] Job ${job.id} failed:`, error.message);
-        
         job.attempts++;
+        job.attemptsMade++;
         
-        if (job.attempts < 5) {
+        if (job.attempts < (job.opts.attempts || 5)) {
           const backoffMs = Math.pow(2, job.attempts) * 1000;
           job.delayUntil = Date.now() + backoffMs;
           this.jobs.push(job);
           console.log(`[${this.name}] Job ${job.id} requeued for retry ${job.attempts}`);
         } else {
           await this.logJob(job, 'failed', null, error.message);
+          this.emit('failed', job, error);
           console.error(`[${this.name}] Job ${job.id} failed permanently`);
         }
       }
       
       this.processing = false;
-      
     }, this.intervalMs);
   }
 
-  private async logJob(job: QueuedJob, status: string, result?: any, error?: string): Promise<void> {
+  private async logJob(
+    job: QueuedJob, 
+    status: string, 
+    result?: any, 
+    error?: string
+  ): Promise<void> {
     try {
       if (!job.data.userId) return;
       
@@ -103,7 +123,7 @@ class MemoryQueue {
         data: {
           queueName: this.name,
           jobId: job.id,
-          userId: BigInt(job.data.userId || 0),
+          userId: BigInt(job.data.userId),
           contractAddress: job.data.contractAddress,
           chain: job.data.chain,
           status,
@@ -116,19 +136,24 @@ class MemoryQueue {
     }
   }
 
-  public async add(data: JobData, options?: { priority?: number; delay?: number; attempts?: number }): Promise<{ id: string }> {
+  public async add(
+    data: JobData, 
+    options?: { priority?: number; delay?: number; attempts?: number }
+  ): Promise<{ id: string }> {
+    const attempts = options?.attempts ?? 5;
     const job: QueuedJob = {
       id: `${this.name}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       data,
       attempts: 0,
+      attemptsMade: 0,
       priority: options?.priority ?? 5,
       createdAt: Date.now(),
       delayUntil: options?.delay ? Date.now() + options.delay : undefined,
+      opts: { attempts: attempts, priority: options?.priority ?? 5 },
     };
-    
+
     this.jobs.push(job);
     console.log(`[${this.name}] Job ${job.id} added (queue size: ${this.jobs.length})`);
-    
     return { id: job.id };
   }
 
@@ -148,17 +173,28 @@ class MemoryQueue {
   }
 
   public on(event: string, handler: Function): void {
-    // Event emitter stub for compatibility
+    if (!this.eventHandlers.has(event)) {
+      this.eventHandlers.set(event, []);
+    }
+    this.eventHandlers.get(event)!.push(handler);
+  }
+
+  private emit(event: string, ...args: any[]): void {
+    const handlers = this.eventHandlers.get(event);
+    if (handlers) {
+      handlers.forEach(handler => {
+        try {
+          handler(...args);
+        } catch (e) {
+          console.error(`Event handler error for ${event}:`, e);
+        }
+      });
+    }
   }
 }
 
 export const mintQueue = new MemoryQueue('nft-mints', 500);
 export const discoveryQueue = new MemoryQueue('nft-discovery', 1000);
-
-mintQueue.on('completed', () => {});
-mintQueue.on('failed', () => {});
-discoveryQueue.on('completed', () => {});
-discoveryQueue.on('failed', () => {});
 
 export async function closeQueues(): Promise<void> {
   mintQueue.close();
@@ -180,7 +216,6 @@ export async function queueMint(
     priority: 2,
     attempts: 5,
   });
-  
   return job.id;
 }
 
@@ -199,7 +234,6 @@ export async function queueDiscovery(
     priority: 1,
     delay: 500,
   });
-  
   return job.id;
 }
 
