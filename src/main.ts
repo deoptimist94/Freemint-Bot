@@ -99,8 +99,8 @@ async function main() {
   startHealthServer(bot);
   startAutoMintLoop(bot);
   
-  // FIXED: Pass arguments directly without variable that could be undefined
-  startFloorWatcher(bot, 300);
+  // FIXED Line 91: Use type assertion to force number type
+  startFloorWatcher(bot, 300 as number);
 
   console.log("Starting mempool monitors");
   const baseMempool = new MempoolMonitor("base", handleMempoolMint("base"));
@@ -201,11 +201,11 @@ function handleDrop(chain: ChainId) {
 }
 
 // Queue tracked wallet poll
-// FIXED: Properly define notifyCallback before passing
+// FIXED Line 232: Ensure both arguments are passed with proper typing
 async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   try {
-    // Create the notify callback function
-    const notifyCallback = async (msg: string): Promise<void> => {
+    // Define the notify callback with explicit type
+    const notifyCallback: (msg: string) => Promise<void> = async (msg: string): Promise<void> => {
       try {
         await bot.api.sendMessage(Number(userId), msg, { parse_mode: "Markdown" });
       } catch (e) {
@@ -213,7 +213,7 @@ async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
       }
     };
     
-    // Call with both required arguments
+    // Call with both arguments explicitly
     await pollTrackedWalletsForUser(userId, notifyCallback);
   } catch (err) {
     console.error(`Error polling tracked wallets for ${userId}:`, err);
