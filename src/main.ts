@@ -99,9 +99,8 @@ async function main() {
   startHealthServer(bot);
   startAutoMintLoop(bot);
   
-  // FIXED Line 91: Ensure number is passed
-  const floorWatcherInterval = 300;
-  startFloorWatcher(bot, floorWatcherInterval);
+  // FIXED: Pass arguments directly without variable that could be undefined
+  startFloorWatcher(bot, 300);
 
   console.log("Starting mempool monitors");
   const baseMempool = new MempoolMonitor("base", handleMempoolMint("base"));
@@ -202,16 +201,20 @@ function handleDrop(chain: ChainId) {
 }
 
 // Queue tracked wallet poll
+// FIXED: Properly define notifyCallback before passing
 async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   try {
-    // FIXED: Pass bot as second argument if needed, or check function signature
-    await pollTrackedWalletsForUser(userId, async (msg: string) => {
+    // Create the notify callback function
+    const notifyCallback = async (msg: string): Promise<void> => {
       try {
         await bot.api.sendMessage(Number(userId), msg, { parse_mode: "Markdown" });
       } catch (e) {
         console.error(`Failed to notify user ${userId}:`, e);
       }
-    });
+    };
+    
+    // Call with both required arguments
+    await pollTrackedWalletsForUser(userId, notifyCallback);
   } catch (err) {
     console.error(`Error polling tracked wallets for ${userId}:`, err);
   }
