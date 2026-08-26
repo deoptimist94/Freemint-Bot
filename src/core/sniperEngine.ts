@@ -1,9 +1,8 @@
 /**
  * Enhanced Sniper Engine with Mempool-based whale watching
- * Faster detection than block polling
  */
 
-import type { Address, Hex } from "viem";
+import type { Address } from "viem";
 import { getPublicClient } from "./chain.js";
 import { prisma } from "../db/client.js";
 import { batchMint, type MintOptions } from "./mint.js";
@@ -12,7 +11,6 @@ import type { ChainId } from "./chains.js";
 import { getChainsForSelection, getUserChainSelection } from "./userChain.js";
 import { getRPCPool } from "./rpcPool.js";
 
-// Whale tracking types
 interface WhaleTransaction {
   hash: string;
   to: string;
@@ -21,12 +19,9 @@ interface WhaleTransaction {
   value: bigint;
 }
 
-// SeaDrop constants
 const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
 const MINT_PUBLIC_SELECTOR = "0x161ac21f";
-
-// Cycle configuration
-const CYCLE_MS = 8000; // Reduced from 12000 for faster detection
+const CYCLE_MS = 8000;
 const MAX_BLOCKS_PER_CYCLE = 50n;
 
 interface SeaDropContext {
@@ -41,8 +36,14 @@ interface TrackedWallet {
   label?: string | null;
 }
 
-// Mempool whale watching
 const whaleMempoolMonitors: Map<ChainId, any> = new Map();
+const cycleStartedAt: Record<ChainId, number> = { base: 0, robinhood: 0 };
+const cycleFromBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
+const cycleToBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
+const cycleProcessed: Record<ChainId, Set<string>> = { 
+  base: new Set(), 
+  robinhood: new Set() 
+};
 
 export async function addTrackedWallet(telegramId: bigint, address: string, label?: string) {
   return await prisma.trackedWallet.upsert({
@@ -110,16 +111,12 @@ export async function setSniperConfig(
   });
 }
 
-// ✅ ENHANCED: Start mempool monitoring for whales
 export async function startWhaleMempoolMonitoring(
   chain: ChainId,
   onWhaleMint: (tx: WhaleTransaction, whale: TrackedWallet) => Promise<void>
 ): Promise<void> {
   if (whaleMempoolMonitors.has(chain)) return;
 
-  const pool = getRPCPool(chain);
-  
-  // Poll pending block for whale transactions
   const monitor = setInterval(async () => {
     try {
       const { getPublicClient } = await import("./chain.js");
@@ -135,11 +132,9 @@ export async function startWhaleMempoolMonitoring(
       for (const tx of block.transactions as any[]) {
         if (!tx.to || !tx.input || tx.input === "0x") continue;
         
-        // Check if from tracked wallet
         const tracked = await isTrackedWallet(tx.from);
         if (!tracked) continue;
 
-        // Check if mint transaction
         const selector = tx.input.slice(0, 10).toLowerCase();
         const isMint = [
           "0x1249c58b", "0xa0712d68", "0x6a627842",
@@ -153,10 +148,10 @@ export async function startWhaleMempoolMonitoring(
     } catch (err) {
       // Silent fail - will retry
     }
-  }, 2000); // Check every 2 seconds
+  }, 2000);
 
   whaleMempoolMonitors.set(chain, monitor);
-  console.log(`🐋 Whale mempool monitoring started on ${chain}`);
+  console.log(`Whale mempool monitoring started on ${chain}`);
 }
 
 export async function stopWhaleMempoolMonitoring(chain: ChainId): Promise<void> {
@@ -173,15 +168,6 @@ async function isTrackedWallet(address: string): Promise<TrackedWallet | null> {
   });
   return wallet || null;
 }
-
-// Block polling for whale watching (backup method)
-const cycleStartedAt: Record<ChainId, number> = { base: 0, robinhood: 0 };
-const cycleFromBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
-const cycleToBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
-const cycleProcessed: Record<ChainId, Set<string>> = { 
-  base: new Set(), 
-  robinhood: new Set() 
-};
 
 async function getBlockCached(chain: ChainId, blockNumber: bigint): Promise<any | null> {
   try {
@@ -254,7 +240,7 @@ async function pollChain(
   const now = Date.now();
   
   if (now - cycleStartedAt[chain] < CYCLE_MS && cycleFromBlock[chain]) {
-    return; // Too soon
+    return;
   }
 
   try {
@@ -268,7 +254,7 @@ async function pollChain(
     
     if (fromBlock > toBlock) return;
     if (toBlock - fromBlock > MAX_BLOCKS_PER_CYCLE) {
-      console.warn(`[${chain}] Block range too large, capping`);
+      console.warn(`Block range too large, capping`);
     }
 
     cycleStartedAt[chain] = now;
@@ -302,21 +288,20 @@ async function pollChain(
           ? (Number(tx.value) / 1e18).toFixed(4) 
           : "0";
         
-        const config = getChainConfig(chain);
-        const badge = config.badge;
-        const name = config.name;
+        const chainConfig = await import("./chains.js").then(m => m.getChainConfig(chain));
+        const badge = chainConfig.badge;
+        const name = chainConfig.name;
 
-        // Notify and execute copy-mint
         const viaRouter = !!seaDropContext?.isViaRouter;
         
         notifyCallback(
-          `🐋 *Whale Mint Detected* (${matchedWallet.label || "Tracked"}) — ${badge} ${name}\n\n` +
+          `Whale Mint Detected (${matchedWallet.label || "Tracked"}) - ${badge} ${name}\n\n` +
           (viaRouter
-            ? `*Target:* \\`${mintTarget}\\` (via SeaDrop)\n`
-            : `*Target:* \\`${mintTarget}\\`\n`) +
-          `*Value:* ${valueEth} ETH\n` +
-          `*Tx:* \\`${tx.hash}\\`\n\n` +
-          `🚀 Attempting copy-mint...`
+            ? `Target: ${mintTarget} (via SeaDrop)\n`
+            : `Target: ${mintTarget}\n`) +
+          `Value: ${valueEth} ETH\n` +
+          `Tx: ${tx.hash}\n\n` +
+          `Attempting copy-mint...`
         );
 
         const mintOptions: MintOptions = {
@@ -328,25 +313,24 @@ async function pollChain(
           batchMint(telegramId, mintTarget, mintOptions)
         );
 
-        // Send result notification
         if (result.results.length === 0) {
           notifyCallback(
-            `⏭️ *Copy-Mint Skipped*\n` +
-            `Contract: \\`${mintTarget}\\`\n` +
+            `Copy-Mint Skipped\n` +
+            `Contract: ${mintTarget}\n` +
             `Reason: ${result.abortReason || "No result"}`
           );
         } else {
           let msg = 
-            `✅ *Copy-Mint Result*\n\n` +
-            `Contract: \\`${mintTarget}\\`\n` +
-            `Success: ${result.totalSuccess} · Failed: ${result.totalFailed}\n\n`;
+            `Copy-Mint Result\n\n` +
+            `Contract: ${mintTarget}\n` +
+            `Success: ${result.totalSuccess} Failed: ${result.totalFailed}\n\n`;
           
           for (const r of result.results) {
-            const icon = r.success ? "✅" : "❌";
+            const icon = r.success ? "SUCCESS" : "FAILED";
             const shortAddr = `${r.walletAddress.slice(0, 6)}..${r.walletAddress.slice(-4)}`;
-            msg += `${icon} ${r.label}: \\`${shortAddr}\\``;
-            if (r.basescanUrl) msg += ` — [TX](${r.basescanUrl})`;
-            if (r.error) msg += ` — ${r.error}`;
+            msg += `${icon} ${r.label}: ${shortAddr}`;
+            if (r.basescanUrl) msg += ` - TX: ${r.basescanUrl}`;
+            if (r.error) msg += ` - ${r.error}`;
             msg += "\n";
           }
           
@@ -376,6 +360,3 @@ export async function pollTrackedWalletsForUser(
     await pollChain(chain, telegramId, tracked, config, notifyCallback);
   }
 }
-
-// Import at bottom to avoid circular dependency
-import { getChainConfig } from "./chains.js";
