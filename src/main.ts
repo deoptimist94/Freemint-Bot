@@ -309,7 +309,7 @@ async function processDiscovery(
     include: { wallets: true },
   });
 
-  console.log(`🎯 Free-mint alert: ${scan.contractAddress} on ${chain} - broadcasting to ${activeUsers.length} users`);
+  console.log(`Free-mint alert: ${scan.contractAddress} on ${chain} - broadcasting to ${activeUsers.length} users`);
 
   const userPromises = activeUsers.map(async (user) => {
     try {
@@ -333,16 +333,16 @@ async function processDiscovery(
           attempts: 5,
         });
 
-        console.log(`✅ Queued mint for user ${user.telegramId} on ${scan.contractAddress}`);
+        console.log(`Queued mint for user ${user.telegramId} on ${scan.contractAddress}`);
       }
 
       try {
-        const badge = chain === 'base' ? '⛽' : '🏹';
-        const gatedWarning = (scan.isGated || scan.requiresSignature) ? '\n⚠️ This mint may be gated/signature-required' : '';
+        const badge = chain === 'base' ? 'BASE' : 'ROBINHOOD';
+        const gatedWarning = (scan.isGated || scan.requiresSignature) ? '\nThis mint may be gated/signature-required' : '';
         
         await bot.api.sendMessage(Number(user.telegramId), 
-          `🚨 *FREE MINT DETECTED* ${badge}\n\n` +
-          `Contract: \\`${scan.contractAddress}\\`\n` +
+          `FREE MINT DETECTED ${badge}\n\n` +
+          `Contract: ${scan.contractAddress}\n` +
           `Chain: ${chain.toUpperCase()}\n` +
           `Security Score: ${scan.security.riskScore}/100${gatedWarning}\n\n` +
           `${user.autoMintEnabled ? 'Auto-mint has been queued.' : 'Use /bypass to attempt mint manually.'}`,
@@ -363,7 +363,7 @@ async function processDiscovery(
 
   await Promise.race([
     Promise.all(userPromises),
-    new Promise((_resolve, reject) => 
+    new Promise((unused, reject) => 
       setTimeout(() => reject(new Error('User processing timeout')), 30000)
     ),
   ]).catch(err => {
