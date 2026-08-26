@@ -19,6 +19,7 @@ model User {
   sniperConfig   SniperConfig?
   bypassLogs     BypassLog[]
   preference     UserPreference?
+  jobLogs        JobLog[]
 }
 
 model UserPreference {
@@ -108,4 +109,23 @@ model BypassLog {
 
   @@index([userId])
   @@index([contractAddress])
+}
+
+model JobLog {
+  id              String   @id @default(cuid())
+  queueName       String
+  jobId           String
+  userId          BigInt
+  contractAddress String
+  chain           String
+  status          String
+  result          String?
+  error           String?
+  createdAt       DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [telegramId], onDelete: Cascade)
+
+  @@index([queueName])
+  @@index([userId])
+  @@index([createdAt])
 }
