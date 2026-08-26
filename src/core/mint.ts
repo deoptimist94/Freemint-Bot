@@ -9,8 +9,6 @@ import {
   parseAbi,
   encodeFunctionData,
   getAddress,
-  decodeEventLog,
-  zeroAddress,
 } from "viem";
 import { prisma } from "../db/client.js";
 import { getPublicClient, getWalletClient } from "./chain.js";
@@ -83,16 +81,6 @@ export function getUserMintQuantity(userId: bigint): number {
 export function setUserMintQuantity(userId: bigint, quantity: number): void {
   userMintQuantities.set(userId, Math.max(1, Math.min(quantity, 10)));
 }
-
-const SEADROP_ROUTER_ABI = parseAbi([
-  "function mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity) payable",
-] as const);
-
-const STANDARD_TRANSFER_EVENTS = parseAbi([
-  "event Transfer(address indexed from, address indexed to, uint256 indexed tokenId)",
-  "event TransferSingle(address indexed operator, address indexed from, address indexed to, uint256 id, uint256 value)",
-  "event TransferBatch(address indexed operator, address indexed from, address indexed to, uint256[] ids, uint256[] values)",
-] as const);
 
 export function classifyMintError(error: unknown): ClassifiedError {
   const errorStr = (error instanceof Error ? error.message : String(error)).toLowerCase();
@@ -256,6 +244,36 @@ export function classifyMintError(error: unknown): ClassifiedError {
   };
 }
 
+interface GasStrategy {
+  maxFeePerGas: bigint;
+  maxPriorityFeePerGas: bigint;
+}
+
+async function getOptimalGas(chain: ChainId): Promise<GasStrategy> {
+  const publicClient = getPublicClient(chain);
+  
+  try {
+    const block = await publicClient.getBlock({ blockTag: 'latest' });
+    const baseFee = block.baseFeePerGas || 1000000000n;
+    
+    const priorityFee = await publicClient.estimateMaxPriorityFeePerGas().catch(() => 1500000000n);
+    
+    const maxPriorityFee = (priorityFee * 150n) / 100n;
+    const maxFee = baseFee * 2n + maxPriorityFee;
+    
+    return {
+      maxFeePerGas: maxFee,
+      maxPriorityFeePerGas: maxPriorityFee,
+    };
+  } catch (err) {
+    console.warn('Failed to get optimal gas, using defaults:', err);
+    return {
+      maxFeePerGas: 50000000000n,
+      maxPriorityFeePerGas: 1500000000n,
+    };
+  }
+}
+
 function generateMintArgs(
   mintFunction: MintFunctionInfo,
   walletAddress: string,
@@ -329,7 +347,6 @@ async function executeSingleMint(
       const walletClient = getWalletClient(hexKey, chain);
       const publicClient = getPublicClient(chain);
       
-      // FIXED: assertGasSafe returns void, so use try/catch
       try {
         await assertGasSafe(BigInt(0));
       } catch (gasError) {
@@ -348,6 +365,37 @@ async function executeSingleMint(
         args: args as any,
       });
       
+      // PRE-FLIGHT SIMULATION
+      try {
+        await publicClient.call({
+          data,
+          to: getAddress(nftContract),
+          account: getAddress(wallet.address),
+          value: 0n,
+        });
+        console.log(`✅ Pre-flight simulation passed for ${wallet.label}`);
+      } catch (simError: any) {
+        const classified = classifyMintError(simError);
+        console.warn(`❌ Pre-flight failed for ${wallet.label}: ${classified.category}`);
+        
+        if (!classified.retryable) {
+          return {
+            walletId: wallet.id,
+            walletAddress: wallet.address,
+            label: wallet.label,
+            success: false,
+            error: classified.userFriendly,
+            errorCategory: classified.category,
+            iteration,
+          };
+        }
+        throw simError;
+      }
+      
+      // Get optimal gas pricing
+      const gasStrategy = await getOptimalGas(chain);
+      
+      // Estimate gas with buffer
       let gasLimit: bigint;
       try {
         const estimate = await publicClient.estimateGas({
@@ -356,29 +404,40 @@ async function executeSingleMint(
           data,
           value: 0n,
         });
-        gasLimit = (estimate * 120n) / 100n;
+        gasLimit = (estimate * 130n) / 100n;
       } catch (gasErr) {
         console.warn(`Gas estimation failed for ${wallet.label}, using default`);
         gasLimit = 500000n;
       }
       
+      // Send transaction with aggressive gas
       const txHash = await walletClient.sendTransaction({
         account: walletClient.account!,
         to: getAddress(nftContract),
         data,
         value: 0n,
         gas: gasLimit,
+        maxFeePerGas: gasStrategy.maxFeePerGas,
+        maxPriorityFeePerGas: gasStrategy.maxPriorityFeePerGas,
         chain: config.viemChain,
       });
       
+      console.log(`🚀 Transaction sent: ${txHash} for ${wallet.label}`);
+      
+      // Wait for receipt with timeout
       const receipt = await Promise.race([
-        publicClient.waitForTransactionReceipt({ hash: txHash }),
+        publicClient.waitForTransactionReceipt({ 
+          hash: txHash,
+          timeout: 60000,
+          pollingInterval: 1000,
+        }),
         new Promise<never>((_, reject) => 
           setTimeout(() => reject(new Error("Transaction timeout")), 60000)
         ),
       ]);
       
       if (receipt.status === "success") {
+        console.log(`✅ Mint confirmed for ${wallet.label}: ${txHash}`);
         return {
           walletId: wallet.id,
           walletAddress: wallet.address,
@@ -397,13 +456,13 @@ async function executeSingleMint(
       const classified = classifyMintError(error);
       lastError = classified;
       
-      console.warn(`Mint attempt ${attempt + 1} failed for ${wallet.label}: ${classified.category}`);
+      console.warn(`Mint attempt ${attempt + 1} failed for ${wallet.label}: ${classified.category} - ${classified.message.slice(0, 100)}`);
       
       if (!classified.retryable || attempt === maxRetries - 1) {
         break;
       }
       
-      await new Promise(resolve => setTimeout(resolve, retryDelayMs * (attempt + 1)));
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs * Math.pow(2, attempt)));
     }
   }
   
@@ -412,7 +471,7 @@ async function executeSingleMint(
     walletAddress: wallet.address,
     label: wallet.label,
     success: false,
-    error: lastError?.message || "Unknown error",
+    error: lastError?.userFriendly || "Unknown error",
     errorCategory: lastError?.category || "UNKNOWN",
     iteration,
   };
