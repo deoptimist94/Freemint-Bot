@@ -1,13 +1,12 @@
 /**
  * Job Queue - In-Memory with Postgres persistence
- * No Redis required - works with single instance
  */
 
 import { prisma } from "../db/client.js";
 import { type ChainId } from "./chains.js";
 
 interface JobData {
-  userId: string;
+  userId?: string;
   contractAddress: string;
   chain: ChainId;
   options?: any;
@@ -37,7 +36,7 @@ class MemoryQueue {
   constructor(name: string, intervalMs: number = 1000) {
     this.name = name;
     this.intervalMs = intervalMs;
-    console.log(`📦 MemoryQueue '${name}' initialized`);
+    console.log(`MemoryQueue '${name}' initialized`);
   }
 
   public process(processor: JobProcessor): void {
@@ -53,13 +52,11 @@ class MemoryQueue {
       
       this.processing = true;
       
-      // Sort by priority and time
       this.jobs.sort((a, b) => {
         if (a.priority !== b.priority) return a.priority - b.priority;
         return a.createdAt - b.createdAt;
       });
       
-      // Find ready job (respects delay)
       const now = Date.now();
       const readyIndex = this.jobs.findIndex(j => !j.delayUntil || j.delayUntil <= now);
       
@@ -74,7 +71,6 @@ class MemoryQueue {
         console.log(`[${this.name}] Processing job ${job.id} (attempt ${job.attempts + 1})`);
         const result = await this.processor(job);
         
-        // Log success to database
         await this.logJob(job, 'completed', result);
         console.log(`[${this.name}] Job ${job.id} completed`);
         
@@ -84,15 +80,13 @@ class MemoryQueue {
         job.attempts++;
         
         if (job.attempts < 5) {
-          // Retry with exponential backoff
           const backoffMs = Math.pow(2, job.attempts) * 1000;
           job.delayUntil = Date.now() + backoffMs;
           this.jobs.push(job);
-          console.log(`[${this.name}] Job ${job.id} requeued for retry ${job.attempts} (delay ${backoffMs}ms)`);
+          console.log(`[${this.name}] Job ${job.id} requeued for retry ${job.attempts}`);
         } else {
-          // Max retries reached
           await this.logJob(job, 'failed', null, error.message);
-          console.error(`[${this.name}] Job ${job.id} failed permanently after ${job.attempts} attempts`);
+          console.error(`[${this.name}] Job ${job.id} failed permanently`);
         }
       }
       
@@ -103,6 +97,8 @@ class MemoryQueue {
 
   private async logJob(job: QueuedJob, status: string, result?: any, error?: string): Promise<void> {
     try {
+      if (!job.data.userId) return;
+      
       await prisma.jobLog.create({
         data: {
           queueName: this.name,
@@ -156,23 +152,19 @@ class MemoryQueue {
   }
 }
 
-// Create queues
 export const mintQueue = new MemoryQueue('nft-mints', 500);
 export const discoveryQueue = new MemoryQueue('nft-discovery', 1000);
 
-// Event stubs for compatibility
 mintQueue.on('completed', () => {});
 mintQueue.on('failed', () => {});
 discoveryQueue.on('completed', () => {});
 discoveryQueue.on('failed', () => {});
 
-// Export close function
 export async function closeQueues(): Promise<void> {
   mintQueue.close();
   discoveryQueue.close();
 }
 
-// Job wrappers
 export async function queueMint(
   userId: bigint,
   contractAddress: string,
@@ -203,7 +195,6 @@ export async function queueDiscovery(
     chain,
     detectedAt,
     txHash,
-    userId: '0',
   }, {
     priority: 1,
     delay: 500,
@@ -212,7 +203,6 @@ export async function queueDiscovery(
   return job.id;
 }
 
-// Health check
 export function isQueueHealthy(): boolean {
   return true;
 }
