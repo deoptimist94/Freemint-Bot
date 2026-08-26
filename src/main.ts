@@ -82,12 +82,9 @@ async function main() {
     }
   });
 
-  // ============================================================
-  // FIX #1: Guard `detectedAt` against `undefined` from JobData
-  // ============================================================
   discoveryQueue.process(async (job) => {
     const { contractAddress, chain, detectedAt: rawDetectedAt, txHash } = job.data;
-    const detectedAt = rawDetectedAt ?? Date.now();  // <-- guarantees `number`
+    const detectedAt = rawDetectedAt ?? Date.now();
     try {
       await processDiscovery(contractAddress, chain as ChainId, detectedAt, txHash);
     } catch (error) {
@@ -199,9 +196,7 @@ function handleDrop(chain: ChainId) {
   };
 }
 
-// ============================================================
-// FIX #2: Pass the notification callback as 2nd argument
-// ============================================================
+// Queue tracked wallet poll — now passes both required arguments
 async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
   try {
     const notifyCallback: (msg: string) => Promise<void> = async (msg: string) => {
@@ -212,13 +207,13 @@ async function queueTrackedWalletPoll(userId: bigint): Promise<void> {
       }
     };
 
-    await pollTrackedWalletsForUser(userId, notifyCallback);  // <-- both args now provided
+    await pollTrackedWalletsForUser(userId, notifyCallback);
   } catch (err) {
     console.error(`Error polling tracked wallets for ${userId}:`, err);
   }
 }
 
-// Process discovery
+// Process discovery — scan first, then evaluate spam with the ScanResult
 async function processDiscovery(
   contractAddress: string,
   chain: ChainId,
@@ -227,15 +222,15 @@ async function processDiscovery(
 ): Promise<void> {
   console.log(`Processing discovery: ${contractAddress} on ${chain}`);
 
-  const spamCheck = await evaluateSpamContract(contractAddress);
-  if (spamCheck.isSpam) {
-    console.log(`Skipping spam contract: ${contractAddress}`);
-    return;
-  }
-
   const scan = await scanContract(contractAddress, chain);
   if (!scan.isNft || scan.mintFunctions.length === 0) {
     console.log(`No mint functions found for: ${contractAddress}`);
+    return;
+  }
+
+  const spamCheck = await evaluateSpamContract(scan, chain);
+  if (spamCheck.isSpam) {
+    console.log(`Skipping spam contract: ${contractAddress} — ${spamCheck.reason}`);
     return;
   }
 
@@ -254,7 +249,6 @@ async function processDiscovery(
 
   console.log(`Broadcasting to ${activeUsers.length} users`);
 
-  // Chunked broadcasting
   const CHUNK_SIZE = 50;
   const chunks: typeof activeUsers[] = [];
 
