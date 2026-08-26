@@ -53,7 +53,7 @@ export async function loadSubscribers(): Promise<void> {
       });
     }
     
-    console.log(`📡 Loaded ${subscribers.size} subscribers`);
+    console.log(`Loaded ${subscribers.size} subscribers`);
   } catch (err) {
     console.error('Failed to load subscribers:', err);
   }
@@ -89,7 +89,7 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
   if (recentEvents.has(eventKey)) {
     const lastTime = recentEvents.get(eventKey)!;
     if (now - lastTime < EVENT_DEDUP_TTL) {
-      console.log(`⏭️ Event ${eventKey} already broadcast recently`);
+      console.log(`Event ${eventKey} already broadcast recently`);
       return;
     }
   }
@@ -103,21 +103,21 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
   
   let message: string;
   if (event.type === 'free_mint') {
-    const badge = event.chain === 'base' ? '⛽' : '🏹';
-    const gatedWarning = event.isGated ? '\n⚠️ *Gated mint detected - may require whitelist*' : '';
+    const badge = event.chain === 'base' ? 'BASE' : 'ROBINHOOD';
+    const gatedWarning = event.isGated ? '\nGated mint detected - may require whitelist' : '';
     message = 
-      `🚨 *FREE MINT DETECTED* ${badge}\n\n` +
-      `Contract: \\`${event.contractAddress}\\`\n` +
+      `FREE MINT DETECTED ${badge}\n\n` +
+      `Contract: ${event.contractAddress}\n` +
       `Chain: ${event.chain.toUpperCase()}\n` +
       `Security Score: ${event.securityScore}/100${gatedWarning}\n\n` +
       `Auto-mint will attempt if enabled.`;
   } else {
-    const badge = event.chain === 'base' ? '⛽' : '🏹';
+    const badge = event.chain === 'base' ? 'BASE' : 'ROBINHOOD';
     const label = event.whaleLabel ? `(${event.whaleLabel})` : '';
     message = 
-      `🐋 *WHALE MINT DETECTED* ${badge}\n\n` +
-      `Whale: \\`${event.whaleAddress}\\` ${label}\n` +
-      `Contract: \\`${event.contractAddress}\\`\n` +
+      `WHALE MINT DETECTED ${badge}\n\n` +
+      `Whale: ${event.whaleAddress} ${label}\n` +
+      `Contract: ${event.contractAddress}\n` +
       `Chain: ${event.chain.toUpperCase()}\n\n` +
       `Copy-mint will attempt if enabled.`;
   }
@@ -147,14 +147,14 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
   
   await Promise.race([
     Promise.all(promises),
-    new Promise((_resolve, reject) => 
+    new Promise((unused, reject) => 
       setTimeout(() => reject(new Error('Broadcast timeout')), 30000)
     ),
   ]).catch(err => {
     console.error('Broadcast error:', err);
   });
   
-  console.log(`📡 Broadcast ${event.type} to ${promises.length} users`);
+  console.log(`Broadcast ${event.type} to ${promises.length} users`);
 }
 
 export function getSubscriberStats(): { total: number; autoMint: number } {
