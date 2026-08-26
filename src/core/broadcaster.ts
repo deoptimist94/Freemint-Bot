@@ -37,11 +37,10 @@ interface Subscriber {
 
 const subscribers = new Map<bigint, Subscriber>();
 const recentEvents = new Map<string, number>();
-const EVENT_DEDUP_TTL = 60 * 1000; // 1 minute
+const EVENT_DEDUP_TTL = 60 * 1000;
 
-// ✅ ENHANCED: Chunk size for parallel processing
 const BROADCAST_CHUNK_SIZE = 50;
-const BROADCAST_TIMEOUT = 60000; // 60 seconds
+const BROADCAST_TIMEOUT = 60000;
 
 export async function loadSubscribers(): Promise<void> {
   try {
@@ -59,9 +58,9 @@ export async function loadSubscribers(): Promise<void> {
       });
     }
 
-    console.log(`✅ Loaded ${subscribers.size} subscribers`);
+    console.log(`Loaded ${subscribers.size} subscribers`);
   } catch (err) {
-    console.error('❌ Failed to load subscribers:', err);
+    console.error('Failed to load subscribers:', err);
   }
 }
 
@@ -84,65 +83,59 @@ export async function refreshSubscriber(telegramId: bigint): Promise<void> {
       autoMintEnabled: user.autoMintEnabled,
     });
   } catch (err) {
-    console.error('❌ Failed to refresh subscriber:', err);
+    console.error('Failed to refresh subscriber:', err);
   }
 }
 
-// ✅ ENHANCED: True parallel chunked broadcasting
 export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
   const eventKey = `${event.type}:${event.contractAddress}:${event.chain}`;
   const now = Date.now();
 
-  // Deduplication check
   if (recentEvents.has(eventKey)) {
     const lastTime = recentEvents.get(eventKey)!;
     if (now - lastTime < EVENT_DEDUP_TTL) {
-      console.log(`⏭️ Event ${eventKey} already broadcast recently`);
+      console.log(`Event ${eventKey} already broadcast recently`);
       return;
     }
   }
 
   recentEvents.set(eventKey, now);
   
-  // Cleanup old events
   for (const [key, time] of recentEvents) {
     if (now - time > EVENT_DEDUP_TTL * 2) {
       recentEvents.delete(key);
     }
   }
 
-  // Build message
   let message: string;
   if (event.type === 'free_mint') {
-    const badge = event.chain === 'base' ? '🔵 BASE' : '🟣 ROBINHOOD';
-    const gatedWarning = event.isGated ? '\n⚠️ Gated mint detected' : '';
-    const sigWarning = event.requiresSignature ? '\n📝 Signature required' : '';
+    const badge = event.chain === 'base' ? 'BASE' : 'ROBINHOOD';
+    const gatedWarning = event.isGated ? '\nGated mint detected' : '';
+    const sigWarning = event.requiresSignature ? '\nSignature required' : '';
     
     message =
-      `🎯 *FREE MINT DETECTED* ${badge}\n\n` +
-      `*Contract:* \\`${event.contractAddress}\\`\n` +
-      `*Chain:* ${event.chain.toUpperCase()}\n` +
-      `*Security Score:* ${event.securityScore}/100${gatedWarning}${sigWarning}\n\n` +
+      `FREE MINT DETECTED ${badge}\n\n` +
+      `Contract: ${event.contractAddress}\n` +
+      `Chain: ${event.chain.toUpperCase()}\n` +
+      `Security Score: ${event.security.riskScore}/100${gatedWarning}${sigWarning}\n\n` +
       `Auto-mint will attempt if enabled.`;
   } else {
-    const badge = event.chain === 'base' ? '🔵 BASE' : '🟣 ROBINHOOD';
+    const badge = event.chain === 'base' ? 'BASE' : 'ROBINHOOD';
     const label = event.whaleLabel ? ` (${event.whaleLabel})` : '';
     
     message =
-      `🐋 *WHALE MINT DETECTED* ${badge}\n\n` +
-      `*Whale:* \\`${event.whaleAddress}\\`${label}\n` +
-      `*Contract:* \\`${event.contractAddress}\\`\n` +
-      `*Chain:* ${event.chain.toUpperCase()}\n\n` +
+      `WHALE MINT DETECTED ${badge}\n\n` +
+      `Whale: ${event.whaleAddress}${label}\n` +
+      `Contract: ${event.contractAddress}\n` +
+      `Chain: ${event.chain.toUpperCase()}\n\n` +
       `Copy-mint will attempt if enabled.`;
   }
 
-  // Filter subscribers by chain
   const eligibleSubscribers = Array.from(subscribers.values())
     .filter(sub => sub.chainSelection.includes(event.chain));
 
-  console.log(`📢 Broadcasting ${event.type} to ${eligibleSubscribers.length} users`);
+  console.log(`Broadcasting ${event.type} to ${eligibleSubscribers.length} users`);
 
-  // ✅ ENHANCED: Chunked parallel processing
   const chunks: Subscriber[][] = [];
   for (let i = 0; i < eligibleSubscribers.length; i += BROADCAST_CHUNK_SIZE) {
     chunks.push(eligibleSubscribers.slice(i, i + BROADCAST_CHUNK_SIZE));
@@ -163,7 +156,7 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
         } catch (err: any) {
           if (err?.error_code === 403) {
             subscribers.delete(sub.telegramId);
-            console.log(`🚫 Removed blocked user ${sub.telegramId}`);
+            console.log(`Removed blocked user ${sub.telegramId}`);
           }
           return { success: false, userId: sub.telegramId, error: err.message };
         }
@@ -178,13 +171,12 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
       }
     });
 
-    // Small delay between chunks to avoid rate limits
     if (chunks.length > 1) {
       await new Promise(r => setTimeout(r, 100));
     }
   }
 
-  console.log(`✅ Broadcast complete: ${successCount} success, ${failCount} failed`);
+  console.log(`Broadcast complete: ${successCount} success, ${failCount} failed`);
 }
 
 export function getSubscriberStats(): { total: number; autoMint: number } {
