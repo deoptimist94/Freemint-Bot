@@ -18,7 +18,6 @@ import { evaluateSpamContract } from "./core/spamFilter.js";
 import { startFloorWatcher } from "./core/floorWatcher.js";
 import { pollTrackedWalletsForUser } from "./core/sniperEngine.js";
 import { getWallets } from "./core/wallet.js";
-import { getAutoMintStatus } from "./core/watchlist.js";
 import { batchMint } from "./core/mint.js";
 import { withChainContext } from "./core/chainContext.js";
 import { type ChainId, getChainConfig } from "./core/chains.js";
@@ -30,7 +29,6 @@ import { MempoolMonitor, type MempoolMint } from "./core/mempoolSniper.js";
 import { getRPCPool, getRPCStats } from "./core/rpcPool.js";
 import { mintQueue, discoveryQueue, closeQueues } from "./core/queue.js";
 import { loadSubscribers } from "./core/broadcaster.js";
-import { fetchCollectionFloor } from "./core/autoLister.js";
 
 const monitors: Map<ChainId, MempoolMonitor> = new Map();
 let bot: Bot;
@@ -62,7 +60,6 @@ async function main() {
     await prisma.$connect();
     console.log("Database connected");
     
-    // Load subscribers for broadcasting
     await loadSubscribers();
     console.log("Subscribers loaded");
   } catch (error) {
@@ -305,7 +302,6 @@ async function processDiscovery(
     return;
   }
 
-  // Get all active users in ONE query
   const activeUsers = await prisma.user.findMany({
     where: { 
       wallets: { some: {} },
@@ -315,7 +311,6 @@ async function processDiscovery(
 
   console.log(`🎯 Free-mint alert: ${scan.contractAddress} on ${chain} - broadcasting to ${activeUsers.length} users`);
 
-  // PARALLEL processing for all users
   const userPromises = activeUsers.map(async (user) => {
     try {
       if (!user.wallets?.length) return;
@@ -323,7 +318,6 @@ async function processDiscovery(
       const selection = await getUserChainSelection(BigInt(user.telegramId));
       if (!getChainsForSelection(selection).includes(chain)) return;
 
-      // Queue mint job for this user if auto-mint enabled
       if (user.autoMintEnabled) {
         await mintQueue.add({
           userId: user.telegramId.toString(),
@@ -342,7 +336,6 @@ async function processDiscovery(
         console.log(`✅ Queued mint for user ${user.telegramId} on ${scan.contractAddress}`);
       }
 
-      // Send notification
       try {
         const badge = chain === 'base' ? '⛽' : '🏹';
         const gatedWarning = (scan.isGated || scan.requiresSignature) ? '\n⚠️ This mint may be gated/signature-required' : '';
@@ -368,10 +361,9 @@ async function processDiscovery(
     }
   });
 
-  // Execute all in parallel with timeout
   await Promise.race([
     Promise.all(userPromises),
-    new Promise((_, reject) => 
+    new Promise((_resolve, reject) => 
       setTimeout(() => reject(new Error('User processing timeout')), 30000)
     ),
   ]).catch(err => {
