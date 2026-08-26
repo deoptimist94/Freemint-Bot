@@ -2,8 +2,16 @@ import { type ChainId } from "./chains.js";
 import { getRPCPool } from "./rpcPool.js";
 
 const MINT_SELECTORS = new Set([
-  "0x1249c58b", "0xa0712d68", "0x6a627842", "0x40c10f19",
-  "0x4e6ec247", "0x84bb1e42", "0xa6f2ae3a", "0x161ac21f",
+  "0x1249c58b", // mint()
+  "0xa0712d68", // mint(uint256)
+  "0x6a627842", // mint(address)
+  "0x40c10f19", // mint(address,uint256)
+  "0x4e6ec247", // claim()
+  "0x84bb1e42", // claim(uint256)
+  "0xa6f2ae3a", // claim(address,uint256)
+  "0x161ac21f", // mintPublic (SeaDrop)
+  "0xefef39a1", // mintSeaDrop
+  "0x2db11544", // mintSigned
 ]);
 
 export interface MempoolMint {
@@ -26,11 +34,12 @@ export class MempoolMonitor {
   private readonly MAX_CACHE = 10000;
   private readonly CACHE_TTL = 10 * 60 * 1000;
   private pollInterval: NodeJS.Timeout | null = null;
-  private baseDelay = 4000;
+  private baseDelay = 2000; // Faster polling
   private currentDelay = this.baseDelay;
   private maxDelay = 30000;
   private consecutiveErrors = 0;
   private lastBlockNumber: bigint | null = null;
+  private errorStreak = 0;
 
   constructor(chain: ChainId, callback: MempoolCallback) {
     this.chain = chain;
@@ -64,31 +73,44 @@ export class MempoolMonitor {
           () => Promise.resolve(getPublicClient(this.chain))
         );
 
+        // Get pending block with transactions
         const block = await pool.dedupRequest(
           `pendingBlock-${this.chain}`,
-          () => client.getBlock({ blockTag: "pending", includeTransactions: true })
-        ).catch(() => null);
+          () => client.getBlock({ 
+            blockTag: "pending", 
+            includeTransactions: true 
+          })
+        ).catch((err) => {
+          if (this.errorStreak < 3) {
+            console.warn(`[${this.chain}] Failed to get pending block:`, err.message);
+          }
+          return null;
+        });
 
         if (!block) {
           scheduleNext();
           return;
         }
 
+        // Check if new block
         if (this.lastBlockNumber && block.number === this.lastBlockNumber) {
           scheduleNext();
           return;
         }
         this.lastBlockNumber = block.number;
 
+        // Process transactions
         if (block.transactions) {
           for (const tx of block.transactions) {
-            this.processTransaction(tx as any);
+            await this.processTransaction(tx as any);
           }
         }
         
+        // Reset error state on success
         if (this.consecutiveErrors > 0) {
           console.log(`[${this.chain}] Mempool recovered`);
           this.consecutiveErrors = 0;
+          this.errorStreak = 0;
           this.currentDelay = this.baseDelay;
         }
         
@@ -110,18 +132,27 @@ export class MempoolMonitor {
 
   private handleError(error: any): void {
     this.consecutiveErrors++;
+    this.errorStreak++;
     const oldDelay = this.currentDelay;
     this.currentDelay = Math.min(this.currentDelay * 1.5, this.maxDelay);
     
     const errorStr = JSON.stringify(error).toLowerCase();
-    if (errorStr.includes("rate") || errorStr.includes("limit") || errorStr.includes("-32003") || errorStr.includes("-32007")) {
+    const isRateLimit = errorStr.includes("rate") || 
+                       errorStr.includes("limit") || 
+                       errorStr.includes("-32003") || 
+                       errorStr.includes("-32007") ||
+                       errorStr.includes("429");
+    
+    if (isRateLimit) {
       console.warn(`[${this.chain}] Mempool rate limited: ${oldDelay}ms -> ${this.currentDelay}ms`);
+    } else if (this.errorStreak <= 3) {
+      console.warn(`[${this.chain}] Mempool error (${this.errorStreak}):`, error.message || error);
     }
   }
 
-  private processTransaction(tx: any): void {
+  private async processTransaction(tx: any): Promise<void> {
     if (!tx?.to || !tx?.input || tx.input === "0x") return;
-    if (tx.value && BigInt(tx.value) > 0n) return;
+    if (tx.value && BigInt(tx.value) > 0n) return; // Skip paid transactions
 
     const selector = tx.input.slice(0, 10).toLowerCase();
     if (!MINT_SELECTORS.has(selector)) return;
@@ -144,7 +175,12 @@ export class MempoolMonitor {
       detectedAt: now,
     };
 
-    this.callback(mint).catch(console.error);
+    // Execute callback with error isolation
+    try {
+      await this.callback(mint);
+    } catch (err) {
+      console.error(`[${this.chain}] Mempool callback error:`, err);
+    }
   }
 
   private startCacheCleanup(): void {
@@ -181,5 +217,6 @@ export class MempoolMonitor {
       clearTimeout(this.pollInterval);
       this.pollInterval = null;
     }
+    console.log(`[${this.chain}] Mempool Monitor stopped`);
   }
 }
