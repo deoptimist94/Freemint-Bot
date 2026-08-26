@@ -31,7 +31,9 @@ interface SeaDropContext {
   quantity?: number;
 }
 
+// FIXED: Added 'id' property to match Prisma model
 interface TrackedWallet {
+  id: string;
   address: string;
   label?: string | null;
 }
@@ -72,9 +74,15 @@ export async function removeTrackedWallet(telegramId: bigint, address: string) {
 }
 
 export async function getTrackedWallets(telegramId: bigint): Promise<TrackedWallet[]> {
-  return await prisma.trackedWallet.findMany({
+  const wallets = await prisma.trackedWallet.findMany({
     where: { userId: telegramId },
   });
+  // Map to ensure id is included
+  return wallets.map(w => ({
+    id: w.id,
+    address: w.address,
+    label: w.label
+  }));
 }
 
 export async function getSniperConfig(telegramId: bigint) {
@@ -166,7 +174,12 @@ async function isTrackedWallet(address: string): Promise<TrackedWallet | null> {
   const wallet = await prisma.trackedWallet.findFirst({
     where: { address: address.toLowerCase() },
   });
-  return wallet || null;
+  if (!wallet) return null;
+  return {
+    id: wallet.id,
+    address: wallet.address,
+    label: wallet.label
+  };
 }
 
 async function getBlockCached(chain: ChainId, blockNumber: bigint): Promise<any | null> {
