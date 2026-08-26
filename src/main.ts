@@ -93,7 +93,7 @@ async function main() {
   bot = createBot();
   startHealthServer(bot);
   startAutoMintLoop(bot);
-  startFloorWatcher(bot, 300);
+  startFloorWatcher(bot, 300 as number);
 
   console.log("Starting mempool monitors");
   
@@ -183,6 +183,7 @@ function handleMempoolMint(chain: ChainId) {
       console.log(`Mempool mint detected: ${mint.contractAddress} on ${chain}`);
 
       await discoveryQueue.add({
+        userId: "system",
         contractAddress: mint.contractAddress,
         chain,
         detectedAt: mint.detectedAt,
@@ -217,6 +218,7 @@ function handleDrop(chain: ChainId) {
       console.log(`Block drop detected: ${drop.contractAddress} on ${chain}`);
       
       await discoveryQueue.add({
+        userId: "system",
         contractAddress: drop.contractAddress,
         chain,
         detectedAt: Date.now(),
