@@ -39,6 +39,13 @@ interface JobLogData {
   error?: string | null;
 }
 
+// Helper to safely serialize objects containing BigInt values
+const safeStringify = (obj: any): string => {
+  return JSON.stringify(obj, (_, value) =>
+    typeof value === 'bigint' ? value.toString() : value
+  );
+};
+
 class MemoryQueue {
   private name: string;
   private jobs: QueuedJob[] = [];
@@ -127,7 +134,7 @@ class MemoryQueue {
           contractAddress: job.data.contractAddress,
           chain: job.data.chain,
           status,
-          result: result ? JSON.stringify(result).slice(0, 1000) : null,
+          result: result ? safeStringify(result).slice(0, 1000) : null,
           error: error?.slice(0, 1000),
         },
       });
