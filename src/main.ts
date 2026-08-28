@@ -13,6 +13,7 @@ import { DropListener, isTrustedWrapper } from "./core/listener.js";
 import {
   scanContract,
   getBestMintFunction,
+  type ScanResult,
 } from "./core/scanner.js";
 import { evaluateSpamContract } from "./core/spamFilter.js";
 import { startFloorWatcher } from "./core/floorWatcher.js";
@@ -32,6 +33,9 @@ let bot: Bot;
 // --- Skip cache: avoid re-scanning known non-mintable addresses ---
 const skipCache = new Map<string, number>();
 const SKIP_CACHE_TTL_MS = 30 * 60 * 1000;
+const upcomingSchedules = new Map<string, { scan: ScanResult; chain: ChainId; txHash?: string }>();
+const upcomingAlertsSent = new Set<string>();
+const UPCOMING_ALERT_MINUTES = Math.max(1, Number(process.env.UPCOMING_ALERT_MINUTES || 10));
 
 function isSkipped(chain: ChainId, address: string): boolean {
   const key = `${chain}:${address.toLowerCase()}`;
@@ -165,6 +169,10 @@ async function main() {
     }
   }, 300000);
 
+  const upcomingScheduleInterval = setInterval(() => {
+    void processUpcomingSchedules();
+  }, 30000);
+
   // Graceful shutdown
   const handleShutdown = async (signal: string) => {
     console.log(`\nShutting down (${signal})`);
@@ -176,6 +184,7 @@ async function main() {
     stopFloorWatcher();
     clearInterval(copyTradeInterval);
     clearInterval(rpcStatsInterval);
+    clearInterval(upcomingScheduleInterval);
 
     await closeQueues();
     destroyRPCPools();
@@ -195,6 +204,50 @@ async function main() {
   // Start long-polling so the bot actually receives /start, /whois, etc.
   bot.start();
   console.log("Bot polling started — awaiting commands");
+}
+
+async function processUpcomingSchedules(): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  for (const [key, pending] of upcomingSchedules) {
+    const startsAt = pending.scan.schedule?.startsAt;
+    if (!startsAt || startsAt <= now) {
+      upcomingSchedules.delete(key);
+      if (startsAt && startsAt <= now) {
+        await processDiscovery(pending.scan.contractAddress, pending.chain, Date.now(), pending.txHash);
+      }
+      continue;
+    }
+
+    const secondsUntilStart = startsAt - now;
+    if (secondsUntilStart <= UPCOMING_ALERT_MINUTES * 60 && !upcomingAlertsSent.has(key)) {
+      upcomingAlertsSent.add(key);
+      await broadcastUpcomingMint(pending.scan, pending.chain, startsAt);
+    }
+  }
+}
+
+async function broadcastUpcomingMint(scan: ScanResult, chain: ChainId, startsAt: number): Promise<void> {
+  const users = await prisma.user.findMany({
+    where: { wallets: { some: {} } },
+    include: { wallets: true },
+  });
+  const minutes = Math.max(1, Math.ceil((startsAt - Math.floor(Date.now() / 1000)) / 60));
+  for (const user of users) {
+    try {
+      const selection = await getUserChainSelection(BigInt(user.telegramId));
+      if (!getChainsForSelection(selection).includes(chain)) continue;
+      await bot.api.sendMessage(
+        Number(user.telegramId),
+        `🔔 Upcoming Mint Alert ${chain.toUpperCase()}\n\n` +
+          `Contract: \`${scan.contractAddress}\`\n` +
+          `Starts in approximately ${minutes} minute${minutes === 1 ? "" : "s"}.\n` +
+          `Chain: ${chain.toUpperCase()}`,
+        { parse_mode: "Markdown", reply_markup: discoveryMintKeyboard(scan.contractAddress, chain) },
+      );
+    } catch (error) {
+      console.error(`Upcoming alert failed for ${user.telegramId}:`, error);
+    }
+  }
 }
 
 // Mempool mint handler
@@ -279,6 +332,17 @@ async function processDiscovery(
   if (spamCheck.isSpam) {
     console.log(`Skipping spam contract: ${contractAddress} — ${spamCheck.reason}`);
     markSkipped(chain, contractAddress);
+    return;
+  }
+
+  if (scan.schedule?.isLive === false) {
+    const startsAt = scan.schedule.startsAt;
+    if (startsAt && startsAt > Math.floor(Date.now() / 1000)) {
+      upcomingSchedules.set(`${chain}:${scan.contractAddress.toLowerCase()}`, { scan, chain, txHash });
+      await processUpcomingSchedules();
+    } else {
+      console.log(`Skipping ended mint: ${contractAddress}`);
+    }
     return;
   }
 

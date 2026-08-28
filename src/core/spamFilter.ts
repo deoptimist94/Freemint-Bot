@@ -17,6 +17,7 @@
 
 import type { ChainId } from "./chains.js";
 import type { ScanResult } from "./scanner.js";
+import { readFile, writeFile } from "node:fs/promises";
 
 export interface SpamVerdict {
   isSpam: boolean;
@@ -74,6 +75,32 @@ interface ContractMeta {
 }
 
 const metaCache = new Map<string, ContractMeta>();
+const VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
+const verdictCache = new Map<string, { expiresAt: number; verdict: SpamVerdict }>();
+let verdictCacheLoaded = false;
+
+async function loadVerdictCache(): Promise<void> {
+  if (verdictCacheLoaded) return;
+  verdictCacheLoaded = true;
+  try {
+    const raw = JSON.parse(await readFile(".freemint-spam-cache.json", "utf8")) as Record<string, { expiresAt: number; verdict: SpamVerdict }>;
+    for (const [key, value] of Object.entries(raw)) {
+      if (value.expiresAt > Date.now()) verdictCache.set(key, value);
+    }
+  } catch {
+    // A missing or corrupt local cache should never block discovery.
+  }
+}
+
+async function cacheVerdict(key: string, verdict: SpamVerdict): Promise<void> {
+  verdictCache.set(key, { expiresAt: Date.now() + VERDICT_TTL_MS, verdict });
+  try {
+    const serialized = Object.fromEntries(verdictCache.entries());
+    await writeFile(".freemint-spam-cache.json", JSON.stringify(serialized), "utf8");
+  } catch {
+    // Cache persistence is best effort.
+  }
+}
 
 // --- env config ------------------------------------------------------------
 
@@ -207,19 +234,28 @@ export async function evaluateSpamContract(
   chain: ChainId
 ): Promise<SpamVerdict> {
   const address = scan.contractAddress;
+  const cacheKey = `${chain}:${address.toLowerCase()}`;
+  await loadVerdictCache();
+  const cached = verdictCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.verdict;
+
+  const finish = async (verdict: SpamVerdict): Promise<SpamVerdict> => {
+    await cacheVerdict(cacheKey, verdict);
+    return verdict;
+  };
 
   // 1) Known spam deployer — one cheap Blockscout v2 call.
   const meta = await fetchContractMeta(address, chain);
   const creator = meta.creator?.toLowerCase();
   if (creator) {
     if (KNOWN_SPAM_DEPLOYERS.has(creator)) {
-      return {
+      return finish({
         isSpam: true,
         reason: `deployed by known spam-farm wallet ${meta.creator}`,
-      };
+      });
     }
     if (envSpamDeployers().has(creator)) {
-      return { isSpam: true, reason: "deployer on SPAM_DEPLOYERS blacklist" };
+      return finish({ isSpam: true, reason: "deployer on SPAM_DEPLOYERS blacklist" });
     }
   }
 
@@ -229,10 +265,10 @@ export async function evaluateSpamContract(
     contractName &&
     SPAM_NAME_PATTERNS.some((re) => re.test(contractName))
   ) {
-    return {
+    return finish({
       isSpam: true,
       reason: `contract name "${contractName}" matches spam template`,
-    };
+    });
   }
 
   // 3) UnlimitedMint farm fingerprint: bare mint() with no guardrails at all.
@@ -248,11 +284,11 @@ export async function evaluateSpamContract(
     !hasGuardrails &&
     runtimeHasSelector(scan.bytecode, BARE_MINT_SELECTOR)
   ) {
-    return {
+    return finish({
       isSpam: true,
       reason:
         "UnlimitedMint farm template: bare mint() with no supply/payment/pause guardrails",
-    };
+    });
   }
 
   // 4) Age gate: only NEWLY deployed contracts qualify as "new free mints".
@@ -262,13 +298,13 @@ export async function evaluateSpamContract(
       const ageDays = (Date.now() - createdMs) / 86_400_000;
       const limit = maxAgeDays();
       if (ageDays > limit) {
-        return {
+        return finish({
           isSpam: true,
           reason: `contract deployed ${ageDays.toFixed(1)} days ago (limit ${limit}) — not a new free mint`,
-        };
+        });
       }
     }
   }
 
-  return { isSpam: false };
+  return finish({ isSpam: false });
 }

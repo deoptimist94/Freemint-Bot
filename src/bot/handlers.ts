@@ -1108,8 +1108,8 @@ async function performScan(
 ): Promise<void> {
   const chain = chainOverride ?? (await resolveUserChain(telegramId));
   await ctx.reply(
-    `🔍 Scanning contract <code>${htmlEscape(shortenAddress(address))}</code> on ${htmlEscape(networkBadge(chain))}...`,
-    { parse_mode: "HTML" }
+    `🔍 Scanning contract \`${address}\` on ${networkBadge(chain)}...`,
+    { parse_mode: "Markdown" }
   );
 
   try {
@@ -1117,35 +1117,35 @@ async function performScan(
 
     if (!result.isContract) {
       await ctx.reply(
-        `❌ No contract found at <code>${htmlEscape(shortenAddress(address))}</code>`,
+        `❌ No contract found at \`${address}\``,
         {
           reply_markup: backToMainKeyboard(),
-          parse_mode: "HTML",
+          parse_mode: "Markdown",
         }
       );
       return;
     }
 
-    let text = `🔍 <b>Contract Analysis & Security Audit</b> — ${htmlEscape(networkBadge(chain))}\n\n`;
-    text += `Contract: <code>${htmlEscape(result.contractAddress)}</code>\n`;
+    let text = `🔍 Contract Analysis & Security Audit — ${networkBadge(chain)}\n\n`;
+    text += `Contract: \`${result.contractAddress}\`\n`;
     text += `Verified: ${result.isVerified ? "✅ Yes" : "⚠️ Bytecode only"}\n`;
-    text += `🛡 <b>Security Status:</b> ${
+    text += `🛡 Security Status: ${
       result.security.isSafe ? "✅ SAFE / CLEAN" : "🚨 HIGH RISK / HONEYPOT"
     }\n`;
-    text += `Risk Score: <code>${result.security.riskScore} / 100</code>\n\n`;
+    text += `Risk Score: \`${result.security.riskScore} / 100\`\n\n`;
 
     if (result.security.warnings.length > 0) {
-      text += `⚠️ <b>Security Warnings:</b>\n`;
+      text += `⚠️ Security Warnings:\n`;
       for (const w of result.security.warnings) {
-        text += `• ${htmlEscape(w)}\n`;
+        text += `• ${w}\n`;
       }
       text += `\n`;
     }
 
     if (result.mintFunctions.length > 0 && result.security.isSafe) {
-      text += `<b>Free Mint Functions Found:</b>\n`;
+      text += `Free Mint Functions Found:\n`;
       for (const fn of result.mintFunctions) {
-        text += `• ${htmlEscape(fn.name)}(${fn.args.map((a) => htmlEscape(a)).join(", ")}) — ✅ Free\n`;
+        text += `• ${fn.name}(${fn.args.join(", ")}) — ✅ Free\n`;
       }
       text += `\n🚀 Safe free mint confirmed!`;
 
@@ -1161,19 +1161,19 @@ async function performScan(
 
       await ctx.reply(text, {
         reply_markup: keyboard,
-        parse_mode: "HTML",
+        parse_mode: "Markdown",
       });
     } else {
-      text += htmlEscape(result.warning || "No free mint functions detected.");
+      text += result.warning || "No free mint functions detected.";
       await ctx.reply(text, {
         reply_markup: backToMainKeyboard(),
-        parse_mode: "HTML",
+        parse_mode: "Markdown",
       });
     }
   } catch (error) {
-    await ctx.reply(`❌ Scan failed: ${htmlEscape(errorMessage(error))}`, {
+    await ctx.reply(`❌ Scan failed: ${errorMessage(error)}`, {
       reply_markup: backToMainKeyboard(),
-      parse_mode: "HTML",
+      parse_mode: "Markdown",
     });
   }
 }
@@ -1215,11 +1215,11 @@ async function performMint(
 
   await ctx.reply(
     `🚀 <b>Starting Mint</b> — ${htmlEscape(networkBadge(chain))}\n\n` +
-      `Contract: <code>${htmlEscape(shortenAddress(address))}</code>\n` +
+      `Contract: \`${address}\`\n` +
       `Active Wallets: ${activeCount} (x${multiplier} each)\n` +
       `Gas Price: <code>${gasCheck.currentGwei.toFixed(4)} Gwei</code> (Safe ✅)\n\n` +
       `Minting in progress...`,
-    { parse_mode: "HTML" }
+    { parse_mode: "Markdown" }
   );
 
   try {
@@ -1235,27 +1235,27 @@ async function performMint(
 
     for (const r of result.results) {
       const statusIcon = r.success ? "✅" : "❌";
-      let card = `${statusIcon} <b>${htmlEscape(r.label)}</b> — ${r.success ? "Minted!" : "Failed"}\n`;
-      card += `Wallet: <code>${htmlEscape(shortenAddress(r.walletAddress))}</code>\n`;
+      let card = `${statusIcon} ${r.label} — ${r.success ? "Minted!" : "Failed"}\n`;
+      card += `Wallet: \`${shortenAddress(r.walletAddress)}\`\n`;
 
       if (r.txHash && r.basescanUrl) {
-        card += `TX: <a href="${htmlEscape(r.basescanUrl)}">${shortenAddress(r.txHash, 8, 8)}</a>\n`;
+        card += `TX: ${r.basescanUrl}\n`;
       }
       if (r.error) {
-        card += `Error: ${htmlEscape(r.error)}\n`;
+        card += `Error: ${r.error}\n`;
       }
 
       await ctx.reply(card, {
-        parse_mode: "HTML",
+        parse_mode: "Markdown",
         link_preview_options: { is_disabled: true },
       });
     }
 
     await ctx.reply(
-      `📊 <b>Mint Summary</b> — ${htmlEscape(networkBadge(chain))}\n\nContract: <code>${htmlEscape(shortenAddress(address))}</code>\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${result.totalFailed}\nTotal Attempts: ${result.results.length}`,
+      `📊 Mint Summary — ${networkBadge(chain)}\n\nContract: \`${address}\`\n✅ Success: ${result.totalSuccess}\n❌ Failed: ${result.totalFailed}\nTotal Attempts: ${result.results.length}`,
       {
         reply_markup: backToMainKeyboard(),
-        parse_mode: "HTML",
+        parse_mode: "Markdown",
       }
     );
   } catch (error) {

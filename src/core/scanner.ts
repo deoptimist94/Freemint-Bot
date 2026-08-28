@@ -44,6 +44,13 @@ export interface ScanResult {
   isSeaDrop?: boolean;
   requiresSignature?: boolean;
   isGated?: boolean;
+  schedule?: MintSchedule;
+}
+
+export interface MintSchedule {
+  startsAt?: number;
+  endsAt?: number;
+  isLive?: boolean;
 }
 
 type AbiInput = { type: string; name?: string };
@@ -213,7 +220,7 @@ async function fetchAbiFromExplorer(
       const parsed = typeof abiJson.result === "string"
         ? JSON.parse(abiJson.result)
         : abiJson.result;
-      if (Array.isArray(parsed)) return parsed as Abi;
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed as Abi;
     }
 
     // Explorer proxy metadata is useful when the proxy has no source/ABI of its own.
@@ -228,6 +235,47 @@ async function fetchAbiFromExplorer(
     console.error("Failed to fetch ABI:", err);
     }
   return null;
+}
+
+async function readMintSchedule(
+  address: Address,
+  abi: Abi,
+  chain: ChainId
+): Promise<MintSchedule | undefined> {
+  const candidates = abi.filter((item) => {
+    const fn = item as AbiFn;
+    return fn.type === "function" && fn.stateMutability === "view" &&
+      (fn.inputs?.length ?? 0) === 0 &&
+      /(^|public|mint|sale|drop|phase|start|end|open|close|active|live)/i.test(fn.name || "");
+  }).slice(0, 16) as AbiFn[];
+  const schedule: MintSchedule = {};
+  const now = Math.floor(Date.now() / 1000);
+
+  for (const fn of candidates) {
+    try {
+      const value = await getPublicClient(chain).readContract({
+        address,
+        abi: [fn] as Abi,
+        functionName: fn.name!,
+        args: [],
+      } as any);
+      if (typeof value !== "bigint" && typeof value !== "number") continue;
+      const timestamp = Number(value);
+      if (!Number.isSafeInteger(timestamp) || timestamp < 1_000_000_000) continue;
+      const name = fn.name!.toLowerCase();
+      if (name.includes("end") || name.includes("close")) schedule.endsAt = timestamp;
+      else if (name.includes("start") || name.includes("open")) schedule.startsAt = timestamp;
+    } catch {
+      // Optional schedule getters are common; failed probes are non-fatal.
+    }
+  }
+
+  if (schedule.startsAt !== undefined || schedule.endsAt !== undefined) {
+    schedule.isLive = (schedule.startsAt === undefined || now >= schedule.startsAt) &&
+      (schedule.endsAt === undefined || now <= schedule.endsAt);
+    return schedule;
+  }
+  return undefined;
 }
 
 function isViewOrPure(fn: AbiFn): boolean {
@@ -421,6 +469,7 @@ export async function scanContract(
   const { isGated, requiresSignature } = detectGateTypeFromFunctions(mintFunctions);
   const freeMintFunctions = mintFunctions.filter((f) => f.isFreeMint);
   const security = await auditContractSecurity(checksumAddress, chain);
+  const schedule = abi ? await readMintSchedule(checksumAddress as Address, abi, chain) : undefined;
   
   return {
     contractAddress: checksumAddress,
@@ -434,6 +483,7 @@ export async function scanContract(
     isSeaDrop,
     requiresSignature,
     isGated,
+    schedule,
     warning: !isVerified
       ? "Contract is unverified on explorer. No verified mint functions can be safely extracted."
       : isSeaDrop

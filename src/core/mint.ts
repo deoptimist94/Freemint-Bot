@@ -60,6 +60,7 @@ export type MintErrorCategory =
   | "SIGNATURE"
   | "SOLD_OUT"
   | "TIMING"
+  | "PAYMENT"
   | "GAS"
   | "RPC"
   | "INSUFFICIENT_FUNDS"
@@ -76,8 +77,10 @@ export interface ClassifiedError {
 const userMintQuantities = new Map<bigint, number>();
 const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5" as Address;
 const SEADROP_ABI = parseAbi([
-  "function getFeesAndRecipient(address nftContract) view returns (uint256 fee, address feeRecipient)",
   "function mintPublic(address nftContract, address feeRecipient, address minter, uint256 quantity) payable",
+] as const);
+const SEADROP_NFT_ABI = parseAbi([
+  "function getFeesAndRecipient() view returns (uint256 fee, address feeRecipient)",
 ] as const);
 
 export function getUserMintQuantity(userId: bigint): number {
@@ -94,6 +97,11 @@ export function classifyMintError(error: unknown): ClassifiedError {
   if (
     errorStr.includes("alreadyclaimed") ||
     errorStr.includes("soldout") ||
+    errorStr.includes("mintended") ||
+    errorStr.includes("mintnotactive") ||
+    errorStr.includes("mint has ended") ||
+    errorStr.includes("mint is not active") ||
+    errorStr.includes("maximum mint per wallet exceeded") ||
     errorStr.includes("salenotactive") ||
     errorStr.includes("salenotstarted")
   ) {
@@ -102,6 +110,15 @@ export function classifyMintError(error: unknown): ClassifiedError {
       message: errorStr,
       retryable: false,
       userFriendly: `MINT UNAVAILABLE: ${errorStr.slice(0, 160)}`,
+    };
+  }
+
+  if (errorStr.includes("insufficientpayment") || errorStr.includes("insufficient payment")) {
+    return {
+      category: "PAYMENT",
+      message: errorStr,
+      retryable: false,
+      userFriendly: "INSUFFICIENT PAYMENT: The required mint fee was not provided.",
     };
   }
 
@@ -283,10 +300,25 @@ function decodeContractRevert(error: unknown): string | null {
         "error NotEligible()",
         "error InvalidProof()",
         "error InvalidSignature()",
+        "error MintEnded()",
+        "error MintNotActive()",
+        "error MaxMintPerWalletExceeded()",
+        "error InsufficientPayment()",
+        "error NotAuthorized()",
+        "error OnlySeaDrop()",
       ]),
       data: data as Hex,
     });
-    return `${decoded.errorName}${decoded.args?.length ? `: ${decoded.args.join(", ")}` : ""}`;
+    const labels: Record<string, string> = {
+      MintEnded: "Mint has ended",
+      MintNotActive: "Mint is not active",
+      MaxMintPerWalletExceeded: "Maximum mint per wallet exceeded",
+      InsufficientPayment: "Insufficient payment",
+      NotAuthorized: "Wallet is not authorized",
+      OnlySeaDrop: "This mint must be routed through SeaDrop",
+    };
+    const label = labels[decoded.errorName] ?? decoded.errorName;
+    return `${label}${decoded.args?.length ? `: ${decoded.args.join(", ")}` : ""}`;
   } catch {
     return `contract custom error (${data.slice(0, 10)})`;
   }
@@ -408,10 +440,9 @@ async function executeSingleMint(
 
       if (options?.seaDropContext?.isViaRouter) {
         const feeResult = await publicClient.readContract({
-          address: SEADROP_ROUTER,
-          abi: SEADROP_ABI,
+          address: getAddress(nftContract),
+          abi: SEADROP_NFT_ABI,
           functionName: "getFeesAndRecipient",
-          args: [getAddress(nftContract)],
         });
         const [fee, feeRecipient] = feeResult as readonly [bigint, Address];
         target = SEADROP_ROUTER;

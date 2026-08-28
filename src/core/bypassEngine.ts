@@ -90,8 +90,10 @@ const PROBE_NAME_RE =
 const MAX_PROBE_READS = 24;
 const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5" as Address;
 const SEADROP_ABI = parseAbi([
-  "function getFeesAndRecipient(address nftContract) view returns (uint256 fee, address feeRecipient)",
   "function mintPublic(address nftContract, address feeRecipient, address minter, uint256 quantity) payable",
+] as const);
+const SEADROP_NFT_ABI = parseAbi([
+  "function getFeesAndRecipient() view returns (uint256 fee, address feeRecipient)",
 ] as const);
 
 const PUBLIC_START_KEYS = [
@@ -116,10 +118,9 @@ async function buildMintCall(
 ): Promise<{ target: Address; data: Hex; value: bigint }> {
   if (result.isSeaDrop) {
     const [fee, feeRecipient] = await client.readContract({
-      address: SEADROP_ROUTER,
-      abi: SEADROP_ABI,
+      address: getAddress(address),
+      abi: SEADROP_NFT_ABI,
       functionName: "getFeesAndRecipient",
-      args: [getAddress(address)],
     }) as readonly [bigint, Address];
     const quantity = args.find((arg, index) => fn.args[index]?.toLowerCase().startsWith("uint")) as bigint | undefined;
     const mintQuantity = quantity && quantity > 0n ? quantity : 1n;
