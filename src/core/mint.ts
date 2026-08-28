@@ -6,6 +6,7 @@
 import {
   type Address,
   type Hex,
+  decodeErrorResult,
   parseAbi,
   encodeFunctionData,
   getAddress,
@@ -85,6 +86,20 @@ export function setUserMintQuantity(userId: bigint, quantity: number): void {
 export function classifyMintError(error: unknown): ClassifiedError {
   const errorStr = (error instanceof Error ? error.message : String(error)).toLowerCase();
   
+  if (
+    errorStr.includes("alreadyclaimed") ||
+    errorStr.includes("soldout") ||
+    errorStr.includes("salenotactive") ||
+    errorStr.includes("salenotstarted")
+  ) {
+    return {
+      category: "SOLD_OUT",
+      message: errorStr,
+      retryable: false,
+      userFriendly: `MINT UNAVAILABLE: ${errorStr.slice(0, 160)}`,
+    };
+  }
+
   if (
     errorStr.includes("not whitelisted") ||
     errorStr.includes("not on whitelist") ||
@@ -232,7 +247,7 @@ export function classifyMintError(error: unknown): ClassifiedError {
       category: "SIMULATION_FAILED",
       message: errorStr,
       retryable: true,
-      userFriendly: "SIMULATION FAILED: Contract call would fail. May need different parameters.",
+      userFriendly: `SIMULATION FAILED: ${errorStr.slice(0, 160)}`,
     };
   }
   
@@ -242,6 +257,34 @@ export function classifyMintError(error: unknown): ClassifiedError {
     retryable: true,
     userFriendly: `UNKNOWN ERROR: ${errorStr.slice(0, 100)}`,
   };
+}
+
+function decodeContractRevert(error: unknown): string | null {
+  const data =
+    typeof error === "object" && error !== null && "data" in error
+      ? error.data
+      : undefined;
+  if (typeof data !== "string" || !data.startsWith("0x")) return null;
+
+  try {
+    const decoded = decodeErrorResult({
+      abi: parseAbi([
+        "error Error(string)",
+        "error Panic(uint256)",
+        "error AlreadyClaimed()",
+        "error SoldOut()",
+        "error SaleNotStarted()",
+        "error SaleNotActive()",
+        "error NotEligible()",
+        "error InvalidProof()",
+        "error InvalidSignature()",
+      ]),
+      data: data as Hex,
+    });
+    return `${decoded.errorName}${decoded.args?.length ? `: ${decoded.args.join(", ")}` : ""}`;
+  } catch {
+    return `contract custom error (${data.slice(0, 10)})`;
+  }
 }
 
 interface GasStrategy {
@@ -374,8 +417,9 @@ async function executeSingleMint(
           value: 0n,
         });
         console.log(`✅ Pre-flight simulation passed for ${wallet.label}`);
-      } catch (simError: any) {
-        const classified = classifyMintError(simError);
+      } catch (simError: unknown) {
+        const decodedError = decodeContractRevert(simError);
+        const classified = classifyMintError(decodedError || simError);
         console.warn(`❌ Pre-flight failed for ${wallet.label}: ${classified.category}`);
         
         if (!classified.retryable) {

@@ -183,7 +183,7 @@ async function showWallets(ctx: Context, telegramId: bigint): Promise<void> {
     text += `\nTap a wallet to toggle active, or 📋 Copy for the full address.`;
   }
   await editOrReply(ctx, text, {
-    reply_markup: walletsKeyboard(wallets),
+    reply_markup: walletsKeyboard(wallets, chain),
     parse_mode: "Markdown",
   });
 }
@@ -220,8 +220,8 @@ function mdEscape(text: string): string {
     .replace(/([_*[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
 }
 
-function htmlEscape(text: string): string {
-  return String(text)
+function htmlEscape(text: unknown): string {
+  return String(text ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -515,10 +515,11 @@ async function handleNewWallet(ctx: Context, telegramId: bigint): Promise<void> 
   try {
     const wallet = await generateNewWallet(telegramId);
     const wallets = await getWallets(telegramId);
+    const chain = await resolveUserChain(telegramId);
     await editOrReply(
       ctx,
       `✅ **New Wallet Created**\n\n📍 \`${wallet.address}\`\n📋 Label: ${wallet.label}\n\nLong-press the address to copy it.`,
-      { reply_markup: walletsKeyboard(wallets), parse_mode: "Markdown" }
+      { reply_markup: walletsKeyboard(wallets, chain), parse_mode: "Markdown" }
     );
   } catch (err) {
     await editOrReply(ctx, `❌ ${errorMessage(err)}`, { reply_markup: backToMainKeyboard() });
@@ -529,8 +530,9 @@ async function handleDeleteWallet(ctx: Context, telegramId: bigint, data: string
   const walletId = data.replace(/^del_/, "");
   await deleteWallet(walletId);
   const wallets = await getWallets(telegramId);
+  const chain = await resolveUserChain(telegramId);
   await editOrReply(ctx, `🗑 Wallet deleted.`, {
-    reply_markup: walletsKeyboard(wallets),
+    reply_markup: walletsKeyboard(wallets, chain),
     parse_mode: "Markdown",
   });
 }
@@ -539,8 +541,9 @@ async function handleToggleWallet(ctx: Context, telegramId: bigint, data: string
   const walletId = data.replace(/^toggle_/, "");
   await toggleWallet(walletId);
   const wallets = await getWallets(telegramId);
+  const chain = await resolveUserChain(telegramId);
   await editOrReply(ctx, `🔄 Wallet toggled.`, {
-    reply_markup: walletsKeyboard(wallets),
+    reply_markup: walletsKeyboard(wallets, chain),
     parse_mode: "Markdown",
   });
 }

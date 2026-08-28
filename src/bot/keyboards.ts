@@ -105,14 +105,17 @@ export function fundAmountKeyboard(ethPrice: number): InlineKeyboard {
     .text("🔙 Wallets", "wallets").text("🏠 Main Menu", "main_menu");
 }
 
-export function walletsKeyboard(wallets: WalletInfo[]): InlineKeyboard {
+export function walletsKeyboard(wallets: WalletInfo[], chain: ChainId = "base"): InlineKeyboard {
   const kb = new InlineKeyboard();
+  const explorer = chain === "robinhood"
+    ? "https://robinhoodchain.blockscout.com"
+    : "https://basescan.org";
 
   for (const w of wallets) {
     const wText = `${w.isActive ? "✅" : "❌"} ${w.label}: ${shortenAddress(w.address)}`;
     kb.text(wText, `toggle_${w.id}`).row();
     kb.text(`📋 Copy ${w.label}`, `copyaddr_${w.id}`)
-      .url("🔗 Basescan", `https://basescan.org/address/${w.address}`)
+      .url("🔗 Explorer", `${explorer}/address/${w.address}`)
       .row();
   }
 
@@ -210,8 +213,14 @@ export function confirmMintKeyboard(contractAddress: string, chain?: ChainId): I
   const clean = contractAddress.replace(/^0x/, "");
   const cb = `confirm_mint_${clean}${chain ? `_${chain}` : ""}`;
   return new InlineKeyboard()
+    .text("🚀 Batch Mint Now", `mint_${clean}${chain ? `_${chain}` : ""}`).row()
     .text("✅ Confirm Mint", cb).row()
-    .text("❌ Cancel", "main_menu");
+    .text("❌ Cancel", "main_menu")
+    .url("🔗 Explorer", `${chain === "robinhood" ? "https://robinhoodchain.blockscout.com" : "https://basescan.org"}/address/${contractAddress}`);
+}
+
+export function discoveryMintKeyboard(contractAddress: string, chain: ChainId): InlineKeyboard {
+  return confirmMintKeyboard(contractAddress, chain);
 }
 
 export function backToMainKeyboard(): InlineKeyboard {

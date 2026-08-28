@@ -35,6 +35,15 @@ const MAX_SEEN = 2000;
 const BASE_RECONNECT_MS = 2000;
 const MAX_RECONNECT_MS = 30000;
 
+function trustedWrapperAddresses(): Set<string> {
+  return new Set(
+    (process.env.TRUSTED_WRAPPER_ADDRESSES || "")
+      .split(",")
+      .map((address) => address.trim().toLowerCase())
+      .filter((address) => /^0x[a-f0-9]{40}$/.test(address))
+  );
+}
+
 export class DropListener {
   private chain: ChainId;
   private isRunning = false;
@@ -134,6 +143,22 @@ export class DropListener {
       try {
         contractAddr = getAddress(tx.to);
       } catch {
+        continue;
+      }
+
+      if (this.seenContracts.has(contractAddr)) continue;
+
+      let scan;
+      try {
+        scan = await scanContract(contractAddr, this.chain);
+      } catch {
+        continue;
+      }
+      const isTrustedWrapper = trustedWrapperAddresses().has(contractAddr.toLowerCase());
+      const hasValidFreeMint = scan.mintFunctions.some(
+        (fn) => fn.isFreeMint && !fn.requiresPayment
+      );
+      if ((!scan.isVerified && !isTrustedWrapper) || scan.security.riskScore > 20 || !hasValidFreeMint) {
         continue;
       }
 

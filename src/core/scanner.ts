@@ -72,6 +72,22 @@ const PAID_MINT_PATTERNS = [
 ];
 
 const MINT_NAME_BLOCKLIST = [
+  /^update/i,
+  /^set/i,
+  /^admin/i,
+  /^withdraw/i,
+  /^transfer/i,
+  /^owner/i,
+  /^configure/i,
+  /^allow/i,
+  /^revoke/i,
+  /^grant/i,
+  /^pause/i,
+  /^unpause/i,
+  /^upgrade/i,
+  /^initialize/i,
+  /^renounce/i,
+  /^emergency/i,
   /^can/,
   /allowance/,
   /preview/,
@@ -185,6 +201,42 @@ function isBlockedName(name: string): boolean {
   return MINT_NAME_BLOCKLIST.some((pattern) =>
     pattern instanceof RegExp ? pattern.test(lower) : lower.includes(pattern)
   );
+}
+
+function decodeRevertMessage(error: unknown, abi: Abi = []): string {
+  const errorData =
+    typeof error === "object" && error !== null && "data" in error
+      ? error.data
+      : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+
+  if (typeof errorData !== "string" || !errorData.startsWith("0x")) {
+    return message;
+  }
+
+  try {
+    const decoded = decodeErrorResult({
+      abi: [
+        ...abi,
+        ...parseAbi([
+          "error Error(string)",
+          "error Panic(uint256)",
+          "error AlreadyClaimed()",
+          "error SoldOut()",
+          "error SaleNotStarted()",
+          "error SaleNotActive()",
+          "error NotEligible()",
+          "error InvalidProof()",
+          "error InvalidSignature()",
+        ]),
+      ],
+      data: errorData as Hex,
+    });
+    const args = decoded.args?.length ? `: ${decoded.args.join(", ")}` : "";
+    return `${decoded.errorName}${args}`;
+  } catch {
+    return `Contract custom error (${errorData.slice(0, 10)})`;
+  }
 }
 
 function looksLikeMint(fn: AbiFn): boolean {
@@ -427,7 +479,8 @@ export async function simulateMint(
     
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return { success: false, error: message };
+    
+    return { success: false, error: `Contract reverted: ${decodeRevertMessage(error)}` };
   }
 }
 

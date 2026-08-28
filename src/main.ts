@@ -24,6 +24,7 @@ import { MempoolMonitor, type MempoolMint } from "./core/mempoolSniper.js";
 import { getRPCPool, getRPCStats } from "./core/rpcPool.js";
 import { mintQueue, discoveryQueue, closeQueues } from "./core/queue.js";
 import { loadSubscribers } from "./core/broadcaster.js";
+import { discoveryMintKeyboard } from "./bot/keyboards.js";
 
 const monitors: Map<ChainId, MempoolMonitor> = new Map();
 let bot: Bot;
@@ -48,6 +49,13 @@ function markSkipped(chain: ChainId, address: string): void {
     const firstKey = skipCache.keys().next().value;
     if (firstKey) skipCache.delete(firstKey);
   }
+}
+
+function isTrustedWrapper(address: string): boolean {
+  return (process.env.TRUSTED_WRAPPER_ADDRESSES || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .includes(address.toLowerCase());
 }
 
 async function main() {
@@ -254,6 +262,15 @@ async function processDiscovery(
   console.log(`Processing discovery: ${contractAddress} on ${chain}`);
 
   const scan = await scanContract(contractAddress, chain);
+  const trustedWrapper = isTrustedWrapper(scan.contractAddress);
+  const hasValidFreeMint = scan.mintFunctions.some(
+    (fn) => fn.isFreeMint && !fn.requiresPayment
+  );
+  if ((!scan.isVerified && !trustedWrapper) || scan.security.riskScore > 20 || !hasValidFreeMint) {
+    markSkipped(chain, contractAddress);
+    return;
+  }
+
   if (!scan.isNft || scan.mintFunctions.length === 0) {
     console.log(`No mint functions found for: ${contractAddress} — caching skip`);
     markSkipped(chain, contractAddress);
@@ -345,6 +362,7 @@ async function processUser(
       `${user.autoMintEnabled ? 'Auto-mint has been queued.' : 'Use /bypass to attempt mint manually.'}`,
       {
         parse_mode: 'Markdown',
+        reply_markup: discoveryMintKeyboard(scan.contractAddress, chain),
         link_preview_options: { is_disabled: true }
       }
     );
