@@ -9,7 +9,6 @@ import { batchMint, type MintOptions } from "./mint.js";
 import { withChainContext } from "./chainContext.js";
 import type { ChainId } from "./chains.js";
 import { getChainsForSelection, getUserChainSelection } from "./userChain.js";
-import { getRPCPool } from "./rpcPool.js";
 
 interface WhaleTransaction {
   hash: string;
@@ -38,7 +37,7 @@ interface TrackedWallet {
   label: string | null;
 }
 
-const whaleMempoolMonitors: Map<ChainId, any> = new Map();
+const whaleMempoolMonitors = new Map<ChainId, NodeJS.Timeout>();
 const cycleStartedAt: Record<ChainId, number> = { base: 0, robinhood: 0 };
 const cycleFromBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
 const cycleToBlock: Record<ChainId, bigint | null> = { base: null, robinhood: null };
@@ -137,7 +136,7 @@ export async function startWhaleMempoolMonitoring(
 
       if (!block.transactions) return;
 
-      for (const tx of block.transactions as any[]) {
+      for (const tx of block.transactions) {
         if (!tx.to || !tx.input || tx.input === "0x") continue;
         
         const tracked = await isTrackedWallet(tx.from);
@@ -150,7 +149,13 @@ export async function startWhaleMempoolMonitoring(
         ].includes(selector);
 
         if (isMint) {
-          await onWhaleMint(tx as WhaleTransaction, tracked);
+          await onWhaleMint({
+            hash: tx.hash,
+            to: tx.to,
+            from: tx.from,
+            input: tx.input,
+            value: tx.value,
+          }, tracked);
         }
       }
     } catch (err) {
@@ -283,7 +288,7 @@ async function pollChain(
       const block = await getBlockCached(chain, b);
       if (!block?.transactions) continue;
 
-      for (const tx of block.transactions as any[]) {
+      for (const tx of block.transactions) {
         if (!tx.to || !tx.input) continue;
         
         const from = tx.from?.toLowerCase();

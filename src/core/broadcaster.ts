@@ -39,9 +39,6 @@ const subscribers = new Map<bigint, Subscriber>();
 const recentEvents = new Map<string, number>();
 const EVENT_DEDUP_TTL = 60 * 1000;
 
-const BROADCAST_CHUNK_SIZE = 50;
-const BROADCAST_TIMEOUT = 60000;
-
 export async function loadSubscribers(): Promise<void> {
   try {
     const users = await prisma.user.findMany({
@@ -137,45 +134,33 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
 
   console.log(`Broadcasting ${event.type} to ${eligibleSubscribers.length} users`);
 
-  const chunks: Subscriber[][] = [];
-  for (let i = 0; i < eligibleSubscribers.length; i += BROADCAST_CHUNK_SIZE) {
-    chunks.push(eligibleSubscribers.slice(i, i + BROADCAST_CHUNK_SIZE));
-  }
-
-  let successCount = 0;
-  let failCount = 0;
-
-  for (const chunk of chunks) {
-    const results = await Promise.allSettled(
-      chunk.map(async (sub) => {
-        try {
-          await bot.api.sendMessage(Number(sub.telegramId), message, {
-            parse_mode: 'Markdown',
-            link_preview_options: { is_disabled: true },
-          });
-          return { success: true, userId: sub.telegramId };
-        } catch (err: any) {
-          if (err?.error_code === 403) {
-            subscribers.delete(sub.telegramId);
-            console.log(`Removed blocked user ${sub.telegramId}`);
-          }
-          return { success: false, userId: sub.telegramId, error: err.message };
+  const results = await Promise.allSettled(
+    eligibleSubscribers.map(async (sub) => {
+      try {
+        await bot.api.sendMessage(Number(sub.telegramId), message, {
+          parse_mode: 'Markdown',
+          link_preview_options: { is_disabled: true },
+        });
+        return { success: true, userId: sub.telegramId };
+      } catch (err: unknown) {
+        const errorCode =
+          typeof err === "object" && err !== null && "error_code" in err
+            ? err.error_code
+            : undefined;
+        if (errorCode === 403) {
+          subscribers.delete(sub.telegramId);
+          console.log(`Removed blocked user ${sub.telegramId}`);
         }
-      })
-    );
-
-    results.forEach(result => {
-      if (result.status === 'fulfilled' && result.value.success) {
-        successCount++;
-      } else {
-        failCount++;
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        return { success: false, userId: sub.telegramId, error: errorMessage };
       }
-    });
+    })
+  );
 
-    if (chunks.length > 1) {
-      await new Promise(r => setTimeout(r, 100));
-    }
-  }
+  const successCount = results.filter(
+    (result) => result.status === 'fulfilled' && result.value.success
+  ).length;
+  const failCount = results.length - successCount;
 
   console.log(`Broadcast complete: ${successCount} success, ${failCount} failed`);
 }
