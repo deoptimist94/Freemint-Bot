@@ -1,6 +1,6 @@
 /**
- * Contract Scanner - Production Version (Base & Robinhood Chain Fixed)
- * Fixes: SeaDrop proxy parsing, unverified bytecode pattern matching, fallback ABI injection, clean notifications
+ * Contract Scanner - Production Version (Strict Verification Filter)
+ * Fixes: Eliminates unverified junk spam, strictly requires verification or pure public matching.
  */
 
 import {
@@ -60,20 +60,6 @@ type ExplorerJson = {
   message?: string;
   result?: unknown;
 };
-
-// Known standard and proxy mint signatures for unverified or SeaDrop contracts
-const FALLBACK_SEADROP_ABI = parseAbi([
-  "function mintSeaDrop(address nftContract, address feeRecipient, address minter, uint256 quantity) external payable",
-  "function mintPublic(address nftContract, address feeRecipient, address minter, uint256 quantity) external payable",
-  "function mint(address recipient, uint256 quantity) external payable",
-  "function mint(uint256 quantity) external payable",
-  "function mint() external payable",
-  "function claim(address recipient, uint256 quantity) external payable",
-  "function claim() external payable",
-  "function publicSaleMint(address receiver, uint256 quantity, address referrer, bytes memory mintParams) external payable",
-  "function safeMint(address to) external",
-  "function safeMint(address to, uint256 quantity) external",
-]);
 
 const PAID_MINT_PATTERNS = [
   "mintwitheth",
@@ -301,7 +287,7 @@ export async function scanContract(
 ): Promise<ScanResult> {
   const checksumAddress = isAddress(address) ? getAddress(address) : address;
   
-  const [bytecode, fetchedAbi] = await Promise.all([
+  const [bytecode, abi] = await Promise.all([
     getBytecode(checksumAddress as Address, chain),
     fetchAbiFromExplorer(checksumAddress as Address, chain),
   ]);
@@ -325,31 +311,18 @@ export async function scanContract(
     };
   }
   
-  // Use explorer ABI if verified, otherwise inject SeaDrop / standard fallback ABI to catch proxy / unverified drops
-  const isVerified = fetchedAbi !== null;
-  const abi = isVerified ? fetchedAbi : (FALLBACK_SEADROP_ABI as unknown as Abi);
+  const isVerified = abi !== null;
+  let mintFunctions: MintFunctionInfo[] = [];
   
-  let mintFunctions = analyzeAbiForMintFunctions(abi);
-  
-  // If unverified bytecode contains common mint signatures or factory selectors, ensure we treat it as valid NFT candidate
-  if (!isVerified && mintFunctions.length === 0) {
-    mintFunctions = [
-      {
-        name: "mint",
-        selector: "0x1249c58b",
-        args: [],
-        isFreeMint: true,
-        requiresPayment: false,
-        stateMutability: "payable",
-      }
-    ];
+  if (abi) {
+    mintFunctions = analyzeAbiForMintFunctions(abi);
   }
   
   const isSeaDrop = mintFunctions.some((f) => isSeaDropMint({ 
     name: f.name, 
     stateMutability: f.stateMutability,
     payable: f.stateMutability === "payable"
-  })) || !isVerified;
+  }));
   
   const { isGated, requiresSignature } = detectGateTypeFromFunctions(mintFunctions);
   const freeMintFunctions = mintFunctions.filter((f) => f.isFreeMint);
@@ -368,7 +341,7 @@ export async function scanContract(
     requiresSignature,
     isGated,
     warning: !isVerified
-      ? "Unverified contract / SeaDrop proxy detected. Fallback signatures enabled."
+      ? "Contract is unverified on explorer. No verified mint functions can be safely extracted."
       : isSeaDrop
       ? "SeaDrop contract detected with available free mint functions."
       : requiresSignature
@@ -447,40 +420,13 @@ export async function simulateMint(
         value: 0n,
       });
     } catch {
-      // Simulation fallback for proxy or factory calls that require specific msg.value or context overrides
-      try {
-        gasEstimate = await client.estimateGas({
-          account: getAddress(fromAddress),
-          to: getAddress(contractAddress),
-          data,
-          value: 1n, // test with nominal wei in case contract checks msg.value > 0
-        });
-      } catch {
-        gasEstimate = 150000n; // Safe default gas limit for free mint execution
-      }
+      gasEstimate = 150000n;
     }
     
     return { success: true, gasEstimate };
     
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    
-    try {
-      const errorData = (error as any)?.data;
-      if (errorData && typeof errorData === "string" && errorData.startsWith("0x")) {
-        const decoded = decodeErrorResult({
-          abi: parseAbi(["error Error(string)", "error Panic(uint256)"]),
-          data: errorData as Hex,
-        });
-        return { 
-          success: false, 
-          error: `Contract reverted: ${decoded.args?.[0] || message}` 
-        };
-      }
-    } catch {
-      // Ignore decode error and return clean message
-    }
-    
     return { success: false, error: message };
   }
 }
@@ -488,7 +434,7 @@ export async function simulateMint(
 export function getBestMintFunction(
   functions: MintFunctionInfo[]
 ): MintFunctionInfo | null {
-  const free = functions.filter((f) => f.isFreeMint || f.stateMutability === "payable" || f.stateMutability === "nonpayable");
+  const free = functions.filter((f) => f.isFreeMint);
   const pool = free.length > 0 ? free : functions;
   
   const noArg = pool.find((f) => f.args.length === 0);
@@ -498,11 +444,6 @@ export function getBestMintFunction(
     (f) => f.args.length === 1 && f.args[0] === "uint256"
   );
   if (withArg) return withArg;
-  
-  const withTwoArgs = pool.find(
-    (f) => f.args.length === 2 && (f.args[0] === "address" || f.args[0].includes("address")) && f.args[1] === "uint256"
-  );
-  if (withTwoArgs) return withTwoArgs;
   
   return pool[0] || null;
 }
