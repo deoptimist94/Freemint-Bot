@@ -71,18 +71,13 @@ class RPCPool {
       ],
       robinhood: [
         { 
-          name: "Alchemy-Robinhood-Primary", 
-          url: process.env.ALCHEMY_ROBINHOOD_API_KEY 
-            ? `https://robinhood-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_ROBINHOOD_API_KEY}` 
-            : "", 
-          weight: 70 
-        },
-        { 
-          name: "Alchemy-Robinhood-Backup", 
-          url: process.env.ALCHEMY_ROBINHOOD_BACKUP_KEY 
-            ? `https://robinhood-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_ROBINHOOD_BACKUP_KEY}` 
-            : "", 
-          weight: 30 
+          name: "Robinhood-Primary", 
+          url: process.env.ALCHEMY_ROBINHOOD_API_KEY?.startsWith("http")
+            ? process.env.ALCHEMY_ROBINHOOD_API_KEY
+            : process.env.ALCHEMY_ROBINHOOD_API_KEY 
+              ? `https://robinhood-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_ROBINHOOD_API_KEY}` 
+              : "https://rpc.mainnet.chain.robinhood.com", 
+          weight: 100 
         },
       ],
     };
@@ -108,7 +103,7 @@ class RPCPool {
     }
 
     if (this.providers.size === 0) {
-      throw new Error(`[${this.chain}] No Alchemy providers configured!`);
+      throw new Error(`[${this.chain}] No providers configured!`);
     }
 
     console.log(`[${this.chain}] RPC Pool initialized with ${this.providers.size} providers`);
