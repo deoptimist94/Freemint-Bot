@@ -102,14 +102,22 @@ export function classifyMintError(error: unknown): ClassifiedError {
     errorStr.includes("mint has ended") ||
     errorStr.includes("mint is not active") ||
     errorStr.includes("maximum mint per wallet exceeded") ||
-    errorStr.includes("salenotactive") ||
-    errorStr.includes("salenotstarted")
+    errorStr.includes("salenotactive")
   ) {
     return {
       category: "SOLD_OUT",
       message: errorStr,
       retryable: false,
       userFriendly: `MINT UNAVAILABLE: ${errorStr.slice(0, 160)}`,
+    };
+  }
+
+  if (errorStr.includes("mintnotstarted") || errorStr.includes("mint has not started") || errorStr.includes("sale not started")) {
+    return {
+      category: "TIMING",
+      message: errorStr,
+      retryable: false,
+      userFriendly: "MINT NOT STARTED: The public mint phase has not opened yet.",
     };
   }
 
@@ -134,7 +142,6 @@ export function classifyMintError(error: unknown): ClassifiedError {
     errorStr.includes("not in merkle tree") ||
     errorStr.includes("presale") ||
     errorStr.includes("not active") ||
-    errorStr.includes("sale not started") ||
     errorStr.includes("sale closed") ||
     errorStr.includes("not open") ||
     errorStr.includes("invalid proof")
@@ -306,6 +313,9 @@ function decodeContractRevert(error: unknown): string | null {
         "error InsufficientPayment()",
         "error NotAuthorized()",
         "error OnlySeaDrop()",
+        "error MintNotStarted()",
+        "error Paused()",
+        "error Unauthorized()",
       ]),
       data: data as Hex,
     });
@@ -316,11 +326,14 @@ function decodeContractRevert(error: unknown): string | null {
       InsufficientPayment: "Insufficient payment",
       NotAuthorized: "Wallet is not authorized",
       OnlySeaDrop: "This mint must be routed through SeaDrop",
+      MintNotStarted: "Mint has not started",
+      Paused: "The contract is paused",
+      Unauthorized: "Wallet is not authorized",
     };
     const label = labels[decoded.errorName] ?? decoded.errorName;
     return `${label}${decoded.args?.length ? `: ${decoded.args.join(", ")}` : ""}`;
   } catch {
-    return `contract custom error (${data.slice(0, 10)})`;
+    return `The contract rejected the transaction (custom error ${data.slice(0, 10)}). Check the mint phase, wallet eligibility, and required payment.`;
   }
 }
 
@@ -594,6 +607,16 @@ export async function batchMint(
       totalSuccess: 0,
       totalFailed: 0,
       abortReason: "No contract found at address",
+    };
+  }
+
+  if (scan.rejectionReason) {
+    return {
+      contractAddress,
+      results: [],
+      totalSuccess: 0,
+      totalFailed: 0,
+      abortReason: scan.rejectionReason,
     };
   }
   

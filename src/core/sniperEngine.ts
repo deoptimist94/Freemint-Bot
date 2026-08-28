@@ -316,8 +316,8 @@ async function pollChain(
         notifyCallback(
           `Whale Mint Detected (${matchedWallet.label || "Tracked"}) - ${badge} ${name}\n\n` +
           (viaRouter
-            ? `Target: ${mintTarget} (via SeaDrop)\n`
-            : `Target: ${mintTarget}\n`) +
+            ? `Target: \`${mintTarget}\` (via SeaDrop)\n`
+            : `Target: \`${mintTarget}\`\n`) +
           `Value: ${valueEth} ETH\n` +
           `Tx: ${tx.hash}\n\n` +
           `Attempting copy-mint...`
@@ -335,13 +335,13 @@ async function pollChain(
         if (result.results.length === 0) {
           notifyCallback(
             `Copy-Mint Skipped\n` +
-            `Contract: ${mintTarget}\n` +
+            `Contract: \`${mintTarget}\`\n` +
             `Reason: ${result.abortReason || "No result"}`
           );
         } else {
           let msg = 
             `Copy-Mint Result\n\n` +
-            `Contract: ${mintTarget}\n` +
+            `Contract: \`${mintTarget}\`\n` +
             `Success: ${result.totalSuccess} Failed: ${result.totalFailed}\n\n`;
           
           for (const r of result.results) {

@@ -113,7 +113,7 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
     // FIXED: Use event.securityScore directly
     message =
       `FREE MINT DETECTED ${badge}\n\n` +
-      `Contract: ${event.contractAddress}\n` +
+      `Contract: \`${event.contractAddress}\`\n` +
       `Chain: ${event.chain.toUpperCase()}\n` +
       `Security Score: ${event.securityScore}/100${gatedWarning}${sigWarning}\n\n` +
       `Auto-mint will attempt if enabled.`;
@@ -124,7 +124,7 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
     message =
       `WHALE MINT DETECTED ${badge}\n\n` +
       `Whale: ${event.whaleAddress}${label}\n` +
-      `Contract: ${event.contractAddress}\n` +
+      `Contract: \`${event.contractAddress}\`\n` +
       `Chain: ${event.chain.toUpperCase()}\n\n` +
       `Copy-mint will attempt if enabled.`;
   }

@@ -45,6 +45,9 @@ export interface ScanResult {
   requiresSignature?: boolean;
   isGated?: boolean;
   schedule?: MintSchedule;
+  deployment?: { blockNumber?: bigint; timestamp?: number };
+  supply?: { total?: bigint; max?: bigint; exhausted: boolean };
+  rejectionReason?: string;
 }
 
 export interface MintSchedule {
@@ -278,6 +281,91 @@ async function readMintSchedule(
   return undefined;
 }
 
+async function readOptionalUint(
+  address: Address,
+  abi: Abi,
+  names: string[],
+  chain: ChainId,
+): Promise<bigint | undefined> {
+  for (const item of abi) {
+    const fn = item as AbiFn;
+    if (fn.type !== "function" || !fn.name || fn.inputs?.length) continue;
+    if (!names.some((name) => fn.name!.toLowerCase() === name.toLowerCase())) continue;
+    try {
+      const value = await getPublicClient(chain).readContract({
+        address,
+        abi: [fn] as Abi,
+        functionName: fn.name,
+        args: [],
+      } as any);
+      if (typeof value === "bigint" || typeof value === "number") return BigInt(value);
+    } catch {
+      // A missing optional getter is handled as unknown.
+    }
+  }
+  return undefined;
+}
+
+async function readNftAndSupply(
+  address: Address,
+  abi: Abi,
+  chain: ChainId,
+): Promise<{ isNft: boolean; supply: ScanResult["supply"] }> {
+  const publicClient = getPublicClient(chain);
+  let isNft = false;
+  try {
+    const supportsInterface = abi.find((item) => (item as AbiFn).name === "supportsInterface");
+    if (supportsInterface) {
+      const result = await publicClient.readContract({
+        address,
+        abi: [supportsInterface] as Abi,
+        functionName: "supportsInterface",
+        args: ["0x80ac58cd"],
+      } as any);
+      isNft = result === true;
+    }
+  } catch {
+    // Fall back to the ERC-721 method surface below.
+  }
+
+  const functionNames = new Set(abi.map((item) => (item as AbiFn).name?.toLowerCase()).filter(Boolean));
+  if (!isNft) {
+    isNft = ["balanceof", "ownerof", "tokenuri"].every((name) => functionNames.has(name));
+  }
+  if (!isNft) return { isNft: false, supply: { exhausted: false } };
+
+  const total = await readOptionalUint(address, abi, ["totalSupply"], chain);
+  const max = await readOptionalUint(address, abi, ["maxSupply", "MAX_SUPPLY", "max_supply", "cap"], chain);
+  return { isNft, supply: { total, max, exhausted: total !== undefined && max !== undefined && total >= max } };
+}
+
+async function fetchDeployment(address: Address, chain: ChainId): Promise<ScanResult["deployment"]> {
+  const base = chain === "robinhood" ? "https://robinhoodchain.blockscout.com" : "https://base.blockscout.com";
+  try {
+    const response = await fetch(`${base}/api/v2/addresses/${address}`);
+    if (!response.ok) return undefined;
+    const metadata = await response.json() as Record<string, unknown>;
+    const txHash = typeof metadata.creation_transaction_hash === "string"
+      ? metadata.creation_transaction_hash
+      : undefined;
+    if (!txHash) return undefined;
+    const txResponse = await fetch(`${base}/api/v2/transactions/${txHash}`);
+    if (!txResponse.ok) return undefined;
+    const tx = await txResponse.json() as Record<string, unknown>;
+    const timestamp = typeof tx.timestamp === "string" ? Date.parse(tx.timestamp) : NaN;
+    const rawBlock = tx.block_number ?? tx.block;
+    const blockNumber = typeof rawBlock === "number" || typeof rawBlock === "string"
+      ? BigInt(rawBlock)
+      : undefined;
+    return {
+      blockNumber,
+      timestamp: Number.isNaN(timestamp) ? undefined : Math.floor(timestamp / 1000),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 function isViewOrPure(fn: AbiFn): boolean {
   return (
     fn.stateMutability === "view" ||
@@ -470,12 +558,31 @@ export async function scanContract(
   const freeMintFunctions = mintFunctions.filter((f) => f.isFreeMint);
   const security = await auditContractSecurity(checksumAddress, chain);
   const schedule = abi ? await readMintSchedule(checksumAddress as Address, abi, chain) : undefined;
+  const nftData = abi
+    ? await readNftAndSupply(checksumAddress as Address, abi, chain)
+    : { isNft: false, supply: { exhausted: false } };
+  const deployment = await fetchDeployment(checksumAddress as Address, chain);
+  const tooOld = deployment?.timestamp !== undefined &&
+    Date.now() / 1000 - deployment.timestamp > 48 * 60 * 60;
+  const rejectionReason = !nftData.isNft
+    ? "Contract does not implement ERC-721 NFT interfaces"
+    : tooOld
+    ? "Contract was deployed more than 48 hours ago"
+    : nftData.supply?.exhausted
+    ? "NFT supply is exhausted"
+    : freeMintFunctions.length === 0
+    ? "No free mint function was identified"
+    : schedule?.isLive === false
+    ? "Mint phase is not currently live"
+    : isGated || requiresSignature
+    ? "Mint requires an allowlist, merkle proof, or signature"
+    : undefined;
   
   return {
     contractAddress: checksumAddress,
     mintFunctions: freeMintFunctions.length > 0 ? freeMintFunctions : mintFunctions,
     isVerified,
-    isNft: mintFunctions.length > 0,
+    isNft: nftData.isNft,
     abi,
     bytecode,
     isContract: true,
@@ -484,6 +591,9 @@ export async function scanContract(
     requiresSignature,
     isGated,
     schedule,
+    deployment,
+    supply: nftData.supply,
+    rejectionReason,
     warning: !isVerified
       ? "Contract is unverified on explorer. No verified mint functions can be safely extracted."
       : isSeaDrop

@@ -1188,13 +1188,13 @@ async function performMint(
   const gasCheck = await withChainContext(chain, () => checkGasSafety(telegramId));
   if (!gasCheck.safe) {
     await ctx.reply(
-      `⚠️ <b>MINT ABORTED (HIGH GAS)</b>\n\n` +
-        `Current Network Gas: <code>${gasCheck.currentGwei.toFixed(4)} Gwei</code>\n` +
-        `Your Configured Max: <code>${gasCheck.maxGwei} Gwei</code>\n\n` +
-        `The bot paused this mint to prevent burning high gas fees. You can adjust your limit in <b>🛡 Settings / Gas</b>`,
+        `⚠️ MINT ABORTED (HIGH GAS)\n\n` +
+          `Current Network Gas: \`${gasCheck.currentGwei.toFixed(4)} Gwei\`\n` +
+          `Your Configured Max: \`${gasCheck.maxGwei} Gwei\`\n\n` +
+          `The bot paused this mint to prevent burning high gas fees. Adjust your limit in Settings / Gas`,
       {
         reply_markup: backToMainKeyboard(),
-        parse_mode: "HTML",
+        parse_mode: "Markdown",
       }
     );
     return;
@@ -1214,10 +1214,10 @@ async function performMint(
   const multiplier = getUserMintQuantity(telegramId);
 
   await ctx.reply(
-    `🚀 <b>Starting Mint</b> — ${htmlEscape(networkBadge(chain))}\n\n` +
+    `🚀 Starting Mint — ${networkBadge(chain)}\n\n` +
       `Contract: \`${address}\`\n` +
       `Active Wallets: ${activeCount} (x${multiplier} each)\n` +
-      `Gas Price: <code>${gasCheck.currentGwei.toFixed(4)} Gwei</code> (Safe ✅)\n\n` +
+      `Gas Price: \`${gasCheck.currentGwei.toFixed(4)} Gwei\` (Safe ✅)\n\n` +
       `Minting in progress...`,
     { parse_mode: "Markdown" }
   );
@@ -1259,9 +1259,9 @@ async function performMint(
       }
     );
   } catch (error) {
-    await ctx.reply(`❌ Mint failed: ${htmlEscape(errorMessage(error))}`, {
+    await ctx.reply(`❌ Mint failed: ${errorMessage(error)}`, {
       reply_markup: backToMainKeyboard(),
-      parse_mode: "HTML",
+      parse_mode: "Markdown",
     });
   }
 }

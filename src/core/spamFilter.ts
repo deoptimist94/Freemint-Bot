@@ -76,16 +76,18 @@ interface ContractMeta {
 
 const metaCache = new Map<string, ContractMeta>();
 const VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
-const verdictCache = new Map<string, { expiresAt: number; verdict: SpamVerdict }>();
+const verdictCache = new Map<string, { expiresAt: number; permanent: boolean; verdict: SpamVerdict }>();
 let verdictCacheLoaded = false;
 
 async function loadVerdictCache(): Promise<void> {
   if (verdictCacheLoaded) return;
   verdictCacheLoaded = true;
   try {
-    const raw = JSON.parse(await readFile(".freemint-spam-cache.json", "utf8")) as Record<string, { expiresAt: number; verdict: SpamVerdict }>;
+    const raw = JSON.parse(await readFile(".freemint-spam-cache.json", "utf8")) as Record<string, { expiresAt?: number; permanent?: boolean; verdict: SpamVerdict }>;
     for (const [key, value] of Object.entries(raw)) {
-      if (value.expiresAt > Date.now()) verdictCache.set(key, value);
+      if (value.permanent || (value.expiresAt ?? 0) > Date.now()) {
+        verdictCache.set(key, { expiresAt: value.expiresAt ?? Number.MAX_SAFE_INTEGER, permanent: value.permanent ?? false, verdict: value.verdict });
+      }
     }
   } catch {
     // A missing or corrupt local cache should never block discovery.
@@ -93,7 +95,8 @@ async function loadVerdictCache(): Promise<void> {
 }
 
 async function cacheVerdict(key: string, verdict: SpamVerdict): Promise<void> {
-  verdictCache.set(key, { expiresAt: Date.now() + VERDICT_TTL_MS, verdict });
+  const permanent = verdict.isSpam;
+  verdictCache.set(key, { expiresAt: permanent ? Number.MAX_SAFE_INTEGER : Date.now() + VERDICT_TTL_MS, permanent, verdict });
   try {
     const serialized = Object.fromEntries(verdictCache.entries());
     await writeFile(".freemint-spam-cache.json", JSON.stringify(serialized), "utf8");
@@ -237,12 +240,16 @@ export async function evaluateSpamContract(
   const cacheKey = `${chain}:${address.toLowerCase()}`;
   await loadVerdictCache();
   const cached = verdictCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.verdict;
+  if (cached && (cached.permanent || cached.expiresAt > Date.now())) return cached.verdict;
 
   const finish = async (verdict: SpamVerdict): Promise<SpamVerdict> => {
     await cacheVerdict(cacheKey, verdict);
     return verdict;
   };
+
+  if (scan.rejectionReason) {
+    return finish({ isSpam: true, reason: scan.rejectionReason });
+  }
 
   // 1) Known spam deployer — one cheap Blockscout v2 call.
   const meta = await fetchContractMeta(address, chain);

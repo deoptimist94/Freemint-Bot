@@ -317,7 +317,22 @@ async function processDiscovery(
   const hasValidFreeMint = scan.mintFunctions.some(
     (fn) => fn.isFreeMint && !fn.requiresPayment
   );
-  if ((!scan.isVerified && !trustedWrapper) || scan.security.riskScore > 20 || !hasValidFreeMint) {
+  if (scan.schedule?.isLive === false) {
+    const startsAt = scan.schedule.startsAt;
+    if (startsAt && startsAt > Math.floor(Date.now() / 1000) && !scan.isGated && !scan.requiresSignature) {
+      upcomingSchedules.set(`${chain}:${scan.contractAddress.toLowerCase()}`, { scan, chain, txHash });
+      await processUpcomingSchedules();
+      return;
+    } else {
+      console.log(`Skipping ended mint: ${contractAddress}`);
+    }
+    markSkipped(chain, contractAddress);
+    return;
+  }
+
+  const spamCheck = await evaluateSpamContract(scan, chain);
+  if (spamCheck.isSpam) {
+    console.log(`Skipping spam/dead contract: ${contractAddress} — ${spamCheck.reason}`);
     markSkipped(chain, contractAddress);
     return;
   }
@@ -328,21 +343,9 @@ async function processDiscovery(
     return;
   }
 
-  const spamCheck = await evaluateSpamContract(scan, chain);
-  if (spamCheck.isSpam) {
-    console.log(`Skipping spam contract: ${contractAddress} — ${spamCheck.reason}`);
+  if ((!scan.isVerified && !trustedWrapper) || scan.security.riskScore > 20 || !hasValidFreeMint || scan.rejectionReason) {
+    if (scan.rejectionReason) console.log(`Skipping discovery ${contractAddress}: ${scan.rejectionReason}`);
     markSkipped(chain, contractAddress);
-    return;
-  }
-
-  if (scan.schedule?.isLive === false) {
-    const startsAt = scan.schedule.startsAt;
-    if (startsAt && startsAt > Math.floor(Date.now() / 1000)) {
-      upcomingSchedules.set(`${chain}:${scan.contractAddress.toLowerCase()}`, { scan, chain, txHash });
-      await processUpcomingSchedules();
-    } else {
-      console.log(`Skipping ended mint: ${contractAddress}`);
-    }
     return;
   }
 
