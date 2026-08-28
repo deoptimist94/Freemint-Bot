@@ -24,7 +24,7 @@ export interface SpamVerdict {
   reason?: string;
 }
 
-const DEFAULT_MAX_AGE_DAYS = 7;
+const DEFAULT_MAX_AGE_DAYS = 2;
 
 // Deployers observed deploying UnlimitedMintNFT spam farms on Base
 // (verified 2026-08-24 across 5 flagged contracts).

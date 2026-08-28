@@ -1,6 +1,7 @@
 import { type ChainId } from "./chains.js";
 import { getRPCPool } from "./rpcPool.js";
 import { isZeroTransactionValue } from "./listener.js";
+import { evaluateNftEligibility } from "./scanner.js";
 
 const MINT_SELECTORS = new Set([
   "0x1249c58b", // mint()
@@ -158,6 +159,17 @@ export class MempoolMonitor {
 
     const selector = tx.input.slice(0, 10).toLowerCase();
     if (!MINT_SELECTORS.has(selector)) return;
+
+    const target = String(tx.to).toLowerCase();
+    try {
+      const { scanContract } = await import("./scanner.js");
+      const scan = await scanContract(target, this.chain);
+      if (!scan.isNft || scan.rejectionReason || !scan.mintFunctions.length) {
+        return;
+      }
+    } catch {
+      return;
+    }
 
     const now = Date.now();
     if (this.processedTxs.has(tx.hash)) {

@@ -9,6 +9,7 @@ import { batchMint, type MintOptions } from "./mint.js";
 import { withChainContext } from "./chainContext.js";
 import type { ChainId } from "./chains.js";
 import { getChainsForSelection, getUserChainSelection } from "./userChain.js";
+import { evaluateNftEligibility, scanContract } from "./scanner.js";
 
 interface WhaleTransaction {
   hash: string;
@@ -302,6 +303,11 @@ async function pollChain(
           tx.to, 
           tx.input
         );
+
+        const eligibility = await scanContract(mintTarget, chain);
+        if (!eligibility.isNft || eligibility.rejectionReason) {
+          continue;
+        }
         
         const valueEth = tx.value 
           ? (Number(tx.value) / 1e18).toFixed(4) 

@@ -421,7 +421,7 @@ async function processUser(
     await bot.api.sendMessage(
       Number(user.telegramId),
       `FREE MINT DETECTED ${badge}\n\n` +
-      `Contract: ${scan.contractAddress}\n` +
+      `Contract: \`${scan.contractAddress}\`\n` +
       `Chain: ${chain.toUpperCase()}\n` +
       `Security Score: ${scan.security?.riskScore || 'N/A'}/100${gatedWarning}\n\n` +
       `${user.autoMintEnabled ? 'Auto-mint has been queued.' : 'Use /bypass to attempt mint manually.'}`,

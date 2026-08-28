@@ -91,8 +91,47 @@ export function setUserMintQuantity(userId: bigint, quantity: number): void {
   userMintQuantities.set(userId, Math.max(1, Math.min(quantity, 10)));
 }
 
+const CUSTOM_ERROR_DICTIONARY: Record<string, string> = {
+  MintEnded: "Mint has ended.",
+  MaxSupplyReached: "Max supply has been reached.",
+  WalletLimitExceeded: "This wallet has reached its mint limit.",
+  ApprovalQueryForNonexistentToken: "Approval was requested for a nonexistent token.",
+  InvalidProof: "The allowlist proof is invalid.",
+  SaleNotActive: "Mint is not active at this time.",
+  SaleNotStarted: "The mint has not started yet.",
+  SoldOut: "The collection is sold out.",
+  AlreadyClaimed: "This wallet has already claimed a token.",
+  OnlySeaDrop: "This mint must be routed through SeaDrop.",
+  NotEligible: "This wallet is not eligible for the mint.",
+  InsufficientPayment: "The required payment was not provided.",
+  NotAuthorized: "The caller is not authorized for this mint.",
+};
+
 export function classifyMintError(error: unknown): ClassifiedError {
-  const errorStr = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  const errorString = error instanceof Error ? error.message : String(error);
+  const errorStr = errorString.toLowerCase();
+
+  const mappedCustom = Object.entries(CUSTOM_ERROR_DICTIONARY).find(([name]) =>
+    errorString.includes(name) || errorStr.includes(name.toLowerCase())
+  );
+  if (mappedCustom) {
+    const [name, description] = mappedCustom;
+    const category = name === "MaxSupplyReached" || name === "SoldOut" || name === "MintEnded"
+      ? "SOLD_OUT"
+      : name === "InvalidProof" || name === "NotEligible"
+        ? "WHITELIST"
+        : name === "WalletLimitExceeded"
+          ? "SOLD_OUT"
+          : name === "OnlySeaDrop"
+            ? "SIGNATURE"
+            : "SIMULATION_FAILED";
+    return {
+      category,
+      message: errorString,
+      retryable: false,
+      userFriendly: description,
+    };
+  }
   
   if (
     errorStr.includes("alreadyclaimed") ||
@@ -106,9 +145,9 @@ export function classifyMintError(error: unknown): ClassifiedError {
   ) {
     return {
       category: "SOLD_OUT",
-      message: errorStr,
+      message: errorString,
       retryable: false,
-      userFriendly: `MINT UNAVAILABLE: ${errorStr.slice(0, 160)}`,
+      userFriendly: "Mint is unavailable or sold out.",
     };
   }
 
@@ -276,7 +315,7 @@ export function classifyMintError(error: unknown): ClassifiedError {
       category: "SIMULATION_FAILED",
       message: errorStr,
       retryable: true,
-      userFriendly: `SIMULATION FAILED: ${errorStr.slice(0, 160)}`,
+      userFriendly: "Mint simulation failed. The contract rejected the call before execution.",
     };
   }
   
@@ -310,6 +349,9 @@ function decodeContractRevert(error: unknown): string | null {
         "error MintEnded()",
         "error MintNotActive()",
         "error MaxMintPerWalletExceeded()",
+        "error MaxSupplyReached()",
+        "error WalletLimitExceeded()",
+        "error ApprovalQueryForNonexistentToken()",
         "error InsufficientPayment()",
         "error NotAuthorized()",
         "error OnlySeaDrop()",
@@ -323,12 +365,17 @@ function decodeContractRevert(error: unknown): string | null {
       MintEnded: "Mint has ended",
       MintNotActive: "Mint is not active",
       MaxMintPerWalletExceeded: "Maximum mint per wallet exceeded",
+      MaxSupplyReached: "Max supply has been reached",
+      WalletLimitExceeded: "This wallet has reached its mint limit",
+      ApprovalQueryForNonexistentToken: "Approval was requested for a nonexistent token",
       InsufficientPayment: "Insufficient payment",
       NotAuthorized: "Wallet is not authorized",
       OnlySeaDrop: "This mint must be routed through SeaDrop",
       MintNotStarted: "Mint has not started",
       Paused: "The contract is paused",
       Unauthorized: "Wallet is not authorized",
+      InvalidProof: "The allowlist proof is invalid",
+      SoldOut: "The collection is sold out",
     };
     const label = labels[decoded.errorName] ?? decoded.errorName;
     return `${label}${decoded.args?.length ? `: ${decoded.args.join(", ")}` : ""}`;

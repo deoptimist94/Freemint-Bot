@@ -306,6 +306,74 @@ async function readOptionalUint(
   return undefined;
 }
 
+export function evaluateNftEligibility(input: {
+  abi?: Abi | null;
+  bytecode?: Hex | null;
+  mintFunctions?: MintFunctionInfo[];
+}): { isNft: boolean; reason?: string } {
+  const abiItems = Array.isArray(input.abi) ? input.abi : [];
+  const functionNames = new Set(
+    abiItems
+      .map((item) => (item as AbiFn).name?.toLowerCase())
+      .filter((name): name is string => Boolean(name))
+  );
+
+  const bytecode = (input.bytecode ?? "0x").toLowerCase();
+  const hasInterfaceMarker = bytecode.includes("80ac58cd");
+  const hasSupportsInterface = functionNames.has("supportsinterface");
+  const hasNftSurface = ["balanceof", "ownerof", "tokenuri"].every((name) => functionNames.has(name));
+  const hasMintSurface = (input.mintFunctions?.length ?? 0) > 0 || abiItems.some((item) => {
+    const fn = item as AbiFn;
+    return fn.type === "function" && fn.name && looksLikeMint(fn);
+  });
+
+  const genericTokenNames = [
+    "symbol",
+    "name",
+    "decimals",
+    "approve",
+    "allowance",
+    "transfer",
+    "transferfrom",
+    "permit",
+    "swap",
+    "addliquidity",
+    "removeliquidity",
+    "quote",
+  ];
+  const hasGenericTokenShape = genericTokenNames.some((name) => functionNames.has(name));
+  const hasRouterShape = [
+    "swapexactethfortokens",
+    "swapexacttokensfortokens",
+    "addliquidity",
+    "removeliquidity",
+    "getamountsout",
+    "getamountsinin",
+    "multicall",
+    "weth",
+  ].some((name) => functionNames.has(name));
+
+  if (hasSupportsInterface || hasInterfaceMarker || hasNftSurface) {
+    return { isNft: true };
+  }
+
+  if (hasMintSurface && !hasGenericTokenShape && !hasRouterShape) {
+    return { isNft: true };
+  }
+
+  if (hasGenericTokenShape || hasRouterShape) {
+    return {
+      isNft: false,
+      reason: "Contract is an ERC-20/router or non-NFT token; skipping silently",
+    };
+  }
+
+  return {
+    isNft: false,
+    reason: "Contract does not implement ERC-721 NFT interfaces or a compliant mint surface",
+  };
+}
+
 async function readNftAndSupply(
   address: Address,
   abi: Abi,
@@ -325,12 +393,12 @@ async function readNftAndSupply(
       isNft = result === true;
     }
   } catch {
-    // Fall back to the ERC-721 method surface below.
+    // Fall back to explicit NFT surface and abi validation.
   }
 
-  const functionNames = new Set(abi.map((item) => (item as AbiFn).name?.toLowerCase()).filter(Boolean));
+  const eligibility = evaluateNftEligibility({ abi, mintFunctions: analyzeAbiForMintFunctions(abi) });
   if (!isNft) {
-    isNft = ["balanceof", "ownerof", "tokenuri"].every((name) => functionNames.has(name));
+    isNft = eligibility.isNft;
   }
   if (!isNft) return { isNft: false, supply: { exhausted: false } };
 
@@ -564,8 +632,9 @@ export async function scanContract(
   const deployment = await fetchDeployment(checksumAddress as Address, chain);
   const tooOld = deployment?.timestamp !== undefined &&
     Date.now() / 1000 - deployment.timestamp > 48 * 60 * 60;
-  const rejectionReason = !nftData.isNft
-    ? "Contract does not implement ERC-721 NFT interfaces"
+  const nftEligibility = evaluateNftEligibility({ abi, bytecode, mintFunctions });
+  const rejectionReason = !nftEligibility.isNft || !nftData.isNft
+    ? nftEligibility.reason ?? "Contract does not implement ERC-721 NFT interfaces"
     : tooOld
     ? "Contract was deployed more than 48 hours ago"
     : nftData.supply?.exhausted

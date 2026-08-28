@@ -205,8 +205,28 @@ export function getBypassPlan(result: ScanResult): BypassPlan {
   };
 }
 
+const CUSTOM_REVERT_MAP: Record<string, string> = {
+  MintEnded: "Mint has ended.",
+  MaxSupplyReached: "Max supply has been reached.",
+  WalletLimitExceeded: "This wallet has reached its mint limit.",
+  ApprovalQueryForNonexistentToken: "Approval was requested for a nonexistent token.",
+  InvalidProof: "The allowlist proof is invalid.",
+  SaleNotActive: "Mint is not active at this time.",
+  SaleNotStarted: "The mint has not started yet.",
+  SoldOut: "The collection is sold out.",
+};
+
 export function classifyRevertReason(reason: string): GateType | undefined {
   const lower = reason.toLowerCase();
+  const mapped = Object.entries(CUSTOM_REVERT_MAP).find(([name]) => lower.includes(name.toLowerCase()));
+  if (mapped) {
+    const [name, text] = mapped;
+    if (name === "InvalidProof") return "whitelist";
+    if (name === "SaleNotStarted" || name === "SaleNotActive") return "timed";
+    if (name === "MaxSupplyReached" || name === "SoldOut" || name === "MintEnded") return "none";
+    if (name === "WalletLimitExceeded") return "none";
+    if (text) return "unknown";
+  }
   
   if (lower.includes("whitelist") || lower.includes("allowlist") || lower.includes("merkle") || lower.includes("not on list")) {
     return "whitelist";

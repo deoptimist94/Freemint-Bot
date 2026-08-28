@@ -168,7 +168,14 @@ export class DropListener {
       const hasValidFreeMint = scan.mintFunctions.some(
         (fn) => fn.isFreeMint && !fn.requiresPayment
       );
-      if ((!scan.isVerified && !isTrusted) || scan.security.riskScore > 20 || !hasValidFreeMint) {
+      if (
+        !scan.isNft ||
+        scan.rejectionReason ||
+        (!scan.isVerified && !isTrusted) ||
+        scan.security.riskScore > 20 ||
+        !hasValidFreeMint ||
+        (scan.deployment?.timestamp !== undefined && Date.now() / 1000 - scan.deployment.timestamp > 48 * 60 * 60)
+      ) {
         continue;
       }
 
