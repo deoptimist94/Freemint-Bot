@@ -348,7 +348,6 @@ export async function showPortfolio(ctx: Context, telegramId: bigint): Promise<v
         lines.push(`**${networkBadge(chain)}**`);
       }
 
-      // Sell targets are Base-only
       if (chain === "base") {
         for (const item of portfolio.items) {
           setSellTarget(telegramId, wallet.id, item.tokenId, {
@@ -1149,8 +1148,16 @@ async function performScan(
 
       await addToWatchlist(telegramId, address);
 
+      // Explicitly renders the confirm/batch mint buttons like your reference screenshots
+      const keyboard = new InlineKeyboard()
+        .text("🚀 Batch Mint Now", `confirm_mint_${address.replace(/^0x/, "")}_${chain}`)
+        .row()
+        .text("✅ Confirm Mint", `confirm_mint_${address.replace(/^0x/, "")}_${chain}`)
+        .row()
+        .text("❌ Cancel", "main_menu");
+
       await ctx.reply(text, {
-        reply_markup: confirmMintKeyboard(address, chain),
+        reply_markup: keyboard,
         parse_mode: "HTML",
       });
     } else {
