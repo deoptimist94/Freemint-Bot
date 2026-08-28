@@ -170,6 +170,10 @@ export function startFloorWatcher(bot: Bot<any>, intervalSeconds: number = 300) 
     }
   };
 
-  setTimeout(runCheck, 15_000);
-  setInterval(runCheck, intervalSeconds * 1000);
+  const initialTimeout = setTimeout(runCheck, 15_000);
+  const interval = setInterval(runCheck, intervalSeconds * 1000);
+  return () => {
+    clearTimeout(initialTimeout);
+    clearInterval(interval);
+  };
 }

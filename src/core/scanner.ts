@@ -61,6 +61,25 @@ type ExplorerJson = {
   result?: unknown;
 };
 
+const EIP1167_PREFIX = "363d3d373d3d3d363d73";
+const EIP1167_SUFFIX = "5af43d82803e903d91602b57fd5bf3";
+
+export function extractEIP1167Implementation(bytecode: Hex): Address | null {
+  const normalized = bytecode.toLowerCase().replace(/^0x/, "");
+  const prefixIndex = normalized.indexOf(EIP1167_PREFIX);
+  if (prefixIndex < 0) return null;
+
+  const addressStart = prefixIndex + EIP1167_PREFIX.length;
+  const addressEnd = addressStart + 40;
+  const suffixStart = addressEnd;
+  if (normalized.slice(suffixStart, suffixStart + EIP1167_SUFFIX.length) !== EIP1167_SUFFIX) {
+    return null;
+  }
+
+  const implementation = `0x${normalized.slice(addressStart, addressEnd)}`;
+  return isAddress(implementation) ? getAddress(implementation) : null;
+}
+
 const PAID_MINT_PATTERNS = [
   "mintwitheth",
   "paidmint",
@@ -155,36 +174,59 @@ async function getBytecode(
   }
 }
 
+async function fetchExplorerJson(url: string): Promise<ExplorerJson | null> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return await response.json() as ExplorerJson;
+      if (![429, 500, 502, 503, 504].includes(response.status)) return null;
+    } catch {
+      if (attempt === 2) return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** attempt));
+  }
+  return null;
+}
+
 async function fetchAbiFromExplorer(
   address: Address,
-  chain: ChainId
+  chain: ChainId,
+  visited = new Set<string>()
 ): Promise<Abi | null> {
   const config = getChainConfig(chain);
-  
+  const key = address.toLowerCase();
+  if (visited.has(key)) return null;
+  visited.add(key);
+
   try {
-    if (config.abiSource.type === "etherscanV2") {
-      const apiKey = process.env[config.abiSource.apiKeyEnv] || explorerApiKey();
-      const url = `${config.explorerApiUrl}?module=contract&action=getabi&address=${address}&apikey=${apiKey}`;
-      
-      const res = await fetch(url);
-      const json = await res.json() as ExplorerJson;
-      
-      if (json.status === "1" && json.result) {
-        return JSON.parse(json.result as string) as Abi;
-      }
-    } else if (config.abiSource.type === "blockscout") {
-      const url = `${config.abiSource.apiUrl}?module=contract&action=getabi&address=${address}`;
-      const res = await fetch(url);
-      const json = await res.json() as ExplorerJson;
-      
-      if (json.status === "1" && json.result) {
-        return JSON.parse(json.result as string) as Abi;
-      }
+    const apiKey = config.abiSource.type === "etherscanV2"
+      ? process.env[config.abiSource.apiKeyEnv] || explorerApiKey()
+      : "";
+    const chainParam = config.abiSource.type === "etherscanV2"
+      ? `&chainid=${config.abiSource.chainParam}`
+      : "";
+    const keyParam = apiKey ? `&apikey=${encodeURIComponent(apiKey)}` : "";
+    const abiUrl = `${config.abiSource.apiUrl}?module=contract&action=getabi&address=${address}${chainParam}${keyParam}`;
+    const abiJson = await fetchExplorerJson(abiUrl);
+
+    if (abiJson?.status === "1" && abiJson.result) {
+      const parsed = typeof abiJson.result === "string"
+        ? JSON.parse(abiJson.result)
+        : abiJson.result;
+      if (Array.isArray(parsed)) return parsed as Abi;
     }
+
+    // Explorer proxy metadata is useful when the proxy has no source/ABI of its own.
+    const sourceUrl = `${config.abiSource.apiUrl}?module=contract&action=getsourcecode&address=${address}${chainParam}${keyParam}`;
+    const sourceJson = await fetchExplorerJson(sourceUrl);
+    const source = Array.isArray(sourceJson?.result) ? sourceJson.result[0] as Record<string, unknown> : undefined;
+    const implementation = typeof source?.Implementation === "string" && isAddress(source.Implementation)
+      ? getAddress(source.Implementation)
+      : null;
+    if (implementation) return fetchAbiFromExplorer(implementation, chain, visited);
   } catch (err) {
     console.error("Failed to fetch ABI:", err);
-  }
-  
+    }
   return null;
 }
 
@@ -339,10 +381,10 @@ export async function scanContract(
 ): Promise<ScanResult> {
   const checksumAddress = isAddress(address) ? getAddress(address) : address;
   
-  const [bytecode, abi] = await Promise.all([
-    getBytecode(checksumAddress as Address, chain),
-    fetchAbiFromExplorer(checksumAddress as Address, chain),
-  ]);
+  const bytecode = await getBytecode(checksumAddress as Address, chain);
+  const implementation = bytecode ? extractEIP1167Implementation(bytecode) : null;
+  const abi = await fetchAbiFromExplorer(checksumAddress as Address, chain) ??
+    (implementation ? await fetchAbiFromExplorer(implementation, chain) : null);
   
   if (!bytecode) {
     return {
@@ -374,7 +416,7 @@ export async function scanContract(
     name: f.name, 
     stateMutability: f.stateMutability,
     payable: f.stateMutability === "payable"
-  }));
+  })) || (abi?.some((item) => (item as AbiFn).name?.toLowerCase().includes("seadrop")) ?? false);
   
   const { isGated, requiresSignature } = detectGateTypeFromFunctions(mintFunctions);
   const freeMintFunctions = mintFunctions.filter((f) => f.isFreeMint);

@@ -134,8 +134,12 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
 
   console.log(`Broadcasting ${event.type} to ${eligibleSubscribers.length} users`);
 
-  const results = await Promise.allSettled(
-    eligibleSubscribers.map(async (sub) => {
+  const results: PromiseSettledResult<{ success: boolean; userId: bigint; error?: string }>[] = [];
+  const CHUNK_SIZE = 20;
+  for (let index = 0; index < eligibleSubscribers.length; index += CHUNK_SIZE) {
+    const chunk = eligibleSubscribers.slice(index, index + CHUNK_SIZE);
+    results.push(...await Promise.allSettled(
+      chunk.map(async (sub) => {
       try {
         await bot.api.sendMessage(Number(sub.telegramId), message, {
           parse_mode: 'Markdown',
@@ -154,8 +158,12 @@ export async function broadcastEvent(bot: Bot, event: BotEvent): Promise<void> {
         const errorMessage = err instanceof Error ? err.message : String(err);
         return { success: false, userId: sub.telegramId, error: errorMessage };
       }
-    })
-  );
+      })
+    ));
+    if (index + CHUNK_SIZE < eligibleSubscribers.length) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+  }
 
   const successCount = results.filter(
     (result) => result.status === 'fulfilled' && result.value.success

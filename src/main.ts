@@ -9,7 +9,7 @@ import { createBot } from "./bot/index.js";
 import { startHealthServer } from "./server/health.js";
 import { startAutoMintLoop } from "./core/autoMint.js";
 import { prisma } from "./db/client.js";
-import { DropListener } from "./core/listener.js";
+import { DropListener, isTrustedWrapper } from "./core/listener.js";
 import {
   scanContract,
   getBestMintFunction,
@@ -21,7 +21,7 @@ import { batchMint } from "./core/mint.js";
 import type { ChainId } from "./core/chains.js";
 import { getChainsForSelection, getUserChainSelection } from "./core/userChain.js";
 import { MempoolMonitor, type MempoolMint } from "./core/mempoolSniper.js";
-import { getRPCPool, getRPCStats } from "./core/rpcPool.js";
+import { getRPCPool, getRPCStats, destroyRPCPools } from "./core/rpcPool.js";
 import { mintQueue, discoveryQueue, closeQueues } from "./core/queue.js";
 import { loadSubscribers } from "./core/broadcaster.js";
 import { discoveryMintKeyboard } from "./bot/keyboards.js";
@@ -49,13 +49,6 @@ function markSkipped(chain: ChainId, address: string): void {
     const firstKey = skipCache.keys().next().value;
     if (firstKey) skipCache.delete(firstKey);
   }
-}
-
-function isTrustedWrapper(address: string): boolean {
-  return (process.env.TRUSTED_WRAPPER_ADDRESSES || "")
-    .split(",")
-    .map((value) => value.trim().toLowerCase())
-    .includes(address.toLowerCase());
 }
 
 async function main() {
@@ -125,8 +118,8 @@ async function main() {
 
   bot = createBot();
   startHealthServer(bot);
-  startAutoMintLoop(bot);
-  startFloorWatcher(bot, 300);
+  const stopAutoMintLoop = startAutoMintLoop(bot);
+  const stopFloorWatcher = startFloorWatcher(bot, 300);
 
   console.log("Starting mempool monitors");
   const baseMempool = new MempoolMonitor("base", handleMempoolMint("base"));
@@ -150,7 +143,7 @@ async function main() {
   }
 
   // Copy-trade scheduler
-  setInterval(async () => {
+  const copyTradeInterval = setInterval(async () => {
     try {
       const configs = await prisma.sniperConfig.findMany({
         where: { autoCopy: true },
@@ -164,7 +157,7 @@ async function main() {
   }, 15000);
 
   // RPC stats logging
-  setInterval(() => {
+  const rpcStatsInterval = setInterval(() => {
     console.log("RPC Pool Stats:");
     console.log("  Base:", getRPCStats("base"));
     if (hasRobinhoodAlchemy) {
@@ -179,8 +172,13 @@ async function main() {
     monitors.forEach(m => m.stop());
     dropListener.stop();
     robinhoodListener?.stop();
+    stopAutoMintLoop();
+    stopFloorWatcher();
+    clearInterval(copyTradeInterval);
+    clearInterval(rpcStatsInterval);
 
     await closeQueues();
+    destroyRPCPools();
     await bot.stop();
     await prisma.$disconnect();
 

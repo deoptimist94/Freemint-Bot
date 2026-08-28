@@ -74,6 +74,11 @@ export interface ClassifiedError {
 }
 
 const userMintQuantities = new Map<bigint, number>();
+const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5" as Address;
+const SEADROP_ABI = parseAbi([
+  "function getFeesAndRecipient(address nftContract) view returns (uint256 fee, address feeRecipient)",
+  "function mintPublic(address nftContract, address feeRecipient, address minter, uint256 quantity) payable",
+] as const);
 
 export function getUserMintQuantity(userId: bigint): number {
   return userMintQuantities.get(userId) ?? 1;
@@ -376,7 +381,8 @@ async function executeSingleMint(
   mintFunction: MintFunctionInfo,
   chain: ChainId,
   iteration: number = 1,
-  options?: MintOptions
+  options?: MintOptions,
+  quantity = 1
 ): Promise<MintResult> {
   const config = getChainConfig(chain);
   const maxRetries = options?.maxRetries ?? 3;
@@ -396,25 +402,44 @@ async function executeSingleMint(
         throw new Error("Gas price exceeds safety limit");
       }
       
-      const args = generateMintArgs(mintFunction, wallet.address, getUserMintQuantity(BigInt(0)));
-      
-      const abiItem = parseAbi([
-        `function ${mintFunction.name}(${mintFunction.args.join(",")})`,
-      ] as const);
-      
-      const data = encodeFunctionData({
-        abi: abiItem,
-        functionName: mintFunction.name,
-        args: args as any,
-      });
+      let target = getAddress(nftContract);
+      let value = 0n;
+      let data: Hex;
+
+      if (options?.seaDropContext?.isViaRouter) {
+        const feeResult = await publicClient.readContract({
+          address: SEADROP_ROUTER,
+          abi: SEADROP_ABI,
+          functionName: "getFeesAndRecipient",
+          args: [getAddress(nftContract)],
+        });
+        const [fee, feeRecipient] = feeResult as readonly [bigint, Address];
+        target = SEADROP_ROUTER;
+        value = fee * BigInt(quantity);
+        data = encodeFunctionData({
+          abi: SEADROP_ABI,
+          functionName: "mintPublic",
+          args: [getAddress(nftContract), feeRecipient, getAddress(wallet.address), BigInt(quantity)],
+        });
+      } else {
+        const args = generateMintArgs(mintFunction, wallet.address, quantity);
+        const abiItem = parseAbi([
+          `function ${mintFunction.name}(${mintFunction.args.join(",")})`,
+        ] as const);
+        data = encodeFunctionData({
+          abi: abiItem,
+          functionName: mintFunction.name,
+          args: args as any,
+        });
+      }
       
       // PRE-FLIGHT SIMULATION
       try {
         await publicClient.call({
           data,
-          to: getAddress(nftContract),
+          to: target,
           account: getAddress(wallet.address),
-          value: 0n,
+          value,
         });
         console.log(`✅ Pre-flight simulation passed for ${wallet.label}`);
       } catch (simError: unknown) {
@@ -444,9 +469,9 @@ async function executeSingleMint(
       try {
         const estimate = await publicClient.estimateGas({
           account: walletClient.account!,
-          to: getAddress(nftContract),
+          to: target,
           data,
-          value: 0n,
+          value,
         });
         gasLimit = (estimate * 130n) / 100n;
       } catch (gasErr) {
@@ -457,9 +482,9 @@ async function executeSingleMint(
       // Send transaction with aggressive gas
       const txHash = await walletClient.sendTransaction({
         account: walletClient.account!,
-        to: getAddress(nftContract),
+        to: target,
         data,
-        value: 0n,
+        value,
         gas: gasLimit,
         maxFeePerGas: gasStrategy.maxFeePerGas,
         maxPriorityFeePerGas: gasStrategy.maxPriorityFeePerGas,
@@ -577,8 +602,8 @@ export async function batchMint(
     };
   }
   
-  const quantity = getUserMintQuantity(userId);
-  const rounds = quantity;
+  const quantity = options?.seaDropContext?.quantity ?? getUserMintQuantity(userId);
+  const rounds = 1;
   const allResults: MintResult[] = [];
   
   const CONCURRENCY = 3;
@@ -600,7 +625,8 @@ export async function batchMint(
               mintFn,
               chain,
               round,
-              options
+              options,
+              quantity
             );
             
             allResults.push(res);

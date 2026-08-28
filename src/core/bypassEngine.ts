@@ -88,6 +88,11 @@ const PROBE_NAME_RE =
   /^(public|whitelist|allowlist|presale|sale|mint|free|phase|start|end|open|active|live|paused|supply|max|price|total)/i;
 
 const MAX_PROBE_READS = 24;
+const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5" as Address;
+const SEADROP_ABI = parseAbi([
+  "function getFeesAndRecipient(address nftContract) view returns (uint256 fee, address feeRecipient)",
+  "function mintPublic(address nftContract, address feeRecipient, address minter, uint256 quantity) payable",
+] as const);
 
 const PUBLIC_START_KEYS = [
   "publicSaleStartTime",
@@ -100,6 +105,45 @@ const PUBLIC_START_KEYS = [
   "publicSaleTime",
   "startTime",
 ];
+
+async function buildMintCall(
+  result: ScanResult,
+  address: string,
+  from: string,
+  fn: MintFunctionInfo,
+  args: unknown[],
+  client: any
+): Promise<{ target: Address; data: Hex; value: bigint }> {
+  if (result.isSeaDrop) {
+    const [fee, feeRecipient] = await client.readContract({
+      address: SEADROP_ROUTER,
+      abi: SEADROP_ABI,
+      functionName: "getFeesAndRecipient",
+      args: [getAddress(address)],
+    }) as readonly [bigint, Address];
+    const quantity = args.find((arg, index) => fn.args[index]?.toLowerCase().startsWith("uint")) as bigint | undefined;
+    const mintQuantity = quantity && quantity > 0n ? quantity : 1n;
+    return {
+      target: SEADROP_ROUTER,
+      data: encodeFunctionData({
+        abi: SEADROP_ABI,
+        functionName: "mintPublic",
+        args: [getAddress(address), feeRecipient, getAddress(from), mintQuantity],
+      }),
+      value: fee * mintQuantity,
+    };
+  }
+
+  return {
+    target: getAddress(address),
+    data: encodeFunctionData({
+      abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`]),
+      functionName: fn.name,
+      args: args as any,
+    }),
+    value: 0n,
+  };
+}
 
 export function detectGateType(mintFunctions: MintFunctionInfo[]): GateType {
   if (!mintFunctions || mintFunctions.length === 0) return "none";
@@ -280,17 +324,14 @@ async function tryMatrix(
     
     for (const args of argVariations) {
       try {
-        const data = encodeFunctionData({
-          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`]),
-          functionName: fn.name,
-          args: args as any,
-        });
+        const call = await buildMintCall(result, address, attempts[0], fn, args, client);
+        const { data, target, value } = call;
         
         await client.call({
           data,
-          to: getAddress(address),
+          to: target,
           from: getAddress(attempts[0]),
-          value: 0n,
+          value,
         });
         
         if (!options.dryRun && !options.probeOnly) {
@@ -306,9 +347,9 @@ async function tryMatrix(
                 
                 const gasEstimate = await client.estimateGas({
                   account: walletClient.account!,
-                  to: getAddress(address),
+                  to: target,
                   data,
-                  value: 0n,
+                  value,
                 }).catch(() => 300000n);
                 
                 const txHash = await walletClient.sendTransaction({
@@ -391,17 +432,14 @@ async function tryDirectMint(
     
     for (const args of argVariations) {
       try {
-        const data = encodeFunctionData({
-          abi: parseAbi([`function ${fn.name}(${fn.args.join(",")})`]),
-          functionName: fn.name,
-          args: args as any,
-        });
+        const call = await buildMintCall(result, address, from, fn, args, client);
+        const { data, target, value } = call;
         
         await client.call({
           data,
-          to: getAddress(address),
+          to: target,
           from: getAddress(from),
-          value: 0n,
+          value,
         });
         
         if (!options.dryRun && !options.probeOnly) {
@@ -416,9 +454,9 @@ async function tryDirectMint(
               
               const gasEstimate = await client.estimateGas({
                 account: walletClient.account!,
-                to: getAddress(address),
+                to: target,
                 data,
-                value: 0n,
+                value,
               }).catch(() => 300000n);
               
               const txHash = await walletClient.sendTransaction({

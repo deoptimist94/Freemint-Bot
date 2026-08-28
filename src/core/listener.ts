@@ -35,13 +35,23 @@ const MAX_SEEN = 2000;
 const BASE_RECONNECT_MS = 2000;
 const MAX_RECONNECT_MS = 30000;
 
-function trustedWrapperAddresses(): Set<string> {
+export function isTrustedWrapper(address: string): boolean {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return false;
   return new Set(
     (process.env.TRUSTED_WRAPPER_ADDRESSES || "")
       .split(",")
       .map((address) => address.trim().toLowerCase())
       .filter((address) => /^0x[a-f0-9]{40}$/.test(address))
-  );
+  ).has(address.toLowerCase());
+}
+
+export function isZeroTransactionValue(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  try {
+    return BigInt(value as bigint | string | number) === 0n;
+  } catch {
+    return false;
+  }
 }
 
 export class DropListener {
@@ -134,7 +144,7 @@ export class DropListener {
     
     for (const tx of txs) {
       if (!tx?.to || !tx?.input || tx.input === "0x") continue;
-      if (tx.value !== 0n && tx.value !== undefined && BigInt(tx.value) !== 0n) continue;
+      if (!isZeroTransactionValue(tx.value)) continue;
       
       const selector = String(tx.input).slice(0, 10).toLowerCase();
       if (!MINT_SELECTORS.has(selector)) continue;
@@ -154,11 +164,11 @@ export class DropListener {
       } catch {
         continue;
       }
-      const isTrustedWrapper = trustedWrapperAddresses().has(contractAddr.toLowerCase());
+      const isTrusted = isTrustedWrapper(contractAddr);
       const hasValidFreeMint = scan.mintFunctions.some(
         (fn) => fn.isFreeMint && !fn.requiresPayment
       );
-      if ((!scan.isVerified && !isTrustedWrapper) || scan.security.riskScore > 20 || !hasValidFreeMint) {
+      if ((!scan.isVerified && !isTrusted) || scan.security.riskScore > 20 || !hasValidFreeMint) {
         continue;
       }
 
@@ -169,7 +179,7 @@ export class DropListener {
         const scanResult = await scanContract(contractAddr, this.chain);
         
         // Skip unverified junk or high risk contracts completely
-        if (!scanResult.isVerified || scanResult.security.riskScore > 20) {
+        if ((!scanResult.isVerified && !isTrusted) || scanResult.security.riskScore > 20) {
           continue;
         }
 

@@ -126,31 +126,6 @@ export function getWalletClient(privateKey: Hex, chain?: ChainId): WalletClient 
   return client;
 }
 
-// DEPRECATED: Old rotation logic - kept for compatibility but not used
-const providerRotation: Record<ChainId, number> = { base: 0, robinhood: 0 };
-const providerFailures: Record<ChainId, number[]> = { base: [0, 0, 0, 0], robinhood: [0, 0, 0] };
-
-const PROVIDERS: Record<ChainId, { name: string; url: string }[]> = {
-  base: [
-    { name: "QuickNode", url: process.env.QUICKNODE_BASE_RPC || "" },
-    { name: "Alchemy", url: process.env.ALCHEMY_API_KEY ? `https://base-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : "" },
-    { name: "Infura", url: process.env.INFURA_BASE_RPC || "" },
-    { name: "Public", url: "https://mainnet.base.org" },
-  ].filter(p => p.url),
-  robinhood: [
-    { name: "QuickNode", url: process.env.QUICKNODE_ROBINHOOD_RPC || "" },
-    { name: "Alchemy", url: process.env.ALCHEMY_API_KEY ? `https://robinhood-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}` : "" },
-    { name: "Public", url: "https://robinhoodchain.blockscout.com" },
-  ].filter(p => p.url),
-};
-
-export function markProviderFailed(chain: ChainId): void {
-  // Deprecated - handled by RPC pool now
-  const providers = PROVIDERS[chain];
-  if (providers.length <= 1) return;
-  providerRotation[chain]++;
-}
-
 export function getAddressFromPrivateKey(privateKey: Hex): Address {
   return privateKeyToAccount(privateKey).address;
 }
@@ -177,7 +152,7 @@ export function isValidPrivateKey(key: string): boolean {
 
 export function normalizePrivateKey(key: string): Hex {
   const stripped = key.startsWith("0x") ? key.slice(2) : key;
-  return `0${stripped.toLowerCase()}` as Hex;
+  return `0x${stripped.toLowerCase()}` as Hex;
 }
 
 export function normalizeAddress(addr: string): string {

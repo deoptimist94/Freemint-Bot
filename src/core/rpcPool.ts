@@ -39,6 +39,7 @@ class RPCPool {
   private providers: Map<string, RPCProvider> = new Map();
   private chain: ChainId;
   private healthCheckInterval!: NodeJS.Timeout;
+  private metricsInterval!: NodeJS.Timeout;
   private circuitBreakerOpen = false;
   private circuitBreakerResetTime = 0;
   private requestQueue: Array<() => void> = [];
@@ -278,7 +279,7 @@ class RPCPool {
   }
 
   private startMetricsLogging(): void {
-    setInterval(() => {
+    this.metricsInterval = setInterval(() => {
       const stats = this.getStats();
       const totalRequests = stats.reduce((sum, s) => sum + s.requestCount, 0);
       const healthyCount = stats.filter(s => s.healthy && !s.rateLimited).length;
@@ -304,6 +305,8 @@ class RPCPool {
 
   public destroy(): void {
     clearInterval(this.healthCheckInterval);
+    clearInterval(this.metricsInterval);
+    this.requestQueue.length = 0;
   }
 }
 
@@ -322,4 +325,9 @@ export function getRPCStats(chain: ChainId): Array<{ name: string; healthy: bool
 
 export function dedupRPCRequest<T>(chain: ChainId, key: string, fn: () => Promise<T>): Promise<T> {
   return getRPCPool(chain).dedupRequest(key, fn);
+}
+
+export function destroyRPCPools(): void {
+  for (const pool of pools.values()) pool.destroy();
+  pools.clear();
 }

@@ -1,5 +1,6 @@
 import { type ChainId } from "./chains.js";
 import { getRPCPool } from "./rpcPool.js";
+import { isZeroTransactionValue } from "./listener.js";
 
 const MINT_SELECTORS = new Set([
   "0x1249c58b", // mint()
@@ -34,6 +35,7 @@ export class MempoolMonitor {
   private readonly MAX_CACHE = 10000;
   private readonly CACHE_TTL = 10 * 60 * 1000;
   private pollInterval: NodeJS.Timeout | null = null;
+  private cleanupInterval: NodeJS.Timeout | null = null;
   private baseDelay = 2000; // Faster polling
   private currentDelay = this.baseDelay;
   private maxDelay = 30000;
@@ -152,7 +154,7 @@ export class MempoolMonitor {
 
   private async processTransaction(tx: any): Promise<void> {
     if (!tx?.to || !tx?.input || tx.input === "0x") return;
-    if (tx.value && BigInt(tx.value) > 0n) return; // Skip paid transactions
+    if (!isZeroTransactionValue(tx.value)) return; // Skip paid transactions
 
     const selector = tx.input.slice(0, 10).toLowerCase();
     if (!MINT_SELECTORS.has(selector)) return;
@@ -184,7 +186,7 @@ export class MempoolMonitor {
   }
 
   private startCacheCleanup(): void {
-    setInterval(() => {
+    this.cleanupInterval = setInterval(() => {
       const now = Date.now();
       let cleaned = 0;
       
@@ -216,6 +218,10 @@ export class MempoolMonitor {
     if (this.pollInterval) {
       clearTimeout(this.pollInterval);
       this.pollInterval = null;
+    }
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
     }
     console.log(`[${this.chain}] Mempool Monitor stopped`);
   }

@@ -11,13 +11,15 @@ const lastMintTime = new Map<string, number>(); // key: userId-contractAddress
 export function startAutoMintLoop(bot: Bot) {
   console.log("🔄 Auto-mint polling loop started (60s interval)");
 
-  setInterval(async () => {
+  const interval = setInterval(async () => {
     try {
       await runAutoMintCycle(bot);
     } catch (error) {
       console.error("Auto-mint cycle error:", error);
     }
   }, POLL_INTERVAL_MS);
+
+  return () => clearInterval(interval);
 }
 
 async function runAutoMintCycle(bot: Bot) {

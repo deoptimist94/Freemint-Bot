@@ -8,6 +8,7 @@ import "dotenv/config";
 import { mintQueue, type QueuedJob } from "./core/queue.js";
 import { batchMint, type BatchMintResult } from "./core/mint.js";
 import { prisma } from "./db/client.js";
+import { destroyRPCPools } from "./core/rpcPool.js";
 
 console.log("👷 Worker node starting...");
 
@@ -88,6 +89,7 @@ mintQueue.on('stalled', (job: QueuedJob) => {
 process.on('SIGINT', async () => {
   console.log('\n🛑 Worker shutting down...');
   await mintQueue.close();
+  destroyRPCPools();
   await prisma.$disconnect();
   process.exit(0);
 });
@@ -95,6 +97,7 @@ process.on('SIGINT', async () => {
 process.on('SIGTERM', async () => {
   console.log('\n🛑 Worker terminating...');
   await mintQueue.close();
+  destroyRPCPools();
   await prisma.$disconnect();
   process.exit(0);
 });
