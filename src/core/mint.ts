@@ -107,6 +107,19 @@ const CUSTOM_ERROR_DICTIONARY: Record<string, string> = {
   NotAuthorized: "The caller is not authorized for this mint.",
 };
 
+const CUSTOM_ERROR_SELECTOR_MAP: Record<string, string> = {
+  "0xd05cb609": "MaxSupplyReached",
+  "0x52df9fe5": "SoldOut",
+  "0x49084b94": "MintEnded",
+  "0x06290e4e": "MintNotStarted",
+  "0xb7b24097": "SaleNotActive",
+  "0x746f4607": "WalletLimitExceeded",
+  "0x979afdba": "MaxMintPerWalletExceeded",
+  "0xf8eb54de": "NotEligible",
+  "0x08d15d1d": "InsufficientPayment",
+  "0x99f1e02d": "NotAuthorized",
+};
+
 export function classifyMintError(error: unknown): ClassifiedError {
   const decodedCustom = decodeContractRevert(error);
   const errorString = decodedCustom ?? (error instanceof Error ? error.message : String(error));
@@ -342,6 +355,32 @@ function decodeContractRevert(error: unknown): string | null {
       if (hex) return `The contract rejected the transaction (${hex[0].slice(0, 10)}).`;
     }
     return null;
+  }
+
+  const selector = data.slice(0, 10).toLowerCase();
+  const fallbackName = CUSTOM_ERROR_SELECTOR_MAP[selector];
+  if (fallbackName) {
+    const labels: Record<string, string> = {
+      MintEnded: "Mint has ended",
+      MintNotActive: "Mint is not active",
+      MaxMintPerWalletExceeded: "Maximum mint per wallet exceeded",
+      MaxSupplyReached: "Max supply has been reached",
+      WalletLimitExceeded: "This wallet has reached its mint limit",
+      ApprovalQueryForNonexistentToken: "Approval was requested for a nonexistent token",
+      InsufficientPayment: "Insufficient payment",
+      NotAuthorized: "Wallet is not authorized",
+      OnlySeaDrop: "This mint must be routed through SeaDrop",
+      MintNotStarted: "Mint has not started",
+      Paused: "The contract is paused",
+      Unauthorized: "Wallet is not authorized",
+      InvalidProof: "The allowlist proof is invalid",
+      SoldOut: "The collection is sold out",
+      Error: "The contract rejected the transaction",
+      Panic: "The contract hit a generic panic",
+      SaleNotActive: "Mint is not active at this time",
+      NotEligible: "This wallet is not eligible for the mint",
+    };
+    return labels[fallbackName] ?? fallbackName;
   }
 
   try {
