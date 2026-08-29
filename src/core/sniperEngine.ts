@@ -21,8 +21,8 @@ interface WhaleTransaction {
 
 const SEADROP_ROUTER = "0x00005ea00ac477b1030ce78506496e8c2de24bf5";
 const MINT_PUBLIC_SELECTOR = "0x161ac21f";
-const CYCLE_MS = 8000;
-const MAX_BLOCKS_PER_CYCLE = 50n;
+const CYCLE_MS = 15000;
+const MAX_BLOCKS_PER_CYCLE = 10n;
 
 interface SeaDropContext {
   isViaRouter: boolean;
@@ -162,7 +162,7 @@ export async function startWhaleMempoolMonitoring(
     } catch (err) {
       // Silent fail - will retry
     }
-  }, 2000);
+  }, 5000);
 
   whaleMempoolMonitors.set(chain, monitor);
   console.log(`Whale mempool monitoring started on ${chain}`);

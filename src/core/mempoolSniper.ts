@@ -37,7 +37,7 @@ export class MempoolMonitor {
   private readonly CACHE_TTL = 10 * 60 * 1000;
   private pollInterval: NodeJS.Timeout | null = null;
   private cleanupInterval: NodeJS.Timeout | null = null;
-  private baseDelay = 2000; // Faster polling
+  private baseDelay = 5000;
   private currentDelay = this.baseDelay;
   private maxDelay = 30000;
   private consecutiveErrors = 0;

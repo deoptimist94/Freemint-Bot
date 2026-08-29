@@ -74,6 +74,7 @@ function createInstrumentedPublicClient(chain: ChainId): PublicClient {
   (client as any).request = async (...args: any[]) => {
     const start = Date.now();
     try {
+      await getRPCPool(chain).waitForRequestSlot();
       const result = await originalRequest.apply(client, args);
       getRPCPool(chain).reportSuccess(name, Date.now() - start);
       return result;
@@ -114,6 +115,7 @@ export function getWalletClient(privateKey: Hex, chain?: ChainId): WalletClient 
   (client as any).request = async (...args: any[]) => {
     const start = Date.now();
     try {
+      await getRPCPool(target).waitForRequestSlot();
       const result = await originalRequest.apply(client, args);
       getRPCPool(target).reportSuccess(name, Date.now() - start);
       return result;

@@ -44,9 +44,12 @@ class RPCPool {
   private circuitBreakerResetTime = 0;
   private requestQueue: Array<() => void> = [];
   private processingQueue = false;
+  private nextRequestAt = 0;
+  private readonly minRequestIntervalMs: number;
 
   constructor(chain: ChainId) {
     this.chain = chain;
+    this.minRequestIntervalMs = chain === "robinhood" ? 300 : 0;
     this.initializeProviders();
     this.startHealthChecks();
     this.startMetricsLogging();
@@ -133,6 +136,18 @@ class RPCPool {
       return result;
     } finally {
       setTimeout(() => pendingRequests.delete(key), REQUEST_DEDUP_TTL);
+    }
+  }
+
+  public async waitForRequestSlot(): Promise<void> {
+    if (this.minRequestIntervalMs === 0) return;
+
+    const now = Date.now();
+    const requestAt = Math.max(now, this.nextRequestAt);
+    this.nextRequestAt = requestAt + this.minRequestIntervalMs;
+    const delay = requestAt - now;
+    if (delay > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
     }
   }
 
