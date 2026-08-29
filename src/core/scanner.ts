@@ -117,30 +117,50 @@ const MINT_NAME_BLOCKLIST = [
   /^initialize/i,
   /^renounce/i,
   /^emergency/i,
-  /^can/,
-  /allowance/,
-  /preview/,
-  /estimate/,
-  /calculate/,
-  /getmint/,
-  /mintprice/,
-  /mintlimit/,
-  /minted/,
-  /maxmint/,
-  /totalmint/,
-  /hasminted/,
-  /isminted/,
-  /devmint/,
-  /ownermint/,
-  /adminmint/,
+  /^can/i,
+  /^remove/i,
+  /^add/i,
+  /^create/i,
+  /^recover/i,
+  /^register/i,
+  /^approve/i,
+  /^disallow/i,
+  /^blacklist/i,
+  /^whitelist/i,
+  /^collect/i,
+  /allowance/i,
+  /preview/i,
+  /estimate/i,
+  /calculate/i,
+  /getmint/i,
+  /mintprice/i,
+  /mintlimit/i,
+  /minted/i,
+  /maxmint/i,
+  /totalmint/i,
+  /hasminted/i,
+  /isminted/i,
+  /devmint/i,
+  /ownermint/i,
+  /adminmint/i,
   /teamMint/i,
   /^mintTo$/i,
   /getseadrop/i,
-  /getmint/i,
   /mintmode/i,
   /mintstats/i,
   /signedmint/i,
   /updatemint/i,
+  /set.*uri/i,
+  /set.*base/i,
+  /set.*contract/i,
+  /set.*price/i,
+  /update.*drop/i,
+  /update.*mint/i,
+  /admin.*mint/i,
+  /owner.*mint/i,
+  /configure.*drop/i,
+  /allow.*mint/i,
+  /revoke.*mint/i,
 ];
 
 const SIGNATURE_INDICATORS = [
@@ -488,15 +508,22 @@ function decodeRevertMessage(error: unknown, abi: Abi = []): string {
 function looksLikeMint(fn: AbiFn): boolean {
   if (!fn.name || fn.name.length < 3) return false;
   const lower = fn.name.toLowerCase();
-  
+
   if (isBlockedName(fn.name)) return false;
-  
-  return (
+
+  const isConsumerMint =
     lower.includes("mint") ||
     lower.includes("claim") ||
     lower.includes("drop") ||
-    lower.includes("airdrop")
-  );
+    lower.includes("airdrop");
+
+  if (!isConsumerMint) return false;
+
+  if (lower.includes("update") || lower.includes("set") || lower.includes("admin") || lower.includes("owner") || lower.includes("configure") || lower.includes("allow") || lower.includes("revoke") || lower.includes("withdraw") || lower.includes("transfer")) {
+    return false;
+  }
+
+  return true;
 }
 
 function isProbablyPaidMint(fn: AbiFn): boolean {
@@ -616,14 +643,18 @@ export async function scanContract(
     mintFunctions = analyzeAbiForMintFunctions(abi);
   }
   
-  const isSeaDrop = mintFunctions.some((f) => isSeaDropMint({ 
-    name: f.name, 
+  const isSeaDrop = mintFunctions.some((f) => isSeaDropMint({
+    name: f.name,
     stateMutability: f.stateMutability,
     payable: f.stateMutability === "payable"
   })) || (abi?.some((item) => (item as AbiFn).name?.toLowerCase().includes("seadrop")) ?? false);
-  
+
   const { isGated, requiresSignature } = detectGateTypeFromFunctions(mintFunctions);
-  const freeMintFunctions = mintFunctions.filter((f) => f.isFreeMint);
+  const freeMintFunctions = mintFunctions.filter((f) => {
+    if (!f.isFreeMint || f.requiresPayment) return false;
+    if (isBlockedName(f.name)) return false;
+    return true;
+  });
   const security = await auditContractSecurity(checksumAddress, chain);
   const schedule = abi ? await readMintSchedule(checksumAddress as Address, abi, chain) : undefined;
   const nftData = abi
@@ -636,7 +667,7 @@ export async function scanContract(
   const rejectionReason = !nftEligibility.isNft || !nftData.isNft
     ? nftEligibility.reason ?? "Contract does not implement ERC-721 NFT interfaces"
     : tooOld
-    ? "Contract was deployed more than 48 hours ago"
+    ? "Contract was deployed more than 24 hours ago"
     : nftData.supply?.exhausted
     ? "NFT supply is exhausted"
     : freeMintFunctions.length === 0

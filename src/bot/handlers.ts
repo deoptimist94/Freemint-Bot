@@ -1153,15 +1153,19 @@ async function performScan(
 
       // Explicitly renders the confirm/batch mint buttons like your reference screenshots
       const keyboard = new InlineKeyboard()
-        .text("🚀 Batch Mint Now", `confirm_mint_${address.replace(/^0x/, "")}_${chain}`)
+        .text("🚀 Batch Mint Now", `mint_${address.replace(/^0x/, "")}_${chain}`)
         .row()
         .text("✅ Confirm Mint", `confirm_mint_${address.replace(/^0x/, "")}_${chain}`)
         .row()
-        .text("❌ Cancel", "main_menu");
+        .text("❌ Cancel", "main_menu")
+        .url(
+          "🔗 Explorer",
+          `${chain === "robinhood" ? "https://robinhoodchain.blockscout.com" : "https://basescan.org"}/address/${address}`
+        );
 
       await ctx.reply(text, {
         reply_markup: keyboard,
-        parse_mode: "Markdown",
+        parse_mode: "HTML",
       });
     } else {
       text += result.warning || "No free mint functions detected.";
@@ -1171,10 +1175,13 @@ async function performScan(
       });
     }
   } catch (error) {
-    await ctx.reply(`❌ Scan failed: ${errorMessage(error)}`, {
-      reply_markup: backToMainKeyboard(),
-      parse_mode: "Markdown",
-    });
+    await ctx.reply(
+      `❌ Scan failed: ${htmlEscape(errorMessage(error) || "Unknown error")}`,
+      {
+        reply_markup: backToMainKeyboard(),
+        parse_mode: "HTML",
+      }
+    );
   }
 }
 

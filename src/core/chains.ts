@@ -17,18 +17,16 @@ function alchemyRobinhoodKey(): string {
 
 export function resolveBaseRpcUrl(): string {
   const key = alchemyBaseKey();
-  if (!key) {
-    throw new Error("ALCHEMY_BASE_API_KEY is required!");
-  }
-  return `https://base-mainnet.g.alchemy.com/v2/${key}`;
+  return key
+    ? `https://base-mainnet.g.alchemy.com/v2/${key}`
+    : "https://mainnet.base.org";
 }
 
 export function resolveRobinhoodRpcUrl(): string {
   const key = alchemyRobinhoodKey();
-  if (!key) {
-    throw new Error("ALCHEMY_ROBINHOOD_API_KEY is required!");
-  }
-  return `https://robinhood-mainnet.g.alchemy.com/v2/${key}`;
+  return key
+    ? `https://robinhood-mainnet.g.alchemy.com/v2/${key}`
+    : "https://robinhoodchain.blockscout.com";
 }
 
 export function getDefaultChainId(): ChainId {

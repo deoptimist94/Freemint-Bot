@@ -34,6 +34,7 @@ export type DropCallback = (drop: DropEvent) => Promise<void>;
 const MAX_SEEN = 2000;
 const BASE_RECONNECT_MS = 2000;
 const MAX_RECONNECT_MS = 30000;
+const BLOCK_POLL_INTERVAL_MS = 6000;
 
 export function isTrustedWrapper(address: string): boolean {
   if (!/^0x[0-9a-fA-F]{40}$/.test(address)) return false;
@@ -92,7 +93,7 @@ export class DropListener {
     this.unwatch = client.watchBlocks({
       includeTransactions: true,
       emitMissed: true,
-      pollingInterval: 3000,
+      pollingInterval: BLOCK_POLL_INTERVAL_MS,
       onBlock: async (block) => {
         this.consecutiveErrors = 0;
         await this.handleBlock(block);
@@ -168,13 +169,16 @@ export class DropListener {
       const hasValidFreeMint = scan.mintFunctions.some(
         (fn) => fn.isFreeMint && !fn.requiresPayment
       );
+      const isOldContract = scan.deployment?.timestamp !== undefined &&
+        Date.now() / 1000 - scan.deployment.timestamp > 24 * 60 * 60;
+
       if (
         !scan.isNft ||
         scan.rejectionReason ||
         (!scan.isVerified && !isTrusted) ||
         scan.security.riskScore > 20 ||
         !hasValidFreeMint ||
-        (scan.deployment?.timestamp !== undefined && Date.now() / 1000 - scan.deployment.timestamp > 48 * 60 * 60)
+        isOldContract
       ) {
         continue;
       }
@@ -185,13 +189,18 @@ export class DropListener {
       try {
         const scanResult = await scanContract(contractAddr, this.chain);
         
+        const isOldResult = scanResult.deployment?.timestamp !== undefined &&
+          Date.now() / 1000 - scanResult.deployment.timestamp > 24 * 60 * 60;
+
         // Skip unverified junk or high risk contracts completely
-        if ((!scanResult.isVerified && !isTrusted) || scanResult.security.riskScore > 20) {
+        if ((!scanResult.isVerified && !isTrusted) || scanResult.security.riskScore > 20 || isOldResult) {
           continue;
         }
 
+        const validFreeMint = scanResult.mintFunctions.some((fn) => fn.isFreeMint && !fn.requiresPayment);
+
         // Must have valid free mint functions available
-        if (scanResult.mintFunctions.length === 0) {
+        if (!validFreeMint || scanResult.rejectionReason) {
           continue;
         }
 

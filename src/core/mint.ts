@@ -108,7 +108,8 @@ const CUSTOM_ERROR_DICTIONARY: Record<string, string> = {
 };
 
 export function classifyMintError(error: unknown): ClassifiedError {
-  const errorString = error instanceof Error ? error.message : String(error);
+  const decodedCustom = decodeContractRevert(error);
+  const errorString = decodedCustom ?? (error instanceof Error ? error.message : String(error));
   const errorStr = errorString.toLowerCase();
 
   const mappedCustom = Object.entries(CUSTOM_ERROR_DICTIONARY).find(([name]) =>
@@ -311,11 +312,12 @@ export function classifyMintError(error: unknown): ClassifiedError {
     errorStr.includes("contract call") ||
     errorStr.includes("always failing transaction")
   ) {
+    const decoded = decodeContractRevert(error);
     return {
       category: "SIMULATION_FAILED",
-      message: errorStr,
+      message: decoded || errorStr,
       retryable: true,
-      userFriendly: "Mint simulation failed. The contract rejected the call before execution.",
+      userFriendly: decoded || "Mint simulation failed. The contract rejected the call before execution.",
     };
   }
   
@@ -332,7 +334,15 @@ function decodeContractRevert(error: unknown): string | null {
     typeof error === "object" && error !== null && "data" in error
       ? error.data
       : undefined;
-  if (typeof data !== "string" || !data.startsWith("0x")) return null;
+
+  if (typeof data !== "string" || !data.startsWith("0x")) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("execution reverted") && message.includes("0x")) {
+      const hex = message.match(/0x[0-9a-fA-F]+/);
+      if (hex) return `The contract rejected the transaction (${hex[0].slice(0, 10)}).`;
+    }
+    return null;
+  }
 
   try {
     const decoded = decodeErrorResult({
@@ -376,9 +386,12 @@ function decodeContractRevert(error: unknown): string | null {
       Unauthorized: "Wallet is not authorized",
       InvalidProof: "The allowlist proof is invalid",
       SoldOut: "The collection is sold out",
+      Error: "The contract rejected the transaction",
+      Panic: "The contract hit a generic panic",
     };
-    const label = labels[decoded.errorName] ?? decoded.errorName;
-    return `${label}${decoded.args?.length ? `: ${decoded.args.join(", ")}` : ""}`;
+    const label = labels[decoded.errorName] ?? decoded.errorName ?? "The contract rejected the transaction";
+    const args = decoded.args && decoded.args.length > 0 ? `: ${decoded.args.join(", ")}` : "";
+    return `${label}${args}`;
   } catch {
     return `The contract rejected the transaction (custom error ${data.slice(0, 10)}). Check the mint phase, wallet eligibility, and required payment.`;
   }

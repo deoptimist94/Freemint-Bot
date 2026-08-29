@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { classifyMintError } from "../src/core/mint.js";
-import { evaluateNftEligibility } from "../src/core/scanner.js";
+import { analyzeAbiForMintFunctions, evaluateNftEligibility } from "../src/core/scanner.js";
+import { encodeErrorResult, parseAbi } from "viem";
 
 test("rejects router-like ERC-20 ABI before minting", () => {
   const result = evaluateNftEligibility({
@@ -34,8 +35,24 @@ test("accepts real ERC-721 surface with interface support", () => {
   assert.equal(result.reason, undefined);
 });
 
-test("maps custom revert errors to readable mint explanations", () => {
-  const info = classifyMintError("error MaxSupplyReached()")
+test("blocks administrative setter functions from free-mint scans", () => {
+  const functions = analyzeAbiForMintFunctions([
+    { type: "function", name: "updateAllowedSeaDrop", stateMutability: "nonpayable", inputs: [{ type: "address" }, { type: "bool" }] },
+    { type: "function", name: "mintPublic", stateMutability: "nonpayable", inputs: [] },
+    { type: "function", name: "setBaseURI", stateMutability: "nonpayable", inputs: [{ type: "string" }] },
+  ] as any);
+
+  assert.equal(functions.some((fn) => fn.name === "updateAllowedSeaDrop"), false);
+  assert.equal(functions.some((fn) => fn.name === "setBaseURI"), false);
+  assert.equal(functions.some((fn) => fn.name === "mintPublic"), true);
+});
+
+test("maps custom revert bytes to readable mint explanations", () => {
+  const data = encodeErrorResult({
+    abi: parseAbi(["error MaxSupplyReached()"]),
+    functionName: "MaxSupplyReached",
+  });
+  const info = classifyMintError({ data });
   assert.equal(info.category, "SOLD_OUT");
   assert.match(info.userFriendly, /max supply|sold out/i);
 });

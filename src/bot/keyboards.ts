@@ -210,13 +210,17 @@ export function watchlistKeyboard(contracts: string[], chain?: ChainId): InlineK
 }
 
 export function confirmMintKeyboard(contractAddress: string, chain?: ChainId): InlineKeyboard {
-  const clean = contractAddress.replace(/^0x/, "");
+  const clean = (contractAddress || "").replace(/^0x/, "");
+  const network = chain === "robinhood" ? "robinhood" : "base";
   const cb = `confirm_mint_${clean}${chain ? `_${chain}` : ""}`;
+  const explorerBase = network === "robinhood"
+    ? "https://robinhoodchain.blockscout.com"
+    : "https://basescan.org";
   return new InlineKeyboard()
     .text("🚀 Batch Mint Now", `mint_${clean}${chain ? `_${chain}` : ""}`).row()
     .text("✅ Confirm Mint", cb).row()
     .text("❌ Cancel", "main_menu")
-    .url("🔗 Explorer", `${chain === "robinhood" ? "https://robinhoodchain.blockscout.com" : "https://basescan.org"}/address/${contractAddress}`);
+    .url("🔗 Explorer", `${explorerBase}/address/${contractAddress || ""}`);
 }
 
 export function discoveryMintKeyboard(contractAddress: string, chain: ChainId): InlineKeyboard {
